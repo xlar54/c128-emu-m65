@@ -305,19 +305,33 @@ fetch16_to_addr:
 
 ; --- push_data ---
 push_data:
-        ; Optimized push - direct access to LOW_RAM_BUFFER stack area
-        ldx p4_sp
+        ; Write p4_data to LOW_RAM_BUFFER + $0100 + p4_sp using 32-bit pointer
+        lda #$00
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        lda p4_sp
+        sta C128_MEM_PTR+0
+        lda #>(LOW_RAM_BUFFER+$0100)
+        sta C128_MEM_PTR+1
+        ldz #0
         lda p4_data
-        sta LOW_RAM_BUFFER+$0100,x             ; Stack is at LOW_RAM_BUFFER+100 - LOW_RAM_BUFFER+1FF
+        sta [C128_MEM_PTR],z
         dec p4_sp
         rts
 
 ; --- pull_to_a ---
 pull_to_a:
-        ; Optimized pull - direct access to LOW_RAM_BUFFER stack area
+        ; Read from LOW_RAM_BUFFER + $0100 + (p4_sp+1) using 32-bit pointer
         inc p4_sp
-        ldx p4_sp
-        lda LOW_RAM_BUFFER+$0100,x             ; Stack is at LOW_RAM_BUFFER+100 - LOW_RAM_BUFFER+1FF
+        lda #$00
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        lda p4_sp
+        sta C128_MEM_PTR+0
+        lda #>(LOW_RAM_BUFFER+$0100)
+        sta C128_MEM_PTR+1
+        ldz #0
+        lda [C128_MEM_PTR],z
         rts
 
 ; ============================================================
@@ -388,9 +402,11 @@ _wzpx_port:
         cpx #$00
         beq _wzpx_ddr
         sta cpu_port_data
+        sta LOW_RAM_BUFFER+$01  ; Mirror to LOW_RAM for non-ZP reads
         rts
 _wzpx_ddr:
         sta cpu_port_ddr
+        sta LOW_RAM_BUFFER+$00  ; Mirror to LOW_RAM for non-ZP reads
         rts
 
 ; Write p4_data to ZP address in p4_addr_lo
@@ -406,9 +422,11 @@ _wzp_port:
         cpx #$00
         beq _wzp_ddr
         sta cpu_port_data
+        sta LOW_RAM_BUFFER+$01  ; Mirror to LOW_RAM for non-ZP reads
         rts
 _wzp_ddr:
         sta cpu_port_ddr
+        sta LOW_RAM_BUFFER+$00  ; Mirror to LOW_RAM for non-ZP reads
         rts
 
 ; Read 16-bit pointer from ZP address Y, result in p4_addr_lo/hi
@@ -691,6 +709,89 @@ VIC_FrameTasks:
         ; TODO: jsr C128_VID_UpdateCursor
 
 _frame_done:
+        rts
+
+; ============================================================
+; Hook routines for init code that hangs in emulation
+; ============================================================
+
+; hook_vdc_screen_clear - Skip $CE0C VDC RAM clear loop
+; Sets VDC shadow regs and advances PC to the RTS at $CE4B
+hook_vdc_screen_clear:
+        lda #$20
+        ldx #18
+        sta vdc_regs,x
+        lda #$00
+        ldx #19
+        sta vdc_regs,x
+        lda #$00
+        sta LOW_RAM_BUFFER+$DA
+        lda #$E0
+        sta LOW_RAM_BUFFER+$DB
+        lda #$4B
+        sta p4_pc_lo
+        lda #$CE
+        sta p4_pc_hi
+        lda #0
+        sta p4_code_valid
+        rts
+
+; hook_raster_wait_1 - Skip "LDA $D011 / BPL $E142" at $E142
+; This waits for raster >= 256. Skip to $E147.
+hook_raster_wait_1:
+        lda #$47
+        sta p4_pc_lo
+        lda #$E1
+        sta p4_pc_hi
+        lda #0
+        sta p4_code_valid
+        lda #4
+        #finish_cycles_inline
+        rts
+
+; hook_raster_wait_2 - Skip "LDA $D011 / BMI $E147" at $E14E
+; This waits for raster < 256. Skip to $E153.
+hook_raster_wait_2:
+        lda #$53
+        sta p4_pc_lo
+        lda #$E1
+        sta p4_pc_hi
+        lda #0
+        sta p4_code_valid
+        lda #4
+        #finish_cycles_inline
+        rts
+
+; write_milestone - Write progress byte A to $0FE0F
+; Uses 32-bit pointer to write to host RAM
+write_milestone:
+        pha
+        lda #$0F
+        sta C128_MEM_PTR+0
+        lda #$FE
+        sta C128_MEM_PTR+1
+        lda #$00
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        ldz #0
+        pla
+        sta [C128_MEM_PTR],z
+        rts
+
+; write_loop_counter - Increment byte at $0FE0E
+; Shows how many times the VDC init loop at E1DC iterates
+write_loop_counter:
+        lda #$0E
+        sta C128_MEM_PTR+0
+        lda #$FE
+        sta C128_MEM_PTR+1
+        lda #$00
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        inc a
+        sta [C128_MEM_PTR],z
         rts
 
 ; ============================================================
@@ -1012,6 +1113,272 @@ _sm_monitor_active:
 ; P4CPU_Step - Single instruction execution
 ; ============================================================
 P4CPU_Step:
+        ; --- Boot milestone & hook checks ---
+        ; Milestones write progress byte to $0FE0F via 32-bit store.
+        ; Check $0FE0F in the monitor to see how far boot got.
+        ;
+        ; Values:  $01=E000  $02=E0CD  $03=E1F0  $04=E242
+        ;          $05=E109  $06=E147(past raster1)  $07=E024
+        ;          $08=E093  $09=E056  $0A=C07B  $0B=B000
+        ;          $0C=B021  $0D=BASIC running
+        ;
+        lda p4_pc_hi
+
+        ; Hook $CE0C: VDC screen clear (skip the polling loop)
+        cmp #$CE
+        bne _hook_not_ce
+        lda p4_pc_lo
+        cmp #$0C
+        bne _hook_not_ce
+        jsr hook_vdc_screen_clear
+        lda #4
+        #finish_cycles_inline
+        rts
+_hook_not_ce:
+
+        ; Hook $E142/$E14E: raster wait loops (skip busy waits)
+        cmp #$E1
+        bne _hook_not_e1
+        lda p4_pc_lo
+        cmp #$42
+        beq hook_raster_wait_1
+        cmp #$4E
+        beq hook_raster_wait_2
+        ; Fine-grained milestones inside E109-E154
+        cmp #$09
+        bne +
+        lda #$05
+        jsr write_milestone     ; $05 = E109 entered
++       lda p4_pc_lo
+        cmp #$14
+        bne +
+        lda #$15
+        jsr write_milestone     ; $15 = E114 (STA $DC0E)
++       lda p4_pc_lo
+        cmp #$2E
+        bne +
+        lda #$16
+        jsr write_milestone     ; $16 = E12E (LDA #$07 STA $DD00)
++       lda p4_pc_lo
+        cmp #$38
+        bne +
+        lda #$17
+        jsr write_milestone     ; $17 = E138 (STA $01 cpu port)
++       lda p4_pc_lo
+        cmp #$40
+        bne +
+        lda #$18
+        jsr write_milestone     ; $18 = E140 (LDX #$FF before raster)
++       lda p4_pc_lo
+        cmp #$47
+        bne +
+        lda #$19
+        jsr write_milestone     ; $19 = E147 (past raster wait 1)
++       lda p4_pc_lo
+        cmp #$53
+        bne +
+        lda #$1A
+        jsr write_milestone     ; $1A = E153 (INX past raster wait 2)
++       lda p4_pc_lo
+        cmp #$54
+        bne +
+        lda #$10
+        jsr write_milestone     ; $10 = E154
++       lda p4_pc_lo
+        cmp #$5C
+        bne +
+        lda #$11
+        jsr write_milestone     ; $11 = E15C
++       lda p4_pc_lo
+        cmp #$6E
+        bne +
+        lda #$12
+        jsr write_milestone     ; $12 = E16E
++       lda p4_pc_lo
+        cmp #$79
+        bne +
+        lda #$13
+        jsr write_milestone     ; $13 = E179 (JSR E1DC)
++       lda p4_pc_lo
+        cmp #$7E
+        bne +
+        lda #$14
+        jsr write_milestone     ; $14 = E17E (after JSR E1DC returns)
++       ; E1DC = VDC init loop entry
+        lda p4_pc_lo
+        cmp #$DC
+        bne +
+        lda #$20
+        jsr write_milestone     ; $20 = E1DC (VDC loop entry/iteration)
+        jsr write_loop_counter  ; increment counter at $0FE0E
++       ; E1E6 = STY $D600 inside VDC loop
+        lda p4_pc_lo
+        cmp #$E6
+        bne +
+        lda #$21
+        jsr write_milestone     ; $21 = E1E6 (STY $D600 in loop)
++       ; E1EC = BPL at end of VDC loop
+        lda p4_pc_lo
+        cmp #$EC
+        bne +
+        lda #$22
+        jsr write_milestone     ; $22 = E1EC (BPL loop-back)
++       ; E1EE = loop exit (end marker hit)
+        lda p4_pc_lo
+        cmp #$EE
+        bne +
+        lda #$23
+        jsr write_milestone     ; $23 = E1EE (loop done, about to RTS)
++       ; E1EF = RTS from E1DC
+        lda p4_pc_lo
+        cmp #$EF
+        bne +
+        lda #$24
+        jsr write_milestone     ; $24 = E1EF (RTS)
++       jmp _no_hooks
+_hook_not_e1:
+
+        ; Milestones in $E0xx page
+        cmp #$E0
+        bne _hook_not_e0
+        lda p4_pc_lo
+        cmp #$00
+        bne +
+        lda #$01
+        jsr write_milestone     ; $01 = E000
++       lda p4_pc_lo
+        cmp #$24
+        bne +
+        lda #$07
+        jsr write_milestone     ; $07 = E024 (post-E109)
++       lda p4_pc_lo
+        cmp #$93
+        bne +
+        lda #$08
+        jsr write_milestone     ; $08 = E093 (IOINIT)
++       lda p4_pc_lo
+        cmp #$56
+        bne +
+        lda #$09
+        jsr write_milestone     ; $09 = E056 (RAMTAS)
++       lda p4_pc_lo
+        cmp #$CD
+        bne _hook_not_e0
+        lda #$02
+        jsr write_milestone     ; $02 = E0CD (bank copy)
+_hook_not_e0:
+
+        ; Milestones in other pages
+        lda p4_pc_hi
+        cmp #$E2
+        bne +
+        lda p4_pc_lo
+        cmp #$42
+        bne +
+        lda #$04
+        jsr write_milestone     ; $04 = E242 (C128 mode check)
++
+        lda p4_pc_hi
+        cmp #$E1
+        bne +
+        lda p4_pc_lo
+        cmp #$F0
+        bne +
+        lda #$03
+        jsr write_milestone     ; $03 = E1F0 (auto-boot check)
++
+        ; CINT screen editor init
+        lda p4_pc_hi
+        cmp #$C0
+        bne +
+        lda p4_pc_lo
+        cmp #$7B
+        bne +
+        lda #$0A
+        jsr write_milestone     ; $0A = C07B (CINT)
++
+        ; Post-CINT milestones
+        lda p4_pc_hi
+        cmp #$E0
+        bne _hook_not_e0_post
+        lda p4_pc_lo
+        cmp #$3A
+        bne +
+        lda #$30
+        jsr write_milestone     ; $30 = E03A (PLA after CINT returned)
++       lda p4_pc_lo
+        cmp #$3B
+        bne +
+        lda #$31
+        jsr write_milestone     ; $31 = E03B (CLI - enables interrupts!)
++       lda p4_pc_lo
+        cmp #$3E
+        bne +
+        lda #$32
+        jsr write_milestone     ; $32 = E03E (JMP $B000)
++
+_hook_not_e0_post:
+
+        ; BASIC cold start
+        lda p4_pc_hi
+        cmp #$B0
+        bne +
+        lda p4_pc_lo
+        cmp #$00
+        bne +
+        lda #$0B
+        jsr write_milestone     ; $0B = B000 (BASIC!)
++       lda p4_pc_hi
+        cmp #$B0
+        bne +
+        lda p4_pc_lo
+        cmp #$21
+        bne +
+        lda #$0C
+        jsr write_milestone     ; $0C = B021 (BASIC init)
++
+        ; Hook: VDC polling loops at $C543, $CDCF, $CDDD
+        ; These poll $D600 bit 7 (VDC ready). Since we return $A0,
+        ; they should exit immediately. But add hooks as safety.
+        lda p4_pc_hi
+        cmp #$CD
+        bne _hook_not_cdxx
+        lda p4_pc_lo
+        cmp #$CF
+        beq _hook_vdc_poll_skip
+        cmp #$DD
+        beq _hook_vdc_poll_skip
+        jmp _hook_not_cdxx
+_hook_vdc_poll_skip:
+        ; Skip the BIT/BPL loop: advance PC past BPL
+        ; BIT $D600 = 3 bytes, BPL = 2 bytes, total 5
+        lda p4_pc_lo
+        clc
+        adc #$05
+        sta p4_pc_lo
+        lda #0
+        sta p4_code_valid
+        lda #4
+        #finish_cycles_inline
+        rts
+_hook_not_cdxx:
+
+        lda p4_pc_hi
+        cmp #$C5
+        bne _no_hooks
+        lda p4_pc_lo
+        cmp #$43
+        bne _no_hooks
+        ; $C543 VDC poll - skip it
+        lda #$48                ; $C543 + 5 = $C548
+        sta p4_pc_lo
+        lda #0
+        sta p4_code_valid
+        lda #4
+        #finish_cycles_inline
+        rts
+
+_no_hooks:
         ; DEBUG TRACE DISABLED
         ; lda p4_trace_enabled
         ; beq _skip_trace

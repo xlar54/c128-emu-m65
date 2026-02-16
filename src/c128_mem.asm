@@ -529,6 +529,14 @@ C128_Read:
         ; (get_physical_bank handles shared RAM)
         cmp #$10
         bcs _rd_not_low
+        ; Special case: $0000/$0001 = CPU port registers
+        cmp #$00
+        bne _rd_low_ram
+        lda p4_addr_lo
+        cmp #$02
+        bcs _rd_low_ram
+        jmp read_zp             ; Use port register handler for $00/$01
+_rd_low_ram:
         jsr get_physical_bank
         sta C128_MEM_PTR+2
         lda p4_addr_lo
@@ -1111,6 +1119,8 @@ _wr_to_ram:
 
 ; ============================================================
 ; write_ram_direct - Write to physical RAM via 32-bit pointer
+; ============================================================
+; write_ram_direct - Write to C128 RAM using physical bank
 ; Also mirrors pages $00-$0F to LOW_RAM_BUFFER so the CPU's
 ; fast ZP/stack reads stay in sync
 ; ============================================================

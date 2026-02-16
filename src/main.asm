@@ -297,7 +297,13 @@ _wait:
         ; ============================================================
         ; Initialize video and start emulation
         ; ============================================================
+
         jsr C128_VideoInit
+        
+        ; Set border to black = boot starting
+        lda #$00
+        sta $D020
+        
         jsr C128_CPUReset
 
 main_loop:
