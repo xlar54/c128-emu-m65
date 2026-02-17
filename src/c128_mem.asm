@@ -11,7 +11,8 @@
 ;   $FF00-$FF04 ALWAYS mapped to MMU (not RAM/ROM)
 ;
 ; MEGA65 Host Memory Layout:
-;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB)
+;   Bank 1 ($10000-$1FFFF): C128 ROMs + VDC RAM (64KB)
+;     $10000-$13FFF: VDC RAM (16KB)
 ;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF)
 ;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF)
 ;     $1C000-$1FFFF: KERNAL ROM    (C128 $C000-$FFFF)
@@ -60,11 +61,11 @@ BANK_ROM    = $01                       ; C128 ROMs in MEGA65 bank 1
 BANK_RAM0   = $04                       ; C128 RAM bank 0 in MEGA65 bank 4
 BANK_RAM1   = $05                       ; C128 RAM bank 1 in MEGA65 bank 5
 
-; Character ROM location in bank 1
-; chargen.bin (8KB) loaded at $10000-$11FFF
-; First 4KB ($10000-$10FFF) = C64 charset
-; Second 4KB ($11000-$11FFF) = C128 charset
-CHARGEN_BASE = $10000                   ; MEGA65 flat address of chargen ROM
+; Character ROM location in bank 0
+; chargen.bin (8KB) loaded at $08000-$09FFF (stays at staging area)
+; First 4KB ($08000-$08FFF) = C64 charset
+; Second 4KB ($09000-$09FFF) = C128 charset
+CHARGEN_BASE = $08000                   ; MEGA65 flat address of chargen ROM
 
 ; Low RAM buffer in bank 0 host RAM for fast screen/color mirroring
 LOW_RAM_BUFFER  = $A000                 ; 4KB - C128 low RAM $0000-$0FFF mirror
@@ -137,8 +138,9 @@ cia2_regs:       .fill 16, 0      ; CIA2 $DD00-$DD0F
 ; Accessed through index/data at $D600/$D601
 vdc_index:       .byte 0          ; Current VDC register index
 vdc_regs:        .fill 38, 0      ; VDC internal registers (R0-R37)
-vdc_ram:                           ; VDC has its own 16KB RAM (not emulated yet)
-                 .byte 0          ; Placeholder
+; VDC 16KB RAM stored at $10000-$13FFF in bank 1
+VDC_RAM_BANK = $01
+VDC_RAM_BASE = $10000
 
 ; SID registers are passed through to real hardware
 
@@ -217,21 +219,25 @@ C128_VideoInit:
         lda #$53
         sta $D02F
 
-        ; Temporarily enable HOTREG, write standard C64 display config,
-        ; let hot register propagation set all vernier registers correctly
+        ; Make sure HOTREG is OFF so our writes don't trigger auto-calculation
         lda $D05D
-        ora #$80                ; Set bit 7 (HOTREG enable)
+        and #$7F                ; Clear bit 7 (HOTREG disable)
         sta $D05D
 
+        ; Color RAM pointer - set FIRST before anything else
+        ; MEGA65 color RAM is at fixed $FF80000
+        lda #$00
+        sta $D063               ; COLPTR LSB
+        lda #$00
+        sta $D064               ; COLPTR middle
+        lda #$80
+        sta $D065               ; COLPTR high -> $FF80000
+
+        ; Standard text mode
         lda #$1B
-        sta $D011               ; Standard 25-row text mode
+        sta $D011               ; 25-row text mode, screen on
         lda #$14
-        sta $D018               ; Default screen/charset layout
-
-        ; Now disable HOTREG so our direct pointer writes stick
-        lda $D05D
-        and #$7F                ; Clear bit 7
-        sta $D05D
+        sta $D018               ; screen at $0400, charset at $1000 (C64 compat, overridden below)
 
         ; Point VIC-IV screen at C128 RAM bank 0 + $0400
         ; C128 default screen is at $0400, in MEGA65 bank 4 = $40400
@@ -242,20 +248,15 @@ C128_VideoInit:
         lda #BANK_RAM0
         sta $D062               ; SCRNPTR bank = 4 -> $40400
 
-        ; Point charset at C128 character ROM in bank 1
-        ; C128 charset is in second 4KB half: $11000-$11FFF
-        ; Default is uppercase/graphics at $11000
+        ; Point charset at C128 character ROM in bank 0
+        ; C128 charset is in second 4KB half: $09000-$09FFF
+        ; Default is uppercase/graphics at $09000
         lda #$00
         sta $D068               ; CHARPTR LSB
-        lda #$10
-        sta $D069               ; CHARPTR middle ($10 within bank 1)
-        lda #BANK_ROM
-        sta $D06A               ; CHARPTR bank = 1 -> $11000
-
-        ; Color RAM pointer - leave at VIC-IV default
-        ; The MEGA65's color RAM is at a fixed location and
-        ; HOTREG processing already set COLPTR correctly.
-        ; Writing $D800-$DBFF in our emulator goes to real color RAM.
+        lda #$90
+        sta $D069               ; CHARPTR middle ($90 within bank 0)
+        lda #$00
+        sta $D06A               ; CHARPTR bank = 0 -> $09000
 
         ; Standard 40-column, virtual row width = 40
         lda #40
@@ -735,22 +736,23 @@ read_from_basic_hi:
         lda [C128_MEM_PTR],z
         rts
 
-; Read from Character ROM: C128 $D000-$DFFF -> MEGA65 $10000-$11FFF
+; Read from Character ROM: C128 $D000-$DFFF -> MEGA65 $08000-$09FFF
 ; The char ROM is 8KB. C128 address $D000 maps to chargen offset $0000.
-; MEGA65 address = $10000 + (addr - $D000)
-; Since chargen is at $10000 in bank 1, and addr_hi=$D0-$DF:
-;   ptr = $10000 + ((addr_hi - $D0) << 8) + addr_lo
-;       = bank 1, offset = ((addr_hi - $D0) << 8) + addr_lo
+; MEGA65 address = $08000 + (addr - $D000)
+; Since chargen is at $08000 in bank 0, and addr_hi=$D0-$DF:
+;   ptr = $08000 + ((addr_hi - $D0) << 8) + addr_lo
+;       = bank 0, high = $80 + (addr_hi - $D0), low = addr_lo
 read_from_chargen:
         lda p4_addr_lo
         sta C128_MEM_PTR
         lda p4_addr_hi
         sec
         sbc #$D0                ; Offset from $D000 base
-        sta C128_MEM_PTR+1      ; High byte of offset within chargen
-        lda #BANK_ROM           ; Bank 1 ($10000)
+        clc
+        adc #$80                ; Add $80 base -> $80xx within bank 0
+        sta C128_MEM_PTR+1
+        lda #$00                ; Bank 0
         sta C128_MEM_PTR+2
-        lda #$00
         sta C128_MEM_PTR+3
         ldz #$00
         lda [C128_MEM_PTR],z
@@ -957,10 +959,11 @@ _rc1_port_b:
 
 _rc1_icr:
         ; $DC0D: Interrupt control - cleared on read
-        lda cia1_regs+$0D
+        lda cia1_icr_data
         pha
         lda #0
-        sta cia1_regs+$0D
+        sta cia1_icr_data
+        sta p4_irq_pending      ; Clear pending IRQ
         pla
         rts
 
@@ -994,8 +997,10 @@ read_vdc_register:
         and #$01
         beq _rv_d600
 
-        ; $D601: VDC data register
+        ; $D601: VDC data register - behavior depends on selected register
         ldx vdc_index
+        cpx #31
+        beq _rv_vdc_data         ; R31 = data read from VDC RAM
         cpx #38
         bcs _rv_vdc_open
         lda vdc_regs,x
@@ -1003,13 +1008,35 @@ read_vdc_register:
 
 _rv_d600:
         ; $D600: VDC status register
-        ; Bit 7: ready (always return ready for now)
+        ; Bit 7: ready (always return ready)
         ; Bit 5: vertical blank
         lda #$A0               ; Ready + VBlank
         rts
 
 _rv_vdc_open:
         lda #$FF
+        rts
+
+_rv_vdc_data:
+        ; R31: Read byte from VDC RAM at address R18:R19, auto-increment
+        ; VDC RAM is at $10000 in bank 1
+        lda vdc_regs+19         ; address lo
+        sta C128_MEM_PTR+0
+        lda vdc_regs+18         ; address hi
+        and #$3F                ; mask to 16KB
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        pha
+        ; Auto-increment R18:R19
+        inc vdc_regs+19
+        bne +
+        inc vdc_regs+18
++       pla
         rts
 
 
@@ -1148,19 +1175,26 @@ _wrd_no_inv:
 
         ; Mirror writes to pages $00-$0F in bank 4 to LOW_RAM_BUFFER
         ; so CPU fast ZP/stack reads see the correct data
+        ; Rebuilds C128_MEM_PTR each time
         lda _wrd_saved_bank
         cmp #BANK_RAM0
         bne _wrd_done
         lda p4_addr_hi
         cmp #$10
         bcs _wrd_done
+        ; Set C128_MEM_PTR to LOW_RAM_BUFFER + p4_addr_hi page
         clc
         adc #>LOW_RAM_BUFFER
-        sta _wrd_mirror+2
-        ldx p4_addr_lo
+        sta C128_MEM_PTR+1
+        lda #<LOW_RAM_BUFFER
+        sta C128_MEM_PTR+0
+        lda #$00
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        lda p4_addr_lo
+        taz
         lda c128_saved_data
-_wrd_mirror:
-        sta LOW_RAM_BUFFER,x
+        sta [C128_MEM_PTR],z
 _wrd_done:
         rts
 
@@ -1346,7 +1380,7 @@ _wv_d018:
         ; charset offsets $1000-$1FFF and $1800-$1FFF read from
         ; character ROM instead of RAM. This is a VIC-II hardware
         ; feature. We emulate this by pointing CHARPTR at our
-        ; chargen ROM in MEGA65 bank 1.
+        ; chargen ROM in MEGA65 bank 0 at $0A000.
 
         ; --- Update CHARPTR ---
         lda c128_saved_data
@@ -1372,24 +1406,25 @@ _wv_d018:
         jmp _d018_screen
 
 _d018_charrom:
-        ; Character ROM shadow - point at chargen in bank 1
-        ; $10 -> chargen offset $0000 (first 2KB charset)
-        ; $18 -> chargen offset $0800 (second 2KB charset)
-        ; The chargen ROM at $10000 has:
-        ;   $10000-$107FF: C64 charset upper/graphics
-        ;   $10800-$10FFF: C64 charset lower/upper
-        ;   $11000-$117FF: C128 charset upper/graphics
-        ;   $11800-$11FFF: C128 charset lower/upper
+        ; Character ROM shadow - point at chargen in bank 0 at $08000
+        ; The chargen ROM at $08000 has:
+        ;   $08000-$087FF: C64 charset upper/graphics
+        ;   $08800-$08FFF: C64 charset lower/upper
+        ;   $09000-$097FF: C128 charset upper/graphics
+        ;   $09800-$09FFF: C128 charset lower/upper
         ; For C128 mode we want the C128 charset (second 4KB half)
-        ; So offset $10 -> $11000, offset $18 -> $11800
+        ; _d018_char_hi is $10 or $18 (from VIC $D018 bits)
+        ; $10 -> $09000, $18 -> $09800
+        ; So: CHARPTR = $80 + _d018_char_hi + $10 = $90 or $98
         lda #$00
         sta $D068               ; CHARPTR low = 0
         lda _d018_char_hi
         clc
-        adc #$10                ; Add $1000 offset for C128 charset half
+        adc #$80                ; $80 base for chargen in bank 0
+        adc #$10                ; +$1000 offset for C128 charset half
         sta $D069               ; CHARPTR mid
-        lda #BANK_ROM
-        sta $D06A               ; CHARPTR bank = 1 ($10000 base)
+        lda #$00
+        sta $D06A               ; CHARPTR bank = 0
 
 _d018_screen:
         ; --- Update SCRNPTR ---
@@ -1415,10 +1450,26 @@ _d018_scrn_hi: .byte 0
 
 _wv_d019:
         ; $D019: IRQ flag register - write 1 to acknowledge
+        ; Writing a 1 bit clears that flag
         lda c128_saved_data
         and vic_regs+$19
         eor vic_regs+$19
+        ; Recalculate bit 7: set if any remaining flags match enable mask
+        and #$0F                ; keep only individual flags (bits 0-3)
+        sta p4_tmp
+        lda vic_regs+$1A
+        and p4_tmp              ; AND with enable mask
+        beq _wv_d019_no_irq
+        ; Still have active IRQ sources
+        lda p4_tmp
+        ora #$80
         sta vic_regs+$19
+        rts
+_wv_d019_no_irq:
+        lda p4_tmp
+        sta vic_regs+$19       ; bit 7 clear
+        lda #0
+        sta p4_irq_pending
         rts
 
 _wv_d020:
@@ -1449,12 +1500,74 @@ write_cia1_register:
 
         ; $DC00: Keyboard column select - write to real CIA
         cpx #$00
-        bne _wc1_not_00
+        beq _wc1_dc00
+        ; $DC04: Timer A latch low
+        cpx #$04
+        beq _wc1_ta_lo
+        ; $DC05: Timer A latch high
+        cpx #$05
+        beq _wc1_ta_hi
+        ; $DC0D: ICR mask
+        cpx #$0D
+        beq _wc1_icr
+        ; $DC0E: Timer A control
+        cpx #$0E
+        beq _wc1_ta_ctrl
+        rts
+
+_wc1_dc00:
         lda c128_saved_data
         sta $DC00
         rts
-_wc1_not_00:
+
+_wc1_ta_lo:
+        lda c128_saved_data
+        sta cia1_timer_a_latch_lo
         rts
+
+_wc1_ta_hi:
+        ; Writing high byte also reloads timer if stopped
+        lda c128_saved_data
+        sta cia1_timer_a_latch_hi
+        ; If timer not running, reload counter from latch
+        lda cia1_timer_a_ctrl
+        and #$01
+        bne +
+        lda cia1_timer_a_latch_lo
+        sta cia1_timer_a_lo
+        lda cia1_timer_a_latch_hi
+        sta cia1_timer_a_hi
++       rts
+
+_wc1_icr:
+        ; $DC0D write: bit 7 = set/clear flag
+        ; If bit 7 = 1, set the bits specified by bits 0-4
+        ; If bit 7 = 0, clear the bits specified by bits 0-4
+        lda c128_saved_data
+        bmi _wc1_icr_set
+        ; Clear: mask &= ~data
+        eor #$FF
+        and cia1_icr_mask
+        sta cia1_icr_mask
+        rts
+_wc1_icr_set:
+        ; Set: mask |= data (bits 0-4 only)
+        and #$1F
+        ora cia1_icr_mask
+        sta cia1_icr_mask
+        rts
+
+_wc1_ta_ctrl:
+        lda c128_saved_data
+        sta cia1_timer_a_ctrl
+        ; Bit 4 = force reload
+        and #$10
+        beq +
+        lda cia1_timer_a_latch_lo
+        sta cia1_timer_a_lo
+        lda cia1_timer_a_latch_hi
+        sta cia1_timer_a_hi
++       rts
 
 
 ; ============================================================
@@ -1487,11 +1600,14 @@ write_vdc_register:
 
         ; $D601: Write VDC data register
         ldx vdc_index
+        cpx #31
+        beq _wvdc_data           ; R31 = data write to VDC RAM
+        cpx #30
+        beq _wvdc_word_count     ; R30 = word count (triggers block fill/copy)
         cpx #38
         bcs _wvdc_done
         lda c128_saved_data
         sta vdc_regs,x
-        ; TODO: Handle VDC side effects (character display, etc.)
 _wvdc_done:
         rts
 
@@ -1501,6 +1617,49 @@ _wvdc_index:
         and #$3F               ; 6-bit register index
         sta vdc_index
         rts
+
+_wvdc_data:
+        ; R31: Write byte to VDC RAM at address R18:R19, auto-increment
+        ; VDC RAM is at $10000 in bank 1
+        lda vdc_regs+19         ; address lo
+        sta C128_MEM_PTR+0
+        lda vdc_regs+18         ; address hi
+        and #$3F                ; mask to 16KB
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda c128_saved_data
+        sta [C128_MEM_PTR],z
+        sta vdc_regs+31         ; also update shadow
+        ; Auto-increment R18:R19
+        inc vdc_regs+19
+        bne +
+        inc vdc_regs+18
++       rts
+
+_wvdc_word_count:
+        ; R30: Writing word count triggers block copy or fill
+        ; The VDC copies/fills (count+1) bytes starting at R18:R19
+        ; Bit 5 of R24 selects copy (0) vs fill (1)
+        ; For now: just advance R18:R19 by (count+1) so address is correct after
+        lda c128_saved_data
+        sta vdc_regs+30
+        ; Advance address by (value + 1)
+        clc
+        lda vdc_regs+19
+        adc c128_saved_data
+        sta vdc_regs+19
+        lda vdc_regs+18
+        adc #$00
+        sta vdc_regs+18
+        ; +1 more
+        inc vdc_regs+19
+        bne +
+        inc vdc_regs+18
++       rts
 
 
 ; ============================================================

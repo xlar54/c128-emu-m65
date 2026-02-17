@@ -1038,10 +1038,10 @@ _save_do_it:
         tax
         
         ; Read start address from LOW_RAM_BUFFER (ZP is in low RAM)
-        lda LOW_RAM_BUFFER,x            ; Start lo
+        jsr lrb_read_x  ; Start lo
         sta p4_save_start_lo
         inx
-        lda LOW_RAM_BUFFER,x            ; Start hi
+        jsr lrb_read_x  ; Start hi
         sta p4_save_start_hi
         
         ; Perform the save

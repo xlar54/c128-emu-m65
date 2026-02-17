@@ -305,13 +305,14 @@ fetch16_to_addr:
 
 ; --- push_data ---
 push_data:
-        ; Write p4_data to LOW_RAM_BUFFER + $0100 + p4_sp using 32-bit pointer
-        lda #$00
+        ; Write to bank 4 stack page ($40100+SP)
+        lda #BANK_RAM0
         sta C128_MEM_PTR+2
+        lda #$00
         sta C128_MEM_PTR+3
         lda p4_sp
         sta C128_MEM_PTR+0
-        lda #>(LOW_RAM_BUFFER+$0100)
+        lda #$01
         sta C128_MEM_PTR+1
         ldz #0
         lda p4_data
@@ -321,35 +322,144 @@ push_data:
 
 ; --- pull_to_a ---
 pull_to_a:
-        ; Read from LOW_RAM_BUFFER + $0100 + (p4_sp+1) using 32-bit pointer
+        ; Read from bank 4 stack page ($40100+SP)
         inc p4_sp
-        lda #$00
+        lda #BANK_RAM0
         sta C128_MEM_PTR+2
+        lda #$00
         sta C128_MEM_PTR+3
         lda p4_sp
         sta C128_MEM_PTR+0
-        lda #>(LOW_RAM_BUFFER+$0100)
+        lda #$01
         sta C128_MEM_PTR+1
         ldz #0
         lda [C128_MEM_PTR],z
         rts
 
 ; ============================================================
-; Fast ZP read/write - direct access to LOW_RAM_BUFFER
-; These skip the full P4MEM_Read/Write overhead for ZP ($00-$FF)
+; Fast ZP read/write - using 32-bit pointer rebuilt each call
+; Cannot keep a persistent pointer in ZP because C128 code writes to all ZP.
+; Instead, rebuild C128_MEM_PTR ($F0-$F3) in each helper from constants.
 ; Special handling for $00/$01 (8502 CPU port registers)
 ; ============================================================
+
+; No persistent pointer needed - removed LRB_PTR
 
 ; 8502 port register state
 cpu_port_ddr:   .byte $2F       ; Data Direction Register (default: bits 0-3,5 output)
 cpu_port_data:  .byte $07       ; Port data register (default: LORAM+HIRAM+CHAREN on)
 cpu_port_ext:   .byte $FF       ; External input lines (active low, no cart = all high)
 
+; Initialize - nothing needed now
+lrb_ptr_init:
+        rts
+
+; Helper: read LOW_RAM_BUFFER[X] -> A  (preserves X)
+; Now reads from bank 4 directly
+lrb_read_x:
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
+        rts
+
+; Helper: write A -> ZP[X]  (preserves A, X)
+; Writes to both LOW_RAM_BUFFER and bank 4
+lrb_write_x:
+        pha
+        ; Write to bank 4 ($04:$00:$00:XX)
+        lda #$00
+        sta C128_MEM_PTR+0
+        sta C128_MEM_PTR+1
+        sta C128_MEM_PTR+3
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        stx C128_MEM_PTR+0
+        ldz #0
+        pla
+        sta [C128_MEM_PTR],z
+        rts
+
+; Helper: read LOW_RAM_BUFFER[Y] -> A  (preserves Y)
+; Now reads from bank 4 directly
+lrb_read_y:
+        #setup_bank4_zp
+        sty C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
+        rts
+
+; Helper: ASL ZP[X]  (preserves X, sets flags from result)
+lrb_asl_x:
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
+        asl a
+        sta [C128_MEM_PTR],z
+        rts
+
+; Helper: DEC ZP[X]  (preserves X, sets flags from result)
+lrb_dec_x:
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sec
+        sbc #1
+        sta [C128_MEM_PTR],z
+        rts
+
+; Helper: INC ZP[X]  (preserves X, sets flags from result)
+lrb_inc_x:
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
+        clc
+        adc #1
+        sta [C128_MEM_PTR],z
+        rts
+
+; Helper: set C128_MEM_PTR to LOW_RAM_BUFFER base (call before [C128_MEM_PTR],z access)
+setup_lrb:
+        lda #>LOW_RAM_BUFFER
+        sta C128_MEM_PTR+1
+        lda #$00
+        sta C128_MEM_PTR+0
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        rts
+
+; Macro: inline setup of C128_MEM_PTR to LOW_RAM_BUFFER
+; Clobbers A only
+setup_lrb_inline .macro
+        lda #>LOW_RAM_BUFFER
+        sta C128_MEM_PTR+1
+        lda #$00
+        sta C128_MEM_PTR+0
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        .endm
+
+; Macro: inline setup of C128_MEM_PTR to bank 4 page 0 (for ZP access)
+setup_bank4_zp .macro
+        lda #$00
+        sta C128_MEM_PTR+0
+        sta C128_MEM_PTR+1
+        sta C128_MEM_PTR+3
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        .endm
+
 ; Read from ZP address in X, result in A
 read_zp_x:
         cpx #$02
         bcc _rzpx_port
-        lda LOW_RAM_BUFFER,x
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
         rts
 _rzpx_port:
         cpx #$00
@@ -373,7 +483,10 @@ read_zp:
         ldx p4_addr_lo
         cpx #$02
         bcc _rzp_port
-        lda LOW_RAM_BUFFER,x
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
         rts
 _rzp_port:
         cpx #$00
@@ -396,17 +509,36 @@ _rzp_tmp: .byte 0
 write_zp_x:
         cpx #$02
         bcc _wzpx_port
-        sta LOW_RAM_BUFFER,x
+        pha
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
+        pla
+        sta [C128_MEM_PTR],z
         rts
 _wzpx_port:
         cpx #$00
         beq _wzpx_ddr
         sta cpu_port_data
-        sta LOW_RAM_BUFFER+$01  ; Mirror to LOW_RAM for non-ZP reads
+        ; Also write to bank 4
+        pha
+        #setup_bank4_zp
+        lda #$01
+        sta C128_MEM_PTR+0
+        ldz #0
+        lda cpu_port_data
+        sta [C128_MEM_PTR],z
+        pla
         rts
 _wzpx_ddr:
         sta cpu_port_ddr
-        sta LOW_RAM_BUFFER+$00  ; Mirror to LOW_RAM for non-ZP reads
+        ; Also write to bank 4
+        pha
+        #setup_bank4_zp
+        ldz #0
+        lda cpu_port_ddr
+        sta [C128_MEM_PTR],z
+        pla
         rts
 
 ; Write p4_data to ZP address in p4_addr_lo
@@ -414,28 +546,48 @@ write_zp:
         ldx p4_addr_lo
         cpx #$02
         bcc _wzp_port
+        #setup_bank4_zp
+        stx C128_MEM_PTR+0
+        ldz #0
         lda p4_data
-        sta LOW_RAM_BUFFER,x
+        sta [C128_MEM_PTR],z
         rts
 _wzp_port:
         lda p4_data
         cpx #$00
         beq _wzp_ddr
         sta cpu_port_data
-        sta LOW_RAM_BUFFER+$01  ; Mirror to LOW_RAM for non-ZP reads
+        ; Also write to bank 4
+        pha
+        #setup_bank4_zp
+        lda #$01
+        sta C128_MEM_PTR+0
+        ldz #0
+        lda cpu_port_data
+        sta [C128_MEM_PTR],z
+        pla
         rts
 _wzp_ddr:
         sta cpu_port_ddr
-        sta LOW_RAM_BUFFER+$00  ; Mirror to LOW_RAM for non-ZP reads
+        ; Also write to bank 4
+        pha
+        #setup_bank4_zp
+        ldz #0
+        lda cpu_port_ddr
+        sta [C128_MEM_PTR],z
+        pla
         rts
 
 ; Read 16-bit pointer from ZP address Y, result in p4_addr_lo/hi
 ; (Used for indirect addressing modes)
 read_zp_ptr_y:
-        lda LOW_RAM_BUFFER,y
+        #setup_bank4_zp
+        sty C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
         sta p4_addr_lo
-        iny
-        lda LOW_RAM_BUFFER,y
+        inc C128_MEM_PTR+0
+        lda [C128_MEM_PTR],z
         sta p4_addr_hi
         rts
 
@@ -504,10 +656,10 @@ addr_indx:
         adc p4_x
         tay                             ; Y = ZP address
         ; Read 16-bit pointer directly from ZP
-        lda LOW_RAM_BUFFER,y
+        jsr lrb_read_y
         sta p4_addr_lo
         iny
-        lda LOW_RAM_BUFFER,y
+        jsr lrb_read_y
         sta p4_addr_hi
         rts
 
@@ -517,10 +669,10 @@ addr_indy:
         lda #$00
         sta p4_xtra
         ; Read 16-bit pointer directly from ZP
-        lda LOW_RAM_BUFFER,y
+        jsr lrb_read_y
         sta p4_tmp
         iny
-        lda LOW_RAM_BUFFER,y
+        jsr lrb_read_y
         sta p4_tmp2
         ; Add Y register to form final address
         lda p4_tmp
@@ -587,6 +739,11 @@ _vic_line_loop:
         sta vic_cycle_accum
 
         ; === CIA1 Timer A countdown (approximate: per-line) ===
+        ; Only count if timer is running (bit 0 of control)
+        lda cia1_timer_a_ctrl
+        and #$01
+        beq _timer_a_no_borrow
+
         ; C128 KERNAL sets Timer A to ~$4025 for ~60Hz IRQ
         ; We subtract 63 per scanline as approximation
         lda cia1_timer_a_lo
@@ -724,10 +881,13 @@ hook_vdc_screen_clear:
         lda #$00
         ldx #19
         sta vdc_regs,x
+        #setup_bank4_zp
+        ldz #$DA
         lda #$00
-        sta LOW_RAM_BUFFER+$DA
+        sta [C128_MEM_PTR],z
+        ldz #$DB
         lda #$E0
-        sta LOW_RAM_BUFFER+$DB
+        sta [C128_MEM_PTR],z
         lda #$4B
         sta p4_pc_lo
         lda #$CE
@@ -815,6 +975,7 @@ vic_raster_compare_hi: .byte $01     ; Raster compare high bit
 ; Cursor state
 c128_cur_div:          .byte 0
 c128_cur_phase:        .byte 0
+pc_trace_idx:          .byte 0
 
 ; ============================================================
 ; cpu_take_irq - Execute IRQ sequence
@@ -1113,6 +1274,9 @@ _sm_monitor_active:
 ; P4CPU_Step - Single instruction execution
 ; ============================================================
 P4CPU_Step:
+        ; Debug: prove we're entering step
+        inc $FE10
+
         ; --- Boot milestone & hook checks ---
         ; Milestones write progress byte to $0FE0F via 32-bit store.
         ; Check $0FE0F in the monitor to see how far boot got.
@@ -1290,13 +1454,142 @@ _hook_not_e0:
         ; CINT screen editor init
         lda p4_pc_hi
         cmp #$C0
-        bne +
+        bne _hook_not_c0
         lda p4_pc_lo
         cmp #$7B
         bne +
         lda #$0A
-        jsr write_milestone     ; $0A = C07B (CINT)
+        jsr write_milestone     ; $0A = C07B (CINT entered)
++       lda p4_pc_lo
+        cmp #$8B
+        bne +
+        lda #$40
+        jsr write_milestone     ; $40 = C08B (JSR $FFCC / CLRCHN)
++       lda p4_pc_lo
+        cmp #$8E
+        bne +
+        lda #$41
+        jsr write_milestone     ; $41 = C08E (past CLRCHN)
++       lda p4_pc_lo
+        cmp #$D0
+        bne +
+        lda #$42
+        jsr write_milestone     ; $42 = C0D0 (JSR $C983)
++       lda p4_pc_lo
+        cmp #$D3
+        bne +
+        lda #$43
+        jsr write_milestone     ; $43 = C0D3 (past C983)
++       lda p4_pc_lo
+        cmp #$F6
+        bne +
+        lda #$44
+        jsr write_milestone     ; $44 = C0F6 (copy loop done)
 +
+_hook_not_c0:
+
+        ; Deeper CINT milestones (page $C1)
+        lda p4_pc_hi
+        cmp #$C1
+        bne _hook_not_c1
+        lda p4_pc_lo
+        cmp #$01
+        bne +
+        lda #$45
+        jsr write_milestone     ; $45 = C101 (BIT $0A04)
++       lda p4_pc_lo
+        cmp #$11
+        bne +
+        lda #$46
+        jsr write_milestone     ; $46 = C111 (copy CEA8 to $1000)
++       lda p4_pc_lo
+        cmp #$24
+        bne +
+        lda #$47
+        jsr write_milestone     ; $47 = C124 (JSR $CD2E)
++       lda p4_pc_lo
+        cmp #$2A
+        bne +
+        lda #$48
+        jsr write_milestone     ; $48 = C12A (JSR $CA24)
++       lda p4_pc_lo
+        cmp #$2D
+        bne +
+        lda #$49
+        jsr write_milestone     ; $49 = C12D (JSR $C142)
++       lda p4_pc_lo
+        cmp #$30
+        bne +
+        lda #$4A
+        jsr write_milestone     ; $4A = C130 (JSR $CD2E again)
++       lda p4_pc_lo
+        cmp #$39
+        bne +
+        lda #$4B
+        jsr write_milestone     ; $4B = C139 (BIT $D505)
++       lda p4_pc_lo
+        cmp #$41
+        bne +
+        lda #$4C
+        jsr write_milestone     ; $4C = C141 (RTS from CINT)
++       ; Inside C142
+        lda p4_pc_lo
+        cmp #$42
+        bne +
+        lda #$50
+        jsr write_milestone     ; $50 = C142 (entered)
++       lda p4_pc_lo
+        cmp #$45
+        bne +
+        lda #$51
+        jsr write_milestone     ; $51 = C145 (JSR $C15E)
++       lda p4_pc_lo
+        cmp #$48
+        bne +
+        lda #$52
+        jsr write_milestone     ; $52 = C148 (JSR $C4A5)
++       lda p4_pc_lo
+        cmp #$4B
+        bne +
+        lda #$53
+        jsr write_milestone     ; $53 = C14B (CPX loop check)
++       lda p4_pc_lo
+        cmp #$5C
+        bne +
+        lda #$55
+        jsr write_milestone     ; $55 = C15C (after CPX loop)
++       lda p4_pc_lo
+        cmp #$7A
+        bne +
+        lda #$56
+        jsr write_milestone     ; $56 = C17A
++       lda p4_pc_lo
+        cmp #$91
+        bne +
+        lda #$57
+        jsr write_milestone     ; $57 = C191
++       lda p4_pc_lo
+        cmp #$93
+        bne +
+        lda #$58
+        jsr write_milestone     ; $58 = C193 (CINT RTS!)
++
+_hook_not_c1:
+
+        ; C4A5 screen clear milestones
+        lda p4_pc_hi
+        cmp #$C4
+        bne _hook_not_c4
+        lda p4_pc_lo
+        cmp #$A5
+        bne +
+        lda #$54
+        jsr write_milestone     ; $54 = C4A5 (entered)
++
+_hook_not_c4:
+        jmp _past_c4_data
+_c4c0_fired: .byte 0
+_past_c4_data:
         ; Post-CINT milestones
         lda p4_pc_hi
         cmp #$E0
@@ -1316,10 +1609,90 @@ _hook_not_e0:
         bne +
         lda #$32
         jsr write_milestone     ; $32 = E03E (JMP $B000)
++       lda p4_pc_lo
+        cmp #$3C
+        bne +
+        lda #$33
+        jsr write_milestone     ; $33 = E03C (instruction after CLI)
 +
 _hook_not_e0_post:
 
-        ; BASIC cold start
+        ; BASIC cold start paths
+        lda p4_pc_hi
+        cmp #$E0
+        bne _not_e0_alt
+        lda p4_pc_lo
+        cmp #$41
+        bne +
+        lda #$35
+        jsr write_milestone     ; $35 = E041 (BMI target - alt boot)
++       lda p4_pc_lo
+        cmp #$45
+        bne +
+        lda #$36
+        jsr write_milestone     ; $36 = E045 JMP ($0A00)
++
+_not_e0_alt:
+
+        lda p4_pc_hi
+        cmp #$40
+        bne _not_40
+        lda p4_pc_lo
+        cmp #$00
+        bne +
+        lda #$37
+        jsr write_milestone     ; $37 = 4000 (BASIC LO entry!)
++       lda p4_pc_lo
+        cmp #$23
+        bne +
+        lda #$38
+        jsr write_milestone     ; $38 = 4023 (BASIC LO cold start)
++       lda p4_pc_lo
+        cmp #$45
+        bne +
+        lda #$39
+        jsr write_milestone     ; $39 = 4045
++       lda p4_pc_lo
+        cmp #$1C
+        bne +
+        lda #$3A
+        jsr write_milestone     ; $3A = 401C (CLI before main loop)
++
+        ; Check for $4Dxx range
+        lda p4_pc_hi
+        cmp #$4D
+        bne _not_4d
+        lda p4_pc_lo
+        cmp #$37
+        bne +
+        lda #$3B
+        jsr write_milestone     ; $3B = 4D37 (BASIC main loop entry)
++       lda p4_pc_lo
+        cmp #$B7
+        bne +
+        lda #$3C
+        jsr write_milestone     ; $3C = 4DB7 (after JMP ($0300))
++       lda p4_pc_lo
+        cmp #$C6
+        bne +
+        lda #$3D
+        jsr write_milestone     ; $3D = 4DC6 (input loop)
++
+_not_4d:
+        ; Check for $4Fxx (input routine)
+        lda p4_pc_hi
+        cmp #$4F
+        bne _not_4f
+        lda p4_pc_lo
+        cmp #$93
+        bne +
+        lda #$3E
+        jsr write_milestone     ; $3E = 4F93 (line input)
++
+_not_4f:
+
+_not_40:
+
         lda p4_pc_hi
         cmp #$B0
         bne +
@@ -1327,7 +1700,15 @@ _hook_not_e0_post:
         cmp #$00
         bne +
         lda #$0B
-        jsr write_milestone     ; $0B = B000 (BASIC!)
+        jsr write_milestone     ; $0B = B000 (BASIC HI entry)
++       lda p4_pc_hi
+        cmp #$B0
+        bne +
+        lda p4_pc_lo
+        cmp #$03
+        bne +
+        lda #$34
+        jsr write_milestone     ; $34 = B003 (BASIC IRQ handler)
 +       lda p4_pc_hi
         cmp #$B0
         bne +
@@ -1335,7 +1716,7 @@ _hook_not_e0_post:
         cmp #$21
         bne +
         lda #$0C
-        jsr write_milestone     ; $0C = B021 (BASIC init)
+        jsr write_milestone     ; $0C = B021 (BASIC HI init)
 +
         ; Hook: VDC polling loops at $C543, $CDCF, $CDDD
         ; These poll $D600 bit 7 (VDC ready). Since we return $A0,
@@ -1421,6 +1802,22 @@ _step_execute:
         lda p4_pc_hi
         sta p4_inst_pc_hi
 
+        ; PC trace - store last PC before halt
+        lda $FE14
+        sta $FE16              ; prev-prev lo
+        lda $FE15
+        sta $FE17              ; prev-prev hi
+        lda $FE12
+        sta $FE14              ; prev lo
+        lda $FE13
+        sta $FE15              ; prev hi
+        lda p4_pc_lo
+        sta $FE12              ; current lo
+        lda p4_pc_hi
+        sta $FE13              ; current hi
+        ; increment counter
+        inc $FE18
+
         ; Check breakpoint BEFORE we fetch/execute
 .if TRACE_ENABLED
         lda p4_inst_pc_hi
@@ -1489,41 +1886,32 @@ _fc_done:
         rts
 
 op_illegal:
-        ; Store PC values immediately in safe locations
-        lda p4_inst_pc_hi
-        sta _ill_pc_hi
+        ; Store debug info using 32-bit writes
+        lda #$00
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        lda #$FE
+        sta C128_MEM_PTR+1
+        ldz #0
+
+        lda #$0D
+        sta C128_MEM_PTR+0
         lda p4_inst_pc_lo
-        sta _ill_pc_lo
-        
-        ; RED border = entered handler
+        sta [C128_MEM_PTR],z   ; $FE0D = PC lo
+
+        lda #$0E
+        sta C128_MEM_PTR+0
+        lda p4_inst_pc_hi
+        sta [C128_MEM_PTR],z   ; $FE0E = PC hi
+
+        lda #$0C
+        sta C128_MEM_PTR+0
+        lda #$BB
+        sta [C128_MEM_PTR],z   ; $FE0C = illegal marker
+
+        ; RED border and halt
         lda #$02
         sta $d020
-        jsr _ill_long_delay
-        
-        ; YELLOW = about to show PC hi
-        lda #$07
-        sta $d020
-        jsr _ill_long_delay
-        
-        ; Show PC high byte as border color
-        lda _ill_pc_hi
-        sta $d020
-        jsr _ill_long_delay
-        
-        ; CYAN = about to show PC lo
-        lda #$03
-        sta $d020
-        jsr _ill_long_delay
-        
-        ; Show PC low byte as border color
-        lda _ill_pc_lo
-        sta $d020
-        jsr _ill_long_delay
-
-        ; WHITE = done, about to halt
-        lda #$01
-        sta $d020
-
 _ill_halt:
         jmp _ill_halt
 
@@ -1917,9 +2305,61 @@ _cpy_n:
 
 ; $00 BRK
 op_00:
-;lda #$02
-;sta $D020
-;jmp op_00
+        ; BRK detected - write distinctive pattern
+        lda #$DE
+        sta $7000
+        lda #$AD
+        sta $7001
+        lda #$BE
+        sta $7002
+        lda #$EF
+        sta $7003
+        lda #$C8
+        sta $7004              ; marker
+        ; Now store actual debug info
+        lda p4_inst_pc_lo
+        sta $7005
+        lda p4_inst_pc_hi
+        sta $7006
+        lda p4_pc_lo
+        sta $7007
+        lda p4_pc_hi
+        sta $7008
+        ; MMU state
+        lda mmu_kernal_rom
+        sta $7009
+        lda mmu_basic_hi_rom
+        sta $700A
+        lda mmu_basic_lo_rom
+        sta $700B
+        lda mmu_io_visible
+        sta $700C
+        lda mmu_cr
+        sta $700D
+        ; Direct read test: read $FBED through C128_Read
+        lda #$ED
+        sta p4_addr_lo
+        lda #$FB
+        sta p4_addr_hi
+        jsr C128_ReadFast
+        sta $700E              ; what C128_ReadFast returns for $FBED
+        ; Direct 32-bit read of $1FBED (bypass emulator entirely)
+        lda #$ED
+        sta C128_MEM_PTR+0
+        lda #$FB
+        sta C128_MEM_PTR+1
+        lda #$01
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sta $700F              ; raw 32-bit read of $1FBED
+        ; Halt - green border
+        lda #$05
+        sta $D020
+_brk_halt:
+        jmp _brk_halt
 
 
         jsr fetch8
@@ -1967,7 +2407,7 @@ op_05:
         ; Optimized ORA zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -1981,7 +2421,7 @@ op_06:
         jsr fetch8
         tax
         ; ASL directly in LOW_RAM_BUFFER
-        asl LOW_RAM_BUFFER,x
+        jsr lrb_asl_x
         ; Update carry flag
         lda p4_p
         and #(~P_C) & $ff
@@ -1990,7 +2430,7 @@ op_06:
 _op06_nc:
         sta p4_p
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #5
         #finish_cycles_inline
@@ -2111,7 +2551,7 @@ op_15:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         ora p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2128,7 +2568,7 @@ op_16:
         adc p4_x
         tax
         ; ASL directly in LOW_RAM_BUFFER
-        asl LOW_RAM_BUFFER,x
+        jsr lrb_asl_x
         ; Update carry flag
         lda p4_p
         and #(~P_C) & $ff
@@ -2137,7 +2577,7 @@ op_16:
 _op16_nc:
         sta p4_p
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #6
         #finish_cycles_inline
@@ -2243,7 +2683,7 @@ op_24:
         ; Optimized BIT zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_tmp
         lda p4_p
         and #(~(P_N|P_V|P_Z)) & $ff
@@ -2272,7 +2712,7 @@ op_25:
         ; Optimized AND zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2290,12 +2730,12 @@ op_26:
         and #P_C
         sta p4_tmp2
         ; Get memory, save bit 7 for new carry
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_tmp
         ; Shift left and OR in old carry
         asl
         ora p4_tmp2
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         ; Update carry from old bit 7
         lda p4_p
         and #(~P_C) & $ff
@@ -2307,7 +2747,7 @@ op_26:
         sta p4_p
 _op26_nc:
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #5
         #finish_cycles_inline
@@ -2466,7 +2906,7 @@ op_35:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         and p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2487,12 +2927,12 @@ op_36:
         and #P_C
         sta p4_tmp2
         ; Get memory, save bit 7 for new carry
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_tmp
         ; Shift left and OR in old carry
         asl
         ora p4_tmp2
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         ; Update carry from old bit 7
         lda p4_p
         and #(~P_C) & $ff
@@ -2504,7 +2944,7 @@ op_36:
         sta p4_p
 _op36_nc:
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #6
         #finish_cycles_inline
@@ -2604,7 +3044,7 @@ op_45:
         ; Optimized EOR zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2618,9 +3058,9 @@ op_46:
         jsr fetch8
         tax
         ; Check bit 0 for carry before shift
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         lsr
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         ; Update carry - carry flag is already set correctly by LSR
         lda p4_p
         and #(~P_C) & $ff
@@ -2629,7 +3069,7 @@ op_46:
 _op46_nc:
         sta p4_p
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #5
         #finish_cycles_inline
@@ -2762,7 +3202,7 @@ op_55:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         eor p4_a
         sta p4_a
         ;jsr set_zn_a
@@ -2779,9 +3219,9 @@ op_56:
         adc p4_x
         tax
         ; Shift right directly
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         lsr
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         ; Update carry - carry flag already set by LSR
         lda p4_p
         and #(~P_C) & $ff
@@ -2790,7 +3230,7 @@ op_56:
 _op56_nc:
         sta p4_p
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #6
         #finish_cycles_inline
@@ -2879,7 +3319,7 @@ op_65:
         ; Optimized ADC zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_adc
         lda #3
         #finish_cycles_inline
@@ -2901,12 +3341,12 @@ _op66_nci:
         sta p4_tmp2
 _op66_do:
         ; Get memory, save bit 0 for new carry
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_tmp
         ; Shift right and OR in old carry
         lsr
         ora p4_tmp2
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         ; Update carry from old bit 0
         lda p4_p
         and #(~P_C) & $ff
@@ -2919,7 +3359,7 @@ _op66_do:
         sta p4_p
 _op66_nc:
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #5
         #finish_cycles_inline
@@ -3069,7 +3509,7 @@ op_75:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_adc
         lda #4
         #finish_cycles_inline
@@ -3094,12 +3534,12 @@ _op76_nci:
         sta p4_tmp2
 _op76_do:
         ; Get memory, save bit 0 for new carry
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_tmp
         ; Shift right and OR in old carry
         lsr
         ora p4_tmp2
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         ; Update carry from old bit 0
         lda p4_p
         and #(~P_C) & $ff
@@ -3112,7 +3552,7 @@ _op76_do:
         sta p4_p
 _op76_nc:
         ; Set N/Z from result
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         #set_zna
         lda #6
         #finish_cycles_inline
@@ -3198,7 +3638,7 @@ op_84:
         jsr fetch8
         tax
         lda p4_y
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         lda #3
         #finish_cycles_inline
         rts
@@ -3209,7 +3649,7 @@ op_85:
         jsr fetch8
         tax
         lda p4_a
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         lda #3
         #finish_cycles_inline
         rts
@@ -3219,7 +3659,7 @@ op_86:
         jsr fetch8
         tax
         lda p4_x
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         lda #3
         #finish_cycles_inline
         rts
@@ -3313,7 +3753,7 @@ op_94:
         adc p4_x
         tax
         lda p4_y
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         lda #4
         #finish_cycles_inline
         rts
@@ -3326,7 +3766,7 @@ op_95:
         adc p4_x
         tax
         lda p4_a
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         lda #4
         #finish_cycles_inline
         rts
@@ -3339,7 +3779,7 @@ op_96:
         adc p4_y
         tax
         lda p4_x
-        sta LOW_RAM_BUFFER,x
+        jsr lrb_write_x
         lda #4
         #finish_cycles_inline
         rts
@@ -3415,7 +3855,7 @@ op_a4:
         ; Optimized LDY zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_y
         #set_zna
         lda #3
@@ -3427,7 +3867,7 @@ op_a5:
         ; Optimized LDA zp - direct access to LOW_RAM_BUFFER
         jsr fetch8              ; Get zero page address in A
         tax
-        lda LOW_RAM_BUFFER,x             ; Direct read from LOW_RAM_BUFFER
+        jsr lrb_read_x
         sta p4_a
         #set_zna
         lda #3
@@ -3439,7 +3879,7 @@ op_a6:
         ; Optimized LDX zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_x
         #set_zna
         lda #3
@@ -3542,7 +3982,7 @@ op_b4:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_y
         ;jsr set_zn_a
         #set_zna
@@ -3557,7 +3997,7 @@ op_b5:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_a
         ;jsr set_zn_a
         #set_zna
@@ -3572,7 +4012,7 @@ op_b6:
         clc
         adc p4_y
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         sta p4_x
         ;jsr set_zn_a
         #set_zna
@@ -3664,7 +4104,7 @@ op_c4:
         ; Optimized CPY zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_cpy
         lda #3
         #finish_cycles_inline
@@ -3675,7 +4115,7 @@ op_c5:
         ; Optimized CMP zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_cmp
         lda #3
         #finish_cycles_inline
@@ -3686,8 +4126,8 @@ op_c6:
         ; Optimized DEC zp
         jsr fetch8
         tax
-        dec LOW_RAM_BUFFER,x
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_dec_x
+        jsr lrb_read_x
         ;jsr set_zn_a
         #set_zna
         lda #5
@@ -3787,7 +4227,7 @@ op_d5:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_cmp
         lda #4
         #finish_cycles_inline
@@ -3800,8 +4240,8 @@ op_d6:
         clc
         adc p4_x
         tax
-        dec LOW_RAM_BUFFER,x
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_dec_x
+        jsr lrb_read_x
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -3872,7 +4312,7 @@ op_e4:
         ; Optimized CPX zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_cpx
         lda #3
         #finish_cycles_inline
@@ -3883,7 +4323,7 @@ op_e5:
         ; Optimized SBC zp
         jsr fetch8
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_sbc
         lda #3
         #finish_cycles_inline
@@ -3894,8 +4334,8 @@ op_e6:
         ; Optimized INC zp
         jsr fetch8
         tax
-        inc LOW_RAM_BUFFER,x
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_inc_x
+        jsr lrb_read_x
         ;jsr set_zn_a
         #set_zna
         lda #5
@@ -3992,7 +4432,7 @@ op_f5:
         clc
         adc p4_x
         tax
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_read_x
         jsr do_sbc
         lda #4
         #finish_cycles_inline
@@ -4005,8 +4445,8 @@ op_f6:
         clc
         adc p4_x
         tax
-        inc LOW_RAM_BUFFER,x
-        lda LOW_RAM_BUFFER,x
+        jsr lrb_inc_x
+        jsr lrb_read_x
         ;jsr set_zn_a
         #set_zna
         lda #6

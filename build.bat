@@ -10,4 +10,5 @@ c1541 -attach c128.d81 -write ../src/chargen-390059-01.bin chargen.bin
 c1541 -attach c128.d81 -write ../src/kernal-318020-05.bin kernal.bin
 c1541 -attach c128.d81 -write ../src/basiclo-318018-04.bin basiclo.bin
 c1541 -attach c128.d81 -write ../src/basichi-318019-04.bin basichi.bin
+c1541 -attach c128.d81 -write ../src/roms.bin roms.bin
 cd ..
