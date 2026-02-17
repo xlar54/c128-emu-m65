@@ -5,13 +5,14 @@
 ; Memory Layout:
 ;   Bank 0:
 ;     $08000-$09FFF: Character ROM (C128 chargen, 8KB, stays at staging area)
-;   Bank 1 ($10000-$1FFFF): C128 ROMs + VDC RAM
-;     $10000-$13FFF: VDC RAM (16KB)
+;   Bank 1 ($10000-$1FFFF): C128 ROMs
+;     $10000-$11FFF: Character ROM (chargen, 8KB)
 ;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF)
 ;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF)
 ;     $1C000-$1FFFF: KERNAL ROM    (C128 $C000-$FFFF)
 ;   Bank 4 ($40000-$4FFFF): C128 RAM Bank 0 (64KB)
 ;   Bank 5 ($50000-$5FFFF): C128 RAM Bank 1 (64KB)
+;   ATTIC RAM ($8000000-$8003FFF): VDC RAM (16KB)
 ;
 ; ROM files on SD card:
 ;   kernal.bin   = 318020-05  KERNAL     (16KB -> $1C000)
@@ -57,22 +58,6 @@ DMA_REG = $D707
 ; Entry point
 ; ============================================================
 start:
-        ; Enable MEGA65 mode and fast CPU
-        lda #$47
-        sta $D02F
-        lda #$53
-        sta $D02F              ; Unlock MEGA65 registers
-
-        ; Print banner
-        ldx #0
-_banner:
-        lda banner_msg,x
-        beq _banner_done
-        jsr CHROUT
-        inx
-        bne _banner
-_banner_done:
-
         ; ============================================================
         ; Clear C128 RAM Bank 0 (MEGA65 bank 4) via DMA fill
         ; ============================================================
@@ -110,16 +95,6 @@ _banner_done:
         ; File layout: chargen@$0000, basiclo@$4000, basichi@$8000, kernal@$C000
         ; Also copies chargen ($10000-$11FFF) to $08000 for VIC-IV
         ; ============================================================
-
-        ; Print loading message
-        ldx #0
-_ld_msg: lda loading_msg,x
-        beq _ld_msg_done
-        jsr CHROUT
-        inx
-        bne _ld_msg
-
-_ld_msg_done:
 
         ; kernal
 
@@ -181,6 +156,8 @@ _ld_msg_done:
         jsr LOAD
 
 
+        ; chargen
+
         lda #$01
         ldx #$00
         jsr SETBNK
@@ -198,116 +175,17 @@ _ld_msg_done:
         ldy #$00
         jsr LOAD
 
-
-
-
-        ; Print done message
-        ldx #0
-_ld_ok: lda roms_ok_msg,x
-        beq _ld_ok_done
-        jsr CHROUT
-        inx
-        bne _ld_ok
-_ld_ok_done:
-        jmp _rom_load_continue
-
-_rom_load_fail:
-        ldx #0
-_lf:    lda rom_fail_msg,x
-        beq _lf_hang
-        jsr CHROUT
-        inx
-        bne _lf
-_lf_hang:
-        jmp _lf_hang
-
-_rom_load_continue:
-
         ; ============================================================
-        ; Initialize memory system
+        ; Initialize memory, video, and start emulation
         ; ============================================================
-        ldx #0
-_init_msg:
-        lda init_msg,x
-        beq _init_done
-        jsr CHROUT
-        inx
-        bne _init_msg
-_init_done:
 
         jsr C128_MemInit
-
-        ldx #0
-_ready_msg:
-        lda ready_msg,x
-        beq _ready_done
-        jsr CHROUT
-        inx
-        bne _ready_msg
-_ready_done:
-
-        ; Wait for keypress
-        ldx #0
-_press: lda press_msg,x
-        beq _wait
-        jsr CHROUT
-        inx
-        bne _press
-_wait:
-        jsr GETIN
-        beq _wait
-
-        ; ============================================================
-        ; Initialize video and start emulation
-        ; ============================================================
-
         jsr C128_VideoInit
-        
-        ; ROM check after VideoInit
-        lda #$ED
-        sta C128_MEM_PTR+0
-        lda #$FB
-        sta C128_MEM_PTR+1
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $7010              ; should be $D7 if ROM intact after VideoInit
 
         ; Initialize LOW_RAM_BUFFER pointer for ZP/stack access
         jsr lrb_ptr_init
 
-        lda #$ED
-        sta C128_MEM_PTR+0
-        lda #$FB
-        sta C128_MEM_PTR+1
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $7011              ; after lrb_ptr_init
-
-        ; Set border to black = boot starting
-        lda #$00
-        sta $D020
-        
         jsr C128_CPUReset
-
-        lda #$ED
-        sta C128_MEM_PTR+0
-        lda #$FB
-        sta C128_MEM_PTR+1
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $7012              ; after CPUReset
 
 main_loop:
         ; --- Check if print requested ---

@@ -11,8 +11,8 @@
 ;   $FF00-$FF04 ALWAYS mapped to MMU (not RAM/ROM)
 ;
 ; MEGA65 Host Memory Layout:
-;   Bank 1 ($10000-$1FFFF): C128 ROMs + VDC RAM (64KB)
-;     $10000-$13FFF: VDC RAM (16KB)
+;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB)
+;     $10000-$11FFF: Character ROM (chargen, 8KB)
 ;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF)
 ;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF)
 ;     $1C000-$1FFFF: KERNAL ROM    (C128 $C000-$FFFF)
@@ -138,9 +138,9 @@ cia2_regs:       .fill 16, 0      ; CIA2 $DD00-$DD0F
 ; Accessed through index/data at $D600/$D601
 vdc_index:       .byte 0          ; Current VDC register index
 vdc_regs:        .fill 38, 0      ; VDC internal registers (R0-R37)
-; VDC 16KB RAM stored at $10000-$13FFF in bank 1
-VDC_RAM_BANK = $01
-VDC_RAM_BASE = $10000
+; VDC 16KB RAM stored in ATTIC RAM at $8000000
+VDC_RAM_BANK = $00              ; low bank byte for ATTIC RAM
+VDC_RAM_ATTIC_HI = $08          ; high byte ($08xxxxxx = ATTIC RAM)
 
 ; SID registers are passed through to real hardware
 
@@ -173,7 +173,8 @@ C128_MemInit:
         lda #$00
         sta mmu_p1h
 
-        ; Compute derived state from MMU registers
+        ; Compute derived state from MMU registers (initial setup)
+        ; NOTE: Done here first so vic_regs clear uses correct bank
         jsr mmu_update_derived
 
         ; Initialize VIC-II shadow registers to defaults
@@ -202,89 +203,119 @@ _clear_cia:
         ; Clear local low RAM buffer
         jsr clear_low_ram_buffer
 
+        ; Re-derive MMU state AFTER clear_low_ram_buffer
+        ; (DMA may have zeroed our variables if they overlap $A000-$AFFF)
+        jsr mmu_update_derived
+
         rts
 
 ; ============================================================
-; C128_VideoInit - Set up VIC-IV for C128 display
-; Call AFTER all MEGA65 KERNAL calls are done!
+; C128_VideoInit - Set up display for C128 emulation
+; VIC-IV must stay unlocked for SCRNPTR/CHARPTR to work.
+; We disable VIC-III extended attributes to keep VIC-II color
+; behavior. Everything else uses standard VIC-II registers.
 ; ============================================================
 C128_VideoInit:
-        ; Unlock VIC-III then VIC-IV
-        lda #$A5
-        sta $D02F
-        lda #$96
-        sta $D02F
+        ; Unlock VIC-IV
         lda #$47
         sta $D02F
         lda #$53
         sta $D02F
 
-        ; Make sure HOTREG is OFF so our writes don't trigger auto-calculation
+        ; Make sure HOTREG is OFF so VIC-II changes dont effect VIC-IV registers
         lda $D05D
         and #$7F                ; Clear bit 7 (HOTREG disable)
         sta $D05D
 
-        ; Color RAM pointer - set FIRST before anything else
-        ; MEGA65 color RAM is at fixed $FF80000
-        lda #$00
-        sta $D063               ; COLPTR LSB
-        lda #$00
-        sta $D064               ; COLPTR middle
-        lda #$80
-        sta $D065               ; COLPTR high -> $FF80000
 
-        ; Standard text mode
-        lda #$1B
-        sta $D011               ; 25-row text mode, screen on
-        lda #$14
-        sta $D018               ; screen at $0400, charset at $1000 (C64 compat, overridden below)
-
-        ; Point VIC-IV screen at C128 RAM bank 0 + $0400
-        ; C128 default screen is at $0400, in MEGA65 bank 4 = $40400
+        
+        ; Switch to 40-column mode (H640 off, VIC-III attributes off)
+        ; Clear all: H640=0 (bit 7), ATTR=0 (bit 5)
         lda #$00
-        sta $D060               ; SCRNPTR LSB = $00
+        sta $D031               
+
+        ; Standard VIC-II setup
+        ;lda #$1B
+        ;sta $D011               ; 25-row text mode
+        ;lda #$14
+        ;sta $D018               ; default charset layout
+
+        ; Point screen at C128 RAM bank 4 + $0400 = $040400
+        ; $040400 is within VIC-IV's 384KB range
+        lda #$00
+        sta $D060               ; SCRNPTR[7:0]   = $00
+        ;sta $D063               ; SCRNPTR[31:24] = $00
         lda #$04
-        sta $D061               ; SCRNPTR middle = $04 (for $x0400)
+        sta $D061               ; SCRNPTR[15:8]  = $04
         lda #BANK_RAM0
-        sta $D062               ; SCRNPTR bank = 4 -> $40400
+        sta $D062               ; SCRNPTR[23:16] = $04 -> $040400
 
-        ; Point charset at C128 character ROM in bank 0
-        ; C128 charset is in second 4KB half: $09000-$09FFF
-        ; Default is uppercase/graphics at $09000
+
+        ; Point charset at C128 character ROM in bank 1
+        ; C128 charset is in second 4KB half: $0000-$0FFF
+        ; Default is uppercase/graphics
         lda #$00
         sta $D068               ; CHARPTR LSB
-        lda #$90
-        sta $D069               ; CHARPTR middle ($90 within bank 0)
-        lda #$00
-        sta $D06A               ; CHARPTR bank = 0 -> $09000
+        lda #$90 ;00
+        sta $D069               ; CHARPTR byte 1
+        lda #$00 ;01
+        sta $D06A               ; CHARPTR byte 2 -> $010000
 
         ; Standard 40-column, virtual row width = 40
+        ; Necesssary!
         lda #40
         sta $D058
         lda #0
         sta $D059
 
         ; CHR16 OFF (standard 1-byte screen codes)
-        lda $D054
-        and #$FE
-        sta $D054
+        ;lda $D054
+        ;and #$FC                ; Clear bits 0-1 (CHR16, FCM)
+        ;sta $D054
+        lda #$d7                ; same thing?
+        trb $d054
 
         ; MCM off
-        lda $D016
-        and #$EF
-        sta $D016
+        ; unnecessary
+        ;lda $D016
+        ;and #$EF
+        ;;lda #$08
+        ;sta $D016               ; 40 columns, no scroll, MCM off
 
-        ; Set default C128 colors
-        ; Border = light blue (14), Background = blue (6)
-        lda #14
-        sta $D020
-        lda #6
-        sta $D021
+        ; Default C128 colors
+        lda #13
+        sta $D020               ; border = light green
+        lda #11
+        sta $D021               ; background = dark grey
 
-        ; NOTE: Do NOT fill color RAM here with STA $D800,x!
-        ; After HOTREG processing, COLPTR may point into bank 1 ROM space,
-        ; so direct writes to $D800+ would corrupt KERNAL ROM.
-        ; The C128 KERNAL will initialize color RAM through the emulated path.
+
+        ; Clear color RAM to light green (13)
+;        ldx #0
+;        lda #$0D
+;_clr_color:
+;        sta $D800,x
+;        sta $D900,x
+;        sta $DA00,x
+;        sta $DB00,x
+;        inx
+;        bne _clr_color
+
+
+
+        ; Color RAM pointer - set FIRST before anything else
+        ; MEGA65 color RAM is at fixed $FF80000
+        ; Set COLPTR to physical color RAM at $FF8(0000)
+        ; so writes to $D800 go to actual color RAM, not ROM
+        lda #$00
+        sta $D064               ; COLPTR byte 0
+        lda #$00
+        sta $D065               ; COLPTR byte 1
+        lda #$F8
+        sta $D066               ; COLPTR[23:16] = $F8
+        lda #$0F
+        sta $D067               ; COLPTR[31:24] = $0F  -> $0FF80800
+
+
 
         rts
 
@@ -558,8 +589,12 @@ _rd_not_low:
         cmp #$05
         bcc read_mmu_register   ; $FF00-$FF04 -> MMU
         ; $FF05-$FFFF: KERNAL ROM or RAM
-        lda mmu_kernal_rom
-        bne read_from_kernal
+        ; Check mmu_cr bits 5-4 directly (00 = KERNAL ROM)
+        lda mmu_cr
+        and #$30
+        bne _ff_read_ram        ; nonzero = RAM or function ROM
+        jmp read_from_kernal
+_ff_read_ram:
         jmp read_ram_direct
 
 _rd_not_ff:
@@ -1019,7 +1054,7 @@ _rv_vdc_open:
 
 _rv_vdc_data:
         ; R31: Read byte from VDC RAM at address R18:R19, auto-increment
-        ; VDC RAM is at $10000 in bank 1
+        ; VDC RAM is in ATTIC RAM at $8000000
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
         lda vdc_regs+18         ; address hi
@@ -1027,7 +1062,7 @@ _rv_vdc_data:
         sta C128_MEM_PTR+1
         lda #VDC_RAM_BANK
         sta C128_MEM_PTR+2
-        lda #$00
+        lda #VDC_RAM_ATTIC_HI
         sta C128_MEM_PTR+3
         ldz #0
         lda [C128_MEM_PTR],z
@@ -1354,8 +1389,19 @@ write_vic_register:
         beq _wv_d021
         ; Other VIC registers: also write to real VIC-IV
         ; (sprite regs, scroll, etc.)
+        ;lda c128_saved_data
+        ;sta $D000,x
+        ;rts
+        ; Other VIC registers: also write to real VIC-IV
+        ; (sprite regs, scroll, etc.)
+        cpx #$2F
+        beq _wv_ignore
+        cpx #$30
+        beq _wv_ignore
         lda c128_saved_data
         sta $D000,x
+        rts
+_wv_ignore:
         rts
 
 _wv_d011:
@@ -1390,7 +1436,6 @@ _wv_d018:
         sta _d018_char_hi
 
         ; Check for character ROM shadow: offset $10 or $18
-        ; (charset at $1000-$17FF or $1800-$1FFF in VIC bank 0 or 2)
         cmp #$10
         beq _d018_charrom
         cmp #$18
@@ -1405,43 +1450,52 @@ _wv_d018:
         sta $D06A
         jmp _d018_screen
 
+;_d018_charrom:
+;        ; Point at chargen in bank 1 at $10000
+;        lda #$00
+;        sta $D068
+;        lda _d018_char_hi
+;        sec
+;        sbc #$10                ; $10 -> $00, $18 -> $08
+;        sta $D069
+;        lda #$01
+;        sta $D06A
+
 _d018_charrom:
-        ; Character ROM shadow - point at chargen in bank 0 at $08000
-        ; The chargen ROM at $08000 has:
-        ;   $08000-$087FF: C64 charset upper/graphics
-        ;   $08800-$08FFF: C64 charset lower/upper
-        ;   $09000-$097FF: C128 charset upper/graphics
-        ;   $09800-$09FFF: C128 charset lower/upper
-        ; For C128 mode we want the C128 charset (second 4KB half)
-        ; _d018_char_hi is $10 or $18 (from VIC $D018 bits)
-        ; $10 -> $09000, $18 -> $09800
-        ; So: CHARPTR = $80 + _d018_char_hi + $10 = $90 or $98
+        ; Point at chargen at $9000 in bank 0
+        ; $D018 charset offset $10 -> $9000 (uppercase/graphics)
+        ; $D018 charset offset $18 -> $9800 (lowercase/uppercase)
         lda #$00
-        sta $D068               ; CHARPTR low = 0
+        sta $D068
         lda _d018_char_hi
         clc
-        adc #$80                ; $80 base for chargen in bank 0
-        adc #$10                ; +$1000 offset for C128 charset half
-        sta $D069               ; CHARPTR mid
+        adc #$80                ; $10 -> $90, $18 -> $98
+        sta $D069
         lda #$00
-        sta $D06A               ; CHARPTR bank = 0
+        sta $D06A
 
 _d018_screen:
         ; --- Update SCRNPTR ---
-        ; Screen offset = (bits 7-4) * $0400
         lda c128_saved_data
         lsr
         lsr
-        and #$3C                ; offset_hi = (bits 7-4) << 2
+        and #$3C
         sta _d018_scrn_hi
 
-        ; All screen addresses go to BANK_RAM0
         lda #$00
         sta $D060
         lda _d018_scrn_hi
         sta $D061
         lda #BANK_RAM0
         sta $D062
+
+        ; Debug: log D018 writes
+        lda c128_saved_data
+        sta $7750               ; raw D018 value
+        lda _d018_scrn_hi
+        sta $7751               ; computed screen hi byte
+        lda _d018_char_hi
+        sta $7752               ; computed char hi byte
 
         rts
 
@@ -1476,6 +1530,7 @@ _wv_d020:
         ; $D020: Border color
         lda c128_saved_data
         and #$0F
+        sta vic_regs+$20
         sta $D020
         rts
 
@@ -1483,6 +1538,7 @@ _wv_d021:
         ; $D021: Background color
         lda c128_saved_data
         and #$0F
+        sta vic_regs+$21
         sta $D021
         rts
 
@@ -1620,7 +1676,7 @@ _wvdc_index:
 
 _wvdc_data:
         ; R31: Write byte to VDC RAM at address R18:R19, auto-increment
-        ; VDC RAM is at $10000 in bank 1
+        ; VDC RAM is in ATTIC RAM at $8000000
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
         lda vdc_regs+18         ; address hi
@@ -1628,7 +1684,7 @@ _wvdc_data:
         sta C128_MEM_PTR+1
         lda #VDC_RAM_BANK
         sta C128_MEM_PTR+2
-        lda #$00
+        lda #VDC_RAM_ATTIC_HI
         sta C128_MEM_PTR+3
         ldz #0
         lda c128_saved_data
@@ -1640,14 +1696,84 @@ _wvdc_data:
         inc vdc_regs+18
 +       rts
 
+;_wvdc_word_count:
+;        ; R30: Writing word count triggers block copy or fill
+;        ; The VDC copies/fills (count+1) bytes starting at R18:R19
+;        ; Bit 5 of R24 selects copy (0) vs fill (1)
+;        ; For now: just advance R18:R19 by (count+1) so address is correct after
+;        lda c128_saved_data
+;        sta vdc_regs+30
+;        ; Advance address by (value + 1)
+;        clc
+;        lda vdc_regs+19
+;        adc c128_saved_data
+;        sta vdc_regs+19
+;        lda vdc_regs+18
+;        adc #$00
+;        sta vdc_regs+18
+        ; +1 more
+;        inc vdc_regs+19
+;        bne +
+;        inc vdc_regs+18
+;+       rts
+
+
 _wvdc_word_count:
         ; R30: Writing word count triggers block copy or fill
         ; The VDC copies/fills (count+1) bytes starting at R18:R19
         ; Bit 5 of R24 selects copy (0) vs fill (1)
-        ; For now: just advance R18:R19 by (count+1) so address is correct after
         lda c128_saved_data
         sta vdc_regs+30
-        ; Advance address by (value + 1)
+
+        ; Count = value + 1
+        lda c128_saved_data
+        clc
+        adc #1
+        sta _vdc_count
+        lda #0
+        adc #0
+        sta _vdc_count+1
+
+        ; Check bit 5 of R24: 1 = fill, 0 = copy
+        lda vdc_regs+24
+        and #$20
+        beq _vdc_block_copy
+
+        ; --- Block fill: fill (count) bytes with R31 value ---
+        lda vdc_regs+31
+        sta _vdc_fill_byte
+
+_vdc_fill_loop:
+        lda vdc_regs+19
+        sta C128_MEM_PTR+0
+        lda vdc_regs+18
+        and #$3F
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #VDC_RAM_ATTIC_HI
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda _vdc_fill_byte
+        sta [C128_MEM_PTR],z
+
+        ; Increment R18:R19
+        inc vdc_regs+19
+        bne +
+        inc vdc_regs+18
++
+        ; Decrement count
+        lda _vdc_count
+        bne +
+        dec _vdc_count+1
++       dec _vdc_count
+        lda _vdc_count
+        ora _vdc_count+1
+        bne _vdc_fill_loop
+        rts
+
+_vdc_block_copy:
+        ; --- Block copy: not implemented yet, just advance address ---
         clc
         lda vdc_regs+19
         adc c128_saved_data
@@ -1655,12 +1781,13 @@ _wvdc_word_count:
         lda vdc_regs+18
         adc #$00
         sta vdc_regs+18
-        ; +1 more
         inc vdc_regs+19
         bne +
         inc vdc_regs+18
 +       rts
 
+_vdc_count:   .word 0
+_vdc_fill_byte: .byte 0
 
 ; ============================================================
 ; Utility: print_hex8 - Print byte in A as 2 hex chars

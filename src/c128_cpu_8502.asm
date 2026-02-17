@@ -976,6 +976,9 @@ vic_raster_compare_hi: .byte $01     ; Raster compare high bit
 c128_cur_div:          .byte 0
 c128_cur_phase:        .byte 0
 pc_trace_idx:          .byte 0
+pc_trace_hi:           .fill 128, 0
+pc_trace_lo:           .fill 128, 0
+pc_trace_sp:           .fill 128, 0
 
 ; ============================================================
 ; cpu_take_irq - Execute IRQ sequence
@@ -1274,9 +1277,6 @@ _sm_monitor_active:
 ; P4CPU_Step - Single instruction execution
 ; ============================================================
 P4CPU_Step:
-        ; Debug: prove we're entering step
-        inc $FE10
-
         ; --- Boot milestone & hook checks ---
         ; Milestones write progress byte to $0FE0F via 32-bit store.
         ; Check $0FE0F in the monitor to see how far boot got.
@@ -1765,7 +1765,18 @@ _no_hooks:
         ; beq _skip_trace
         ; ... trace code ...
         
-_skip_trace:
+_skip_trace_old:
+        ; Diagnostic: check if mmu_ram_bank is correct
+        lda mmu_ram_bank
+        sta $7700
+        lda mmu_io_visible
+        sta $7701
+        lda mmu_kernal_rom
+        sta $7702
+        lda p4_pc_lo
+        sta $7710
+        lda p4_pc_hi
+        sta $7711
         ; --------------------------------------------------------
         ; Check for pending interrupts (NMI first, then IRQ)
         ; --------------------------------------------------------
@@ -1802,21 +1813,27 @@ _step_execute:
         lda p4_pc_hi
         sta p4_inst_pc_hi
 
-        ; PC trace - store last PC before halt
-        lda $FE14
-        sta $FE16              ; prev-prev lo
-        lda $FE15
-        sta $FE17              ; prev-prev hi
-        lda $FE12
-        sta $FE14              ; prev lo
-        lda $FE13
-        sta $FE15              ; prev hi
-        lda p4_pc_lo
-        sta $FE12              ; current lo
+        ; Record PC and SP in trace ring buffer (only on page change or branch)
+        ldx pc_trace_idx
+        dex
+        txa
+        and #$7F
+        tax
         lda p4_pc_hi
-        sta $FE13              ; current hi
-        ; increment counter
-        inc $FE18
+        cmp pc_trace_hi,x       ; Same page as last entry?
+        beq _skip_trace2
+        ; Different page - record it
+        ldx pc_trace_idx
+        sta pc_trace_hi,x
+        lda p4_pc_lo
+        sta pc_trace_lo,x
+        lda p4_sp
+        sta pc_trace_sp,x
+        inx
+        txa
+        and #$7F
+        sta pc_trace_idx
+_skip_trace2:
 
         ; Check breakpoint BEFORE we fetch/execute
 .if TRACE_ENABLED
@@ -1851,6 +1868,77 @@ _no_break:
         beq _step_fetch
         lda #0
         sta p4_code_valid       ; Force code cache rebuild
+        jmp _step_fetch
+
+_trap_fb:
+        ; Breakpoint hit at $FBEA - dump 128-entry trace to $7000
+        ldx pc_trace_idx
+        ldy #0
+        sty _trap_sp_idx
+_trap_trace:
+        lda pc_trace_hi,x
+        sta $7000,y
+        iny
+        lda pc_trace_lo,x
+        sta $7000,y
+        iny
+        ; SP trace stored sequentially at $7100
+        phy
+        ldy _trap_sp_idx
+        lda pc_trace_sp,x
+        sta $7100,y
+        iny
+        sty _trap_sp_idx
+        ply
+        inx
+        txa
+        and #$7F
+        tax
+        cpy #0                  ; 256 bytes = 128 entries * 2
+        bne _trap_trace
+        lda p4_pc_hi
+        sta $7200
+        lda p4_pc_lo
+        sta $7201
+        lda p4_sp
+        sta $7202
+        lda mmu_cr
+        sta $7203
+        lda #$CC               ; trap marker
+        sta $7204
+        ; Check ROM byte at $1FF7F (should be $FA)
+        lda #$7F
+        sta C128_MEM_PTR+0
+        lda #$FF
+        sta C128_MEM_PTR+1
+        lda #$01
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sta $7205              ; actual byte at $1FF7F
+        ; Dump shared RAM state
+        lda shared_bottom_on
+        sta $7206
+        lda shared_bottom_mask
+        sta $7207
+        lda mmu_ram_bank
+        sta $7208
+        lda mmu_rcr
+        sta $7209
+        lda mmu_cr
+        sta $720A
+        lda p4_sp
+        sta $720B
+        ; Halt with white border
+        lda #$01
+        sta $d020
+_trap_halt:
+        jmp _trap_halt
+
+_trap_sp_idx: .byte 0
+_trap_prev_hi: .byte 0
         
 _step_fetch:
         ; --------------------------------------------------------
@@ -1886,51 +1974,62 @@ _fc_done:
         rts
 
 op_illegal:
-        ; Store debug info using 32-bit writes
-        lda #$00
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        lda #$FE
-        sta C128_MEM_PTR+1
-        ldz #0
-
-        lda #$0D
-        sta C128_MEM_PTR+0
-        lda p4_inst_pc_lo
-        sta [C128_MEM_PTR],z   ; $FE0D = PC lo
-
-        lda #$0E
-        sta C128_MEM_PTR+0
-        lda p4_inst_pc_hi
-        sta [C128_MEM_PTR],z   ; $FE0E = PC hi
-
-        lda #$0C
-        sta C128_MEM_PTR+0
-        lda #$BB
-        sta [C128_MEM_PTR],z   ; $FE0C = illegal marker
-
-        ; RED border and halt
-        lda #$02
-        sta $d020
-_ill_halt:
-        jmp _ill_halt
-
-_ill_pc_hi: .byte 0
-_ill_pc_lo: .byte 0
-
-_ill_long_delay:
-        ldx #0
-_ill_d1:
+        ; Write PC trace from ring buffer to $7000 (32 entries = 64 bytes)
+        ldx pc_trace_idx
         ldy #0
-_ill_d2:
-        nop
-        nop
-        nop
-        nop
-        dey
-        bne _ill_d2
-        dex
-        bne _ill_d1
+_ill_trace:
+        lda pc_trace_hi,x
+        sta $7000,y
+        iny
+        lda pc_trace_lo,x
+        sta $7000,y
+        iny
+        inx
+        txa
+        and #$1F
+        tax
+        cpy #64
+        bcc _ill_trace
+
+        ; Write current illegal PC and opcode at $7040
+        lda p4_inst_pc_hi
+        sta $7040
+        lda p4_inst_pc_lo
+        sta $7041
+        ; Read the opcode via emulator
+        lda p4_inst_pc_lo
+        sta p4_addr_lo
+        lda p4_inst_pc_hi
+        sta p4_addr_hi
+        jsr C128_ReadFast
+        sta $7042
+        lda mmu_cr
+        sta $7043
+        ; Direct 32-bit read of $1FB8E (first trace entry)
+        lda #$8E
+        sta C128_MEM_PTR+0
+        lda #$FB
+        sta C128_MEM_PTR+1
+        lda #$01
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sta $7044              ; raw byte at $1FB8E
+        ; Direct 32-bit read of $1FBEA (crash addr)
+        lda #$EA
+        sta C128_MEM_PTR+0
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sta $7045              ; raw byte at $1FBEA
+        lda #$BB
+        sta $7046
+
+        ; Illegal opcode - skip it (treat as 1-byte NOP) and continue
+        ; Log last illegal opcode location to $7040-$7046
+        lda #2
+        #finish_cycles_inline
         rts
 
 ; --- branch_do ---
@@ -2304,62 +2403,43 @@ _cpy_n:
 ; ============================================================
 
 ; $00 BRK
+; $00 BRK
 op_00:
-        ; BRK detected - write distinctive pattern
-        lda #$DE
-        sta $7000
-        lda #$AD
-        sta $7001
-        lda #$BE
-        sta $7002
-        lda #$EF
-        sta $7003
-        lda #$C8
-        sta $7004              ; marker
-        ; Now store actual debug info
-        lda p4_inst_pc_lo
-        sta $7005
-        lda p4_inst_pc_hi
-        sta $7006
-        lda p4_pc_lo
-        sta $7007
+        ; BRK: increment PC past signature byte
+        inw p4_pc_lo
+        ; Push PC high
         lda p4_pc_hi
-        sta $7008
-        ; MMU state
-        lda mmu_kernal_rom
-        sta $7009
-        lda mmu_basic_hi_rom
-        sta $700A
-        lda mmu_basic_lo_rom
-        sta $700B
-        lda mmu_io_visible
-        sta $700C
-        lda mmu_cr
-        sta $700D
-        ; Direct read test: read $FBED through C128_Read
-        lda #$ED
+        sta p4_data
+        jsr push_data
+        ; Push PC low
+        lda p4_pc_lo
+        sta p4_data
+        jsr push_data
+        ; Push P with B=1, U=1
+        lda p4_p
+        ora #P_B                ; Set B flag (distinguishes BRK from IRQ)
+        ora #P_U
+        sta p4_data
+        jsr push_data
+        ; Set I flag
+        lda p4_p
+        ora #P_I
+        sta p4_p
+        ; Load IRQ vector from $FFFE/$FFFF
+        lda #$FE
         sta p4_addr_lo
-        lda #$FB
+        lda #$FF
         sta p4_addr_hi
         jsr C128_ReadFast
-        sta $700E              ; what C128_ReadFast returns for $FBED
-        ; Direct 32-bit read of $1FBED (bypass emulator entirely)
-        lda #$ED
-        sta C128_MEM_PTR+0
-        lda #$FB
-        sta C128_MEM_PTR+1
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $700F              ; raw 32-bit read of $1FBED
-        ; Halt - green border
-        lda #$05
-        sta $D020
-_brk_halt:
-        jmp _brk_halt
+        sta p4_pc_lo
+        lda #$FF
+        sta p4_addr_lo
+        jsr C128_ReadFast
+        sta p4_pc_hi
+        lda #0
+        sta p4_code_valid
+        lda #7
+        jmp finish_cycles
 
 
         jsr fetch8

@@ -296,6 +296,161 @@ _do_load_monitor:
         jmp _done
 
 _not_ff:
+        ; ----- Check for $F9xx / $F8xx (disk status routines to skip) -----
+        cmp #$F9
+        bne _check_f8
+        lda p4_pc_lo
+        cmp #$B3                        ; $F9B3 = disk status display
+        beq _skip_disk_status
+        cmp #$8B                        ; $F98B = disk status read
+        beq _skip_disk_status
+        jmp _done
+
+_check_f8:
+        cmp #$F8
+        bne _check_fa
+        lda p4_pc_lo
+        cmp #$D0                        ; $F8D0 = JSR $FFC0 (OPEN disk cmd channel)
+        beq _skip_disk_open
+        cmp #$E6                        ; $F8E6 = JSR $FFC0 (OPEN disk data channel)
+        beq _skip_disk_open
+        jmp _done
+_skip_disk_open:
+        ; Skip disk OPEN by setting carry (error) and advancing past JSR
+        lda p4_p
+        ora #P_C                        ; Set carry = error
+        sta p4_p
+        ; Advance PC past the 3-byte JSR instruction
+        clc
+        lda p4_pc_lo
+        adc #3
+        sta p4_pc_lo
+        lda p4_pc_hi
+        adc #0
+        sta p4_pc_hi
+        lda #1
+        sta p4_hook_pc_changed
+        jmp _done
+
+;_check_fa:
+;        cmp #$FA
+;        bne _check_c8
+;        ; PRIMM at $FA17 now runs natively (MMU state fix should prevent crash)
+;        jmp _done
+
+;==========================================================================================
+; PRIMM hook
+;==========================================================================================
+_check_fa:
+        cmp #$FA
+        bne _check_c8
+        lda p4_pc_lo
+        cmp #$17                        ; $FA17 = PRIMM entry
+        bne _done_fa
+
+        ; PRIMM hook: read inline string after JSR, print each char
+        ; via guest CHROUT ($FFD2), then patch return address past null.
+        ;
+        ; The native PRIMM crashes due to split stack (push_data uses
+        ; bank 4 but INC $0104,X uses C128_Write which may differ).
+        ; This hook avoids the stack manipulation entirely.
+
+        ; Read return address from stack (SP+1/SP+2)
+        ; The JSR that called PRIMM pushed PC-1, so return addr
+        ; points to the last byte of the JSR instruction.
+        ; String starts at return_addr + 1.
+        ldy p4_sp
+        iny
+        lda #$01
+        sta p4_addr_hi
+        sty p4_addr_lo
+        jsr C128_ReadFast
+        sta _primm_ptr_lo
+        iny
+        sty p4_addr_lo
+        jsr C128_ReadFast
+        sta _primm_ptr_hi
+
+        ; String starts at return_addr + 1
+        clc
+        lda _primm_ptr_lo
+        adc #1
+        sta _primm_ptr_lo
+        lda _primm_ptr_hi
+        adc #0
+        sta _primm_ptr_hi
+
+        ; Print characters until null byte
+        ldy #0
+_primm_print_loop:
+        tya
+        pha                             ; save Y on host stack
+        clc
+        adc _primm_ptr_lo
+        sta p4_addr_lo
+        lda #0
+        adc _primm_ptr_hi
+        sta p4_addr_hi
+        jsr C128_ReadFast               ; read char from ROM
+        beq _primm_end_string
+        ; Store char in guest A and call CHROUT via guest JSR
+        sta p4_a
+        ; Push current guest PC onto guest stack (simulate JSR to $FFD2)
+        ; Actually, just call the host CHROUT to write to the real screen
+        ; The C128 screen editor isn't initialized yet during early boot,
+        ; so we print via host CHROUT instead
+        jsr P4Host_PutChar
+        pla                             ; restore Y
+        iny
+        bne _primm_print_loop
+        ; String > 255 chars, bail
+        jmp _done_fa
+
+_primm_end_string:
+        pla                             ; restore Y (Y = offset of null)
+        ; New return addr = ptr + Y (points AT null byte)
+        ; Guest RTS adds 1, so execution resumes at byte after null
+        tya
+        clc
+        adc _primm_ptr_lo
+        sta _primm_new_lo
+        lda #0
+        adc _primm_ptr_hi
+        sta _primm_new_hi
+
+        ; Write corrected return address to stack
+        ldy p4_sp
+        iny
+        lda #$01
+        sta p4_addr_hi
+        sty p4_addr_lo
+        lda _primm_new_lo
+        sta p4_data
+        jsr C128_Write
+        iny
+        sty p4_addr_lo
+        lda _primm_new_hi
+        sta p4_data
+        jsr C128_Write
+
+        ; Do guest RTS (pops corrected address, adds 1, jumps past null)
+        jsr P4HOOK_RTS_Guest
+
+_done_fa:
+        jmp _done
+
+_primm_ptr_lo: .byte 0
+_primm_ptr_hi: .byte 0
+_primm_new_lo: .byte 0
+_primm_new_hi: .byte 0
+
+
+_skip_disk_status:
+        ; Skip by simulating RTS on the guest stack
+        jsr P4HOOK_RTS_Guest
+        jmp _done
+
+_check_c8:
         ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
         cmp #$C8
         bne _check_a8
@@ -2207,12 +2362,10 @@ P4HOOK_UnlockVIC:
         lda #$53
         sta $D02F
         
-        ; Restore border/background colors from TED shadow registers
-        lda ted_regs+$19
-        and #$7F
+        ; Restore border/background colors from VIC-II shadow registers
+        lda vic_regs+$20
         sta $D020
-        lda ted_regs+$15
-        and #$7F
+        lda vic_regs+$21
         sta $D021
         
         rts
