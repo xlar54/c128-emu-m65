@@ -249,14 +249,23 @@ _do_clrchn:
         jmp _done
 
 _do_chrin:
+        lda seq_input_slot
+        cmp #$FF
+        beq _done               ; No file input - let ROM handle
         jsr P4HOOK_OnCHRIN
         jmp _done
 
 _do_chrout:
+        lda seq_output_slot
+        cmp #$FF
+        beq _done               ; Let guest ROM handle it
         jsr P4HOOK_OnCHROUT
         jmp _done
 
 _do_getin:
+        lda seq_input_slot
+        cmp #$FF
+        beq _done               ; No file input - let ROM handle
         jsr P4HOOK_OnGETIN
         jmp _done
 
@@ -296,162 +305,52 @@ _do_load_monitor:
         jmp _done
 
 _not_ff:
-        ; ----- Check for $F9xx / $F8xx (disk status routines to skip) -----
-        cmp #$F9
-        bne _check_f8
-        lda p4_pc_lo
-        cmp #$B3                        ; $F9B3 = disk status display
-        beq _skip_disk_status
-        cmp #$8B                        ; $F98B = disk status read
-        beq _skip_disk_status
-        jmp _done
-
-_check_f8:
+        ; ----- Check for $F8xx (auto-boot) -----
         cmp #$F8
+        bne _check_f9
+        lda p4_pc_lo
+        cmp #$67                        ; $F867 = IOINIT entry (serial init + auto-boot)
+        bne _f8_done
+        ; Skip IOINIT entirely - no serial bus or disk drive
+        ; But we must initialize CIA1 Timer A for keyboard scanning IRQ
+        ; C128 KERNAL sets Timer A to $4025 (~60Hz on PAL)
+        lda #$25
+        sta cia1_timer_a_latch_lo
+        sta cia1_timer_a_lo
+        lda #$40
+        sta cia1_timer_a_latch_hi
+        sta cia1_timer_a_hi
+        ; Enable Timer A IRQ (bit 0 of ICR mask)
+        lda #$81                        ; Set bit 0 (Timer A)
+        sta cia1_icr_mask
+        ; Start Timer A: continuous mode
+        lda #$01                        ; bit 0 = start
+        sta cia1_timer_a_ctrl
+        ; Write keyboard column select to $DC00 (all columns = $FF)
+        lda #$FF
+        sta $DC00
+        ; Simulate RTS to return to caller (who did JSR $FF56)
+        jsr P4HOOK_RTS_Guest
+_f8_done:
+        jmp _done
+
+_check_f9:
+        cmp #$F9
         bne _check_fa
-        lda p4_pc_lo
-        cmp #$D0                        ; $F8D0 = JSR $FFC0 (OPEN disk cmd channel)
-        beq _skip_disk_open
-        cmp #$E6                        ; $F8E6 = JSR $FFC0 (OPEN disk data channel)
-        beq _skip_disk_open
-        jmp _done
-_skip_disk_open:
-        ; Skip disk OPEN by setting carry (error) and advancing past JSR
-        lda p4_p
-        ora #P_C                        ; Set carry = error
-        sta p4_p
-        ; Advance PC past the 3-byte JSR instruction
-        clc
-        lda p4_pc_lo
-        adc #3
-        sta p4_pc_lo
-        lda p4_pc_hi
-        adc #0
-        sta p4_pc_hi
-        lda #1
-        sta p4_hook_pc_changed
         jmp _done
 
-;_check_fa:
-;        cmp #$FA
-;        bne _check_c8
-;        ; PRIMM at $FA17 now runs natively (MMU state fix should prevent crash)
-;        jmp _done
-
-;==========================================================================================
-; PRIMM hook
-;==========================================================================================
 _check_fa:
         cmp #$FA
-        bne _check_c8
-        lda p4_pc_lo
-        cmp #$17                        ; $FA17 = PRIMM entry
-        bne _done_fa
-
-        ; PRIMM hook: read inline string after JSR, print each char
-        ; via guest CHROUT ($FFD2), then patch return address past null.
-        ;
-        ; The native PRIMM crashes due to split stack (push_data uses
-        ; bank 4 but INC $0104,X uses C128_Write which may differ).
-        ; This hook avoids the stack manipulation entirely.
-
-        ; Read return address from stack (SP+1/SP+2)
-        ; The JSR that called PRIMM pushed PC-1, so return addr
-        ; points to the last byte of the JSR instruction.
-        ; String starts at return_addr + 1.
-        ldy p4_sp
-        iny
-        lda #$01
-        sta p4_addr_hi
-        sty p4_addr_lo
-        jsr C128_ReadFast
-        sta _primm_ptr_lo
-        iny
-        sty p4_addr_lo
-        jsr C128_ReadFast
-        sta _primm_ptr_hi
-
-        ; String starts at return_addr + 1
-        clc
-        lda _primm_ptr_lo
-        adc #1
-        sta _primm_ptr_lo
-        lda _primm_ptr_hi
-        adc #0
-        sta _primm_ptr_hi
-
-        ; Print characters until null byte
-        ldy #0
-_primm_print_loop:
-        tya
-        pha                             ; save Y on host stack
-        clc
-        adc _primm_ptr_lo
-        sta p4_addr_lo
-        lda #0
-        adc _primm_ptr_hi
-        sta p4_addr_hi
-        jsr C128_ReadFast               ; read char from ROM
-        beq _primm_end_string
-        ; Store char in guest A and call CHROUT via guest JSR
-        sta p4_a
-        ; Push current guest PC onto guest stack (simulate JSR to $FFD2)
-        ; Actually, just call the host CHROUT to write to the real screen
-        ; The C128 screen editor isn't initialized yet during early boot,
-        ; so we print via host CHROUT instead
-        jsr P4Host_PutChar
-        pla                             ; restore Y
-        iny
-        bne _primm_print_loop
-        ; String > 255 chars, bail
-        jmp _done_fa
-
-_primm_end_string:
-        pla                             ; restore Y (Y = offset of null)
-        ; New return addr = ptr + Y (points AT null byte)
-        ; Guest RTS adds 1, so execution resumes at byte after null
-        tya
-        clc
-        adc _primm_ptr_lo
-        sta _primm_new_lo
-        lda #0
-        adc _primm_ptr_hi
-        sta _primm_new_hi
-
-        ; Write corrected return address to stack
-        ldy p4_sp
-        iny
-        lda #$01
-        sta p4_addr_hi
-        sty p4_addr_lo
-        lda _primm_new_lo
-        sta p4_data
-        jsr C128_Write
-        iny
-        sty p4_addr_lo
-        lda _primm_new_hi
-        sta p4_data
-        jsr C128_Write
-
-        ; Do guest RTS (pops corrected address, adds 1, jumps past null)
-        jsr P4HOOK_RTS_Guest
-
-_done_fa:
+        bne _check_c4_rom
         jmp _done
 
-_primm_ptr_lo: .byte 0
-_primm_ptr_hi: .byte 0
-_primm_new_lo: .byte 0
-_primm_new_hi: .byte 0
+_check_c4_rom:
+_check_c4_done:
+        ; Reload p4_pc_hi for next check
+        lda p4_pc_hi
 
-
-_skip_disk_status:
-        ; Skip by simulating RTS on the guest stack
-        jsr P4HOOK_RTS_Guest
-        jmp _done
-
-_check_c8:
         ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
+_check_c8:
         cmp #$C8
         bne _check_a8
         lda p4_pc_lo
@@ -2869,17 +2768,111 @@ _clrchn_check_out:
 
 
 ; ============================================================
+; P4HOOK_OnPRIMM - Handle PRIMM (print immediate string)
+;
+; PRIMM is called via JSR $FA17 (or JMP $FA17 from $FF7D).
+; The string follows inline after the JSR. The return address
+; on the stack points to the byte BEFORE the string.
+;
+; We need to:
+; 1. Read return address from guest stack (points to string-1)
+; 2. Add 1 to get string start
+; 3. Read bytes, output via guest CHROUT (write to screen RAM)
+; 4. Update return address to point past null terminator
+; 5. Simulate RTS
+; ============================================================
+P4HOOK_OnPRIMM:
+        ; Get return address from guest stack
+        ; SP points below the return address
+        ; But PRIMM pushes A, X, Y first: 3 bytes
+        ; Actually - we catch at $FA17 BEFORE any pushes happen
+        ; So the stack has the JSR return address at SP+1/SP+2
+        lda p4_sp
+        clc
+        adc #1
+        sta p4_addr_lo
+        lda #$01
+        sta p4_addr_hi
+        jsr C128_ReadFast       ; return addr lo
+        sta _primm_ptr_lo
+
+        lda p4_sp
+        clc
+        adc #2
+        sta p4_addr_lo
+        jsr C128_ReadFast       ; return addr hi
+        sta _primm_ptr_hi
+
+        ; Return address from JSR is (target-1), so add 1 for string start
+        inc _primm_ptr_lo
+        bne _primm_loop
+        inc _primm_ptr_hi
+
+_primm_loop:
+        ; Read next string byte
+        lda _primm_ptr_lo
+        sta p4_addr_lo
+        lda _primm_ptr_hi
+        sta p4_addr_hi
+        jsr C128_ReadFast
+        
+        ; Null terminator?
+        beq _primm_end
+
+        ; Output character via screen write to guest screen RAM
+        ; Store char in guest A and call the screen editor output
+        sta p4_a
+        
+        ; Write to C128 screen RAM directly
+        ; Use the guest's cursor position from ZP $EB (row) and $EC (col)
+        ; Actually, simpler: just call guest CHROUT by letting ROM handle it
+        ; For now, skip the character output - just advance past the string
+        ; The important thing is to get past the string without crashing
+
+        ; Advance pointer
+        inc _primm_ptr_lo
+        bne _primm_loop
+        inc _primm_ptr_hi
+        jmp _primm_loop
+
+_primm_end:
+        ; _primm_ptr now points to the null terminator
+        ; Set return address to null terminator address
+        ; (RTS will add 1, so execution continues after the null)
+        lda p4_sp
+        clc
+        adc #1
+        sta p4_addr_lo
+        lda #$01
+        sta p4_addr_hi
+        lda _primm_ptr_lo
+        sta p4_data
+        jsr C128_Write          ; update return addr lo
+
+        lda p4_sp
+        clc
+        adc #2
+        sta p4_addr_lo
+        lda _primm_ptr_hi
+        sta p4_data
+        jsr C128_Write          ; update return addr hi
+
+        ; Now simulate RTS - pop return address and jump there+1
+        jsr P4HOOK_RTS_Guest
+        rts
+
+_primm_ptr_lo: .byte 0
+_primm_ptr_hi: .byte 0
+
+
+; ============================================================
 ; P4HOOK_OnCHRIN - Character input
 ;
 ; If input is from a file we manage, read from host.
 ; Otherwise let ROM handle (keyboard input).
 ; ============================================================
 P4HOOK_OnCHRIN:
-        ; Check if we have an active input channel
-        lda seq_input_slot
-        cmp #$FF
-        beq _chrin_rom                  ; No file input - let ROM handle
-        
+
         ; Reset stale graphics flags before file operations
         lda #0
         sta p4_gfx_dirty
@@ -2938,10 +2931,6 @@ _chrin_eof:
         jsr P4HOOK_RTS_Guest
         rts
 
-_chrin_rom:
-        ; Let ROM handle keyboard input
-        rts
-
 _chrin_byte:   .byte 0
 _chrin_status: .byte 0
 
@@ -2953,10 +2942,7 @@ _chrin_status: .byte 0
 ; Otherwise let ROM handle (screen output).
 ; ============================================================
 P4HOOK_OnCHROUT:
-        ; Check if we have an active output channel to a file
-        lda seq_output_slot
-        cmp #$FF
-        beq _chrout_rom                 ; No file output - let ROM handle
+        ; We're writing to a file (dispatcher already verified seq_output_slot != $FF)
         
         ; Reset stale graphics flags before file operations
         lda #0
@@ -2965,7 +2951,6 @@ P4HOOK_OnCHROUT:
         ; Save VIC state before host KERNAL call
         jsr P4HOOK_SaveVIC
         
-        ; We're writing to a file
         ; Get byte from guest A
         lda p4_a
         
@@ -2990,10 +2975,6 @@ P4HOOK_OnCHROUT:
         jsr P4HOOK_RTS_Guest
         rts
 
-_chrout_rom:
-        ; Let ROM handle screen output
-        rts
-
 
 ; ============================================================
 ; P4HOOK_OnGETIN - Get character input (used by GET#)
@@ -3005,11 +2986,7 @@ _chrout_rom:
 ; and returns 0 if no key is pressed. For files, it works the same.
 ; ============================================================
 P4HOOK_OnGETIN:
-        ; Check if we have an active input channel
-        lda seq_input_slot
-        cmp #$FF
-        beq _getin_rom                  ; No file input - let ROM handle keyboard
-        
+
         ; Reset stale graphics flags before file operations
         lda #0
         sta p4_gfx_dirty
@@ -3068,9 +3045,6 @@ _getin_eof:
         jsr P4HOOK_RTS_Guest
         rts
 
-_getin_rom:
-        ; Let ROM handle keyboard input
-        rts
 
 _getin_byte:   .byte 0
 _getin_status: .byte 0

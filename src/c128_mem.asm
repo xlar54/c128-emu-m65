@@ -61,6 +61,10 @@ BANK_ROM    = $01                       ; C128 ROMs in MEGA65 bank 1
 BANK_RAM0   = $04                       ; C128 RAM bank 0 in MEGA65 bank 4
 BANK_RAM1   = $05                       ; C128 RAM bank 1 in MEGA65 bank 5
 
+; KERNAL $F800-$FFFF is relocated to $12000-$127FF in bank 1
+; because $1F800-$1FFFF is hijacked by the MEGA65 color RAM window
+KERNAL_F800_RELOC_HI = $20             ; hi byte of relocated address ($2000)
+
 ; Character ROM location in bank 0
 ; chargen.bin (8KB) loaded at $08000-$09FFF (stays at staging area)
 ; First 4KB ($08000-$08FFF) = C64 charset
@@ -730,7 +734,27 @@ _rd_check_hi_rom:
 ; ============================================================
 
 ; Read from KERNAL ROM: C128 $C000-$FFFF -> MEGA65 $1C000-$1FFFF
+; Exception: $F800-$FFFF is redirected to $12000-$127FF
+; because $1F800-$1FFFF is the MEGA65 color RAM window
 read_from_kernal:
+        lda p4_addr_hi
+        cmp #$F8
+        bcc _rfk_normal
+        ; $F800-$FFFF: read from relocated area at $12000
+        ; Map $F8xx -> $20xx, $F9xx -> $21xx, etc.
+        sec
+        sbc #$D8                ; $F8->$20, $F9->$21, ..., $FF->$27
+        sta C128_MEM_PTR+1
+        lda p4_addr_lo
+        sta C128_MEM_PTR
+        lda #BANK_ROM
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #$00
+        lda [C128_MEM_PTR],z
+        rts
+_rfk_normal:
         lda p4_addr_lo
         sta C128_MEM_PTR
         lda p4_addr_hi

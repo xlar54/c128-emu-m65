@@ -97,8 +97,10 @@ start:
         ; ============================================================
 
         ; kernal
+        ; Load to bank 0 first (bank 1 has color RAM window at $1F800-$1FFFF)
+        ; Then DMA copy to bank 1, and relocate $F800-$FFFF to $12000
 
-        lda #$01
+        lda #$00
         ldx #$00
         jsr SETBNK
         lda #$00
@@ -114,6 +116,39 @@ start:
         ldx #$00
         ldy #$C0
         jsr LOAD
+
+        ; DMA copy $C000-$FFFF from bank 0 to bank 1 (16KB)
+        ; ($1F800-$1FFFF will be overridden by color RAM window on reads,
+        ;  but the first 14KB at $1C000-$1F7FF will be accessible)
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = 0
+        .byte $81, $00          ; dst MB = 0
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $4000             ; count = 16384
+        .word $C000             ; src = $C000
+        .byte $00               ; src bank 0
+        .word $C000             ; dst = $C000
+        .byte $01               ; dst bank 1
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+
+        ; DMA copy $F800-$FFFF from bank 0 to $2000 in bank 1 (2KB)
+        ; This is the relocated copy that avoids the color RAM window
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = 0
+        .byte $81, $00          ; dst MB = 0
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $0800             ; count = 2048
+        .word $F800             ; src = $F800
+        .byte $00               ; src bank 0
+        .word $2000             ; dst = $2000
+        .byte $01               ; dst bank 1 ($12000)
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
 
 
         ; basic hi
@@ -174,6 +209,24 @@ start:
         ldx #$00
         ldy #$00
         jsr LOAD
+
+        ; ============================================================
+        ; Relocate KERNAL $F800-$FFFF to $12000 in bank 1
+        ; The MEGA65 maps color RAM over $1F800-$1FFFF in bank 1,
+        ; so we copy from bank 0 (where KERNAL was loaded) to $12000
+        ; ============================================================
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = 0
+        .byte $81, $00          ; dst MB = 0
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $0800             ; count = 2048 bytes
+        .word $F800             ; src addr = $F800
+        .byte $00               ; src bank 0 (where KERNAL was loaded)
+        .word $2000             ; dst addr = $2000
+        .byte $01               ; dst bank 1 ($12000)
+        .word $0000             ; modulo
 
         ; ============================================================
         ; Initialize memory, video, and start emulation

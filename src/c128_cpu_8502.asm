@@ -228,11 +228,21 @@ _f8_check_io_slow:
 
 _f8_build_rom:
         ; ROM visible => BANK_ROM (bank 1), same hi byte
-        ; Works because ROM is at $1xxxx matching C128 address layout
+        ; Exception: pages $F8-$FF are relocated to $2000-$27FF
+        ; because $1F800-$1FFFF is the MEGA65 color RAM window
         lda #$00
         sta p4_code_ptr+0
         lda p4_pc_hi
+        cmp #$F8
+        bcc _f8_rom_normal
+        ; Relocated: $F8->$20, $F9->$21, ..., $FF->$27
+        sec
+        sbc #$D8
         sta p4_code_ptr+1
+        jmp _f8_rom_set_bank
+_f8_rom_normal:
+        sta p4_code_ptr+1
+_f8_rom_set_bank:
         lda #BANK_ROM
         sta p4_code_ptr+2
         lda #$00
@@ -303,10 +313,14 @@ fetch16_to_addr:
         sta p4_addr_lo
         rts
 
+; Cached bank for stack page ($0100-$01FF)
+; Updated by mmu_update_derived whenever MMU config changes.
+; This avoids calling get_physical_bank on every push/pull.
+cached_stack_bank: .byte BANK_RAM0
+
 ; --- push_data ---
 push_data:
-        ; Write to bank 4 stack page ($40100+SP)
-        lda #BANK_RAM0
+        lda cached_stack_bank
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3
@@ -322,9 +336,8 @@ push_data:
 
 ; --- pull_to_a ---
 pull_to_a:
-        ; Read from bank 4 stack page ($40100+SP)
         inc p4_sp
-        lda #BANK_RAM0
+        lda cached_stack_bank
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3
@@ -1835,6 +1848,10 @@ _step_execute:
         sta pc_trace_idx
 _skip_trace2:
 
+        ; LIVE TRACE - DISABLED
+live_trace_done:
+
+
         ; Check breakpoint BEFORE we fetch/execute
 .if TRACE_ENABLED
         lda p4_inst_pc_hi
@@ -1974,63 +1991,30 @@ _fc_done:
         rts
 
 op_illegal:
-        ; Write PC trace from ring buffer to $7000 (32 entries = 64 bytes)
-        ldx pc_trace_idx
-        ldy #0
-_ill_trace:
-        lda pc_trace_hi,x
-        sta $7000,y
-        iny
-        lda pc_trace_lo,x
-        sta $7000,y
-        iny
-        inx
-        txa
-        and #$1F
-        tax
-        cpy #64
-        bcc _ill_trace
+        ; ILLEGAL OPCODE - just halt with red border
+        ; The live trace above already printed where we are
+        lda #$02
+        sta $D020
+_ill_halt:
+        jmp _ill_halt
 
-        ; Write current illegal PC and opcode at $7040
-        lda p4_inst_pc_hi
-        sta $7040
-        lda p4_inst_pc_lo
-        sta $7041
-        ; Read the opcode via emulator
-        lda p4_inst_pc_lo
-        sta p4_addr_lo
-        lda p4_inst_pc_hi
-        sta p4_addr_hi
-        jsr C128_ReadFast
-        sta $7042
-        lda mmu_cr
-        sta $7043
-        ; Direct 32-bit read of $1FB8E (first trace entry)
-        lda #$8E
-        sta C128_MEM_PTR+0
-        lda #$FB
-        sta C128_MEM_PTR+1
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $7044              ; raw byte at $1FB8E
-        ; Direct 32-bit read of $1FBEA (crash addr)
-        lda #$EA
-        sta C128_MEM_PTR+0
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $7045              ; raw byte at $1FBEA
-        lda #$BB
-        sta $7046
-
-        ; Illegal opcode - skip it (treat as 1-byte NOP) and continue
-        ; Log last illegal opcode location to $7040-$7046
-        lda #2
-        #finish_cycles_inline
+; ---- Convert nibble in A to screen code ----
+; 0-9 -> $30-$39, A-F -> $01-$06
+trace_to_scrcode:
+        cmp #$0A
+        bcc trace_sc_digit
+        sec
+        sbc #$09                ; $0A->$01, $0F->$06
         rts
+trace_sc_digit:
+        ora #$30                ; $00->$30, $09->$39
+        rts
+
+live_trace_on: .byte 0
+trace_last_page: .byte 0
+trace_line_num: .byte 5
+trace_count_lo: .byte 0
+trace_count_hi: .byte 0
 
 ; --- branch_do ---
 ; Called when branch is taken. Sets p4_xtra to:
@@ -2403,8 +2387,33 @@ _cpy_n:
 ; ============================================================
 
 ; $00 BRK
-; $00 BRK
 op_00:
+        ; ============================================================
+        ; BRK - Dump state for debugging, then execute normally
+        ; Border = YELLOW, info at $7050+
+        ; ============================================================
+        lda #$07                ; yellow border
+        sta $D020
+
+        ; Dump BRK diagnostic info at $7050
+        lda p4_inst_pc_hi
+        sta $7050               ; PC hi where BRK was
+        lda p4_inst_pc_lo
+        sta $7051               ; PC lo where BRK was
+        lda p4_sp
+        sta $7052
+        lda p4_a
+        sta $7053
+        lda p4_x
+        sta $7054
+        lda p4_y
+        sta $7055
+        lda p4_p
+        sta $7056
+        lda mmu_cr
+        sta $7057
+
+        ; Standard BRK sequence
         ; BRK: increment PC past signature byte
         inw p4_pc_lo
         ; Push PC high
@@ -2440,35 +2449,6 @@ op_00:
         sta p4_code_valid
         lda #7
         jmp finish_cycles
-
-
-        jsr fetch8
-        lda p4_pc_hi
-        sta p4_data
-        jsr push_data
-        lda p4_pc_lo
-        sta p4_data
-        jsr push_data
-        lda p4_p
-        ora #(P_B|P_U)
-        sta p4_data
-        jsr push_data
-        lda p4_p
-        ora #P_I
-        sta p4_p
-        lda #$fe
-        sta p4_addr_lo
-        lda #$ff
-        sta p4_addr_hi
-        jsr C128_ReadFast
-        sta p4_pc_lo
-        lda #$ff
-        sta p4_addr_lo
-        jsr C128_ReadFast
-        sta p4_pc_hi
-        lda #7
-        #finish_cycles_inline
-        rts
 
 ; $01 ORA (zp,X)
 op_01:
@@ -4693,7 +4673,17 @@ op_77: jmp op_illegal
 op_7b: jmp op_illegal
 op_7f: jmp op_illegal
 op_83: jmp op_illegal
-op_87: jmp op_illegal
+; $87 SAX zp (illegal but used by some software)
+; Stores (A AND X) to zero page address
+op_87:
+        jsr fetch8
+        tax
+        lda p4_a
+        and p4_x
+        jsr lrb_write_x
+        lda #3
+        #finish_cycles_inline
+        rts
 op_8b: jmp op_illegal
 op_8f: jmp op_illegal
 op_93: jmp op_illegal

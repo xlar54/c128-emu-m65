@@ -1,5 +1,5 @@
 ; ============================================================
-; p4host.asm - Host-side routines for Plus/4 emulator
+; c128_host.asm - Host-side routines for C128 emulator
 ; 
 ; Screen output via injected CHROUT calls.
 ;
@@ -12,6 +12,11 @@
 ;   5. Run until PC hits trap address
 ;   6. Restore RAM and CPU state, clear flag
 ;
+; IMPORTANT: The C128 CPU reads from physical bank 4 (BANK_RAM0),
+; but LOW_RAM_BUFFER is a mirror in host bank 0. After writing
+; injected code to LOW_RAM_BUFFER, we DMA-copy it to bank 4 so
+; the emulated CPU actually sees it. Same for restore.
+;
 ; Host: MEGA65
 ; Assembler: 64tass (45GS02)
 ; ============================================================
@@ -23,7 +28,9 @@
 ; ============================================================
 
 ; Address in guest RAM where we inject our print code
-; Using $0334 (cassette buffer) - safe in most configs
+; $0334 is in the C128 KERNAL indirect vector area, but we
+; save/restore the bytes so it's safe as long as we sync to
+; physical bank 4.
 P4_INJECT_ADDR  = $0334
 
 ; Trap address - we'll jump here when done and detect PC=this
@@ -74,10 +81,12 @@ p4h_save_pc_hi: .byte 0
 ; ============================================================
 ; P4Host_StartPrint - Called by emulation loop when pending=1
 ;
-; Saves state, injects code, sets PC to begin printing
+; Saves state, injects code, sets PC to begin printing.
+; After writing to LOW_RAM_BUFFER, DMA-copies the injected
+; bytes to physical bank 4 so the CPU can read them.
 ; ============================================================
 P4Host_StartPrint:
-        ; Save original bytes from injection point
+        ; Save original bytes from injection point (LOW_RAM_BUFFER copy)
         ldx #0
 p4h_sp_save_loop:
         lda LOW_RAM_BUFFER + P4_INJECT_ADDR,x
@@ -123,6 +132,13 @@ p4h_sp_save_loop:
         lda #>P4_TRAP_ADDR
         sta LOW_RAM_BUFFER + P4_INJECT_ADDR + 7
         
+        ; DMA copy injected code from LOW_RAM_BUFFER to physical bank 4
+        jsr p4h_sync_inject_to_bank4
+        
+        ; Invalidate code cache since we modified guest RAM
+        lda #0
+        sta p4_code_valid
+        
         ; Set PC to injected code (no stack manipulation needed!)
         lda #<P4_INJECT_ADDR
         sta p4_pc_lo
@@ -165,9 +181,12 @@ p4h_cpd_not_done:
 
 ; ============================================================
 ; P4Host_EndPrint - Restore RAM and CPU state after print
+;
+; Restores saved bytes to LOW_RAM_BUFFER, then DMA-copies
+; them back to physical bank 4.
 ; ============================================================
 P4Host_EndPrint:
-        ; Restore original RAM
+        ; Restore original RAM to LOW_RAM_BUFFER
         ldx #0
 p4h_ep_restore_loop:
         lda p4h_saved_ram,x
@@ -175,6 +194,13 @@ p4h_ep_restore_loop:
         inx
         cpx #P4_INJECT_SIZE
         bne p4h_ep_restore_loop
+        
+        ; DMA copy restored bytes from LOW_RAM_BUFFER to physical bank 4
+        jsr p4h_sync_inject_to_bank4
+        
+        ; Invalidate code cache since we modified guest RAM
+        lda #0
+        sta p4_code_valid
         
         ; Restore CPU state
         lda p4h_save_a
@@ -196,6 +222,36 @@ p4h_ep_restore_loop:
         lda #0
         sta p4h_print_active
         
+        rts
+
+
+; ============================================================
+; _p4h_sync_inject_to_bank4 - DMA copy inject region from
+; LOW_RAM_BUFFER to physical C128 RAM bank 4
+;
+; Copies P4_INJECT_SIZE bytes from:
+;   Bank 0: LOW_RAM_BUFFER + P4_INJECT_ADDR
+; To:
+;   Bank 4: P4_INJECT_ADDR
+; ============================================================
+p4h_sync_inject_to_bank4:
+        lda #$00
+        sta $D707                       ; DMA list in bank 0, mega-list
+        ; Enhanced DMA list follows inline
+        .byte $80,$00                   ; src skip rate = 0 (normal)
+        .byte $81,$00                   ; dst skip rate = 0 (normal)
+        .byte $00                       ; end of options
+        .byte $00                       ; command: COPY
+        .byte P4_INJECT_SIZE            ; count lo
+        .byte $00                       ; count hi
+        .byte <(LOW_RAM_BUFFER + P4_INJECT_ADDR)  ; src lo
+        .byte >(LOW_RAM_BUFFER + P4_INJECT_ADDR)  ; src hi
+        .byte $00                       ; src bank 0
+        .byte <P4_INJECT_ADDR          ; dst lo
+        .byte >P4_INJECT_ADDR          ; dst hi
+        .byte BANK_RAM0                 ; dst bank 4
+        .byte $00                       ; sub-command
+        .word $0000                     ; modulo
         rts
 
 
