@@ -499,7 +499,7 @@ _shared_top_starts:
 
 ; ============================================================
 ; get_physical_bank - Determine the MEGA65 bank for a C128 address
-; Input: p4_addr_hi (page number)
+; Input: c128_addr_hi (page number)
 ; Output: A = MEGA65 bank number (BANK_RAM0 or BANK_RAM1)
 ; Uses shared RAM logic - if address is in shared region,
 ; always returns BANK_RAM0 regardless of MMU bank select
@@ -508,7 +508,7 @@ get_physical_bank:
         ; Check if in bottom shared region
         lda shared_bottom_on
         beq _gpb_check_top
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp shared_bottom_mask
         bcc _gpb_shared          ; Address < shared boundary -> bank 0
 
@@ -516,7 +516,7 @@ _gpb_check_top:
         ; Check if in top shared region
         lda shared_top_on
         beq _gpb_selected
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp shared_top_start
         bcs _gpb_shared          ; Address >= shared top start -> bank 0
 
@@ -536,16 +536,16 @@ _gpb_shared:
 ; to full C128_Read for anything complex ($4000+)
 ; ============================================================
 C128_ReadFast:
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$40
         bcs C128_Read           ; $4000+ needs full handler (ROM/IO possible)
 
         ; $0000-$3FFF: RAM - read from physical bank via 32-bit pointer
         jsr get_physical_bank
         sta C128_MEM_PTR+2
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #$00
         sta C128_MEM_PTR+3
@@ -555,11 +555,11 @@ C128_ReadFast:
 
 ; ============================================================
 ; C128_Read - Full memory read handler
-; Input: p4_addr_hi:p4_addr_lo = C128 address
+; Input: c128_addr_hi:c128_addr_lo = C128 address
 ; Output: A = byte read
 ; ============================================================
 C128_Read:
-        lda p4_addr_hi
+        lda c128_addr_hi
 
         ; $0000-$0FFF: RAM - read from physical bank
         ; (get_physical_bank handles shared RAM)
@@ -568,16 +568,16 @@ C128_Read:
         ; Special case: $0000/$0001 = CPU port registers
         cmp #$00
         bne _rd_low_ram
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$02
         bcs _rd_low_ram
         jmp read_zp             ; Use port register handler for $00/$01
 _rd_low_ram:
         jsr get_physical_bank
         sta C128_MEM_PTR+2
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #$00
         sta C128_MEM_PTR+3
@@ -589,7 +589,7 @@ _rd_not_low:
         ; $FF00-$FF04: ALWAYS MMU registers (regardless of config)
         cmp #$FF
         bne _rd_not_ff
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$05
         bcc read_mmu_register   ; $FF00-$FF04 -> MMU
         ; $FF05-$FFFF: KERNAL ROM or RAM
@@ -603,7 +603,7 @@ _ff_read_ram:
 
 _rd_not_ff:
         ; $D000-$DFFF: I/O or ROM/RAM
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$D0
         bcc _rd_not_io
         cmp #$E0
@@ -621,7 +621,7 @@ _rd_not_ff:
 
 _rd_io_dispatch:
         ; Dispatch I/O reads by page
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$D0
         beq _rd_vic             ; $D000-$D0FF -> VIC-II
         cmp #$D4
@@ -646,7 +646,7 @@ _rd_vic:
 _rd_sid:
         ; SID read - most registers are write-only
         ; Return from real MEGA65 SID for voice 3 / paddle reads
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$1F
         cmp #$1B
         bcs _rd_sid_readable
@@ -661,7 +661,7 @@ _rd_sid_readable:
 
 _rd_mmu_io:
         ; $D500-$D50B: MMU registers via I/O
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$0C
         bcs _rd_mmu_io_open     ; $D50C+ = open bus
         jmp read_mmu_d500
@@ -680,13 +680,13 @@ _rd_io_other:
 _rd_color_ram:
         ; Color RAM at $D800-$DBFF
         ; Read from MEGA65's actual color RAM
-        lda p4_addr_hi
+        lda c128_addr_hi
         sec
         sbc #$D8
         clc
         adc #$D8                ; Map to real $D800
         sta _rd_col+2
-        ldx p4_addr_lo
+        ldx c128_addr_lo
 _rd_col:
         lda $D800,x
         and #$0F               ; Color RAM is 4 bits
@@ -700,7 +700,7 @@ _rd_cia2:
 
 _rd_not_io:
         ; $4000-$CFFF: Check ROM visibility
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$C0
         bcs _rd_check_hi_rom
         cmp #$80
@@ -737,7 +737,7 @@ _rd_check_hi_rom:
 ; Exception: $F800-$FFFF is redirected to $12000-$127FF
 ; because $1F800-$1FFFF is the MEGA65 color RAM window
 read_from_kernal:
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$F8
         bcc _rfk_normal
         ; $F800-$FFFF: read from relocated area at $12000
@@ -745,7 +745,7 @@ read_from_kernal:
         sec
         sbc #$D8                ; $F8->$20, $F9->$21, ..., $FF->$27
         sta C128_MEM_PTR+1
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
         lda #BANK_ROM
         sta C128_MEM_PTR+2
@@ -755,9 +755,9 @@ read_from_kernal:
         lda [C128_MEM_PTR],z
         rts
 _rfk_normal:
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #BANK_ROM           ; Bank 1
         sta C128_MEM_PTR+2
@@ -769,9 +769,9 @@ _rfk_normal:
 
 ; Read from BASIC LO: C128 $4000-$7FFF -> MEGA65 $14000-$17FFF
 read_from_basic_lo:
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #BANK_ROM
         sta C128_MEM_PTR+2
@@ -783,9 +783,9 @@ read_from_basic_lo:
 
 ; Read from BASIC HI: C128 $8000-$BFFF -> MEGA65 $18000-$1BFFF
 read_from_basic_hi:
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #BANK_ROM
         sta C128_MEM_PTR+2
@@ -802,9 +802,9 @@ read_from_basic_hi:
 ;   ptr = $08000 + ((addr_hi - $D0) << 8) + addr_lo
 ;       = bank 0, high = $80 + (addr_hi - $D0), low = addr_lo
 read_from_chargen:
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sec
         sbc #$D0                ; Offset from $D000 base
         clc
@@ -823,9 +823,9 @@ read_from_chargen:
 read_ram_direct:
         jsr get_physical_bank
         sta C128_MEM_PTR+2
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #$00
         sta C128_MEM_PTR+3
@@ -840,7 +840,7 @@ read_ram_direct:
 
 ; Read MMU via $FF00-$FF04 (always visible)
 read_mmu_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$00
         beq rmmu_cr
         cmp #$01
@@ -871,7 +871,7 @@ rmmu_pcrd:
 
 ; Read MMU via $D500-$D50B (I/O mapped)
 read_mmu_d500:
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$00
         beq rmmu_cr
         cmp #$01
@@ -938,7 +938,7 @@ rmmu_d50b:
 ; VIC-II Register Reads ($D000-$D03F, mirrored every 64 bytes)
 ; ============================================================
 read_vic_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$3F                ; Mirror every 64 bytes
         tax
 
@@ -991,7 +991,7 @@ _rv_sprite_collision:
 ; CIA1 Register Reads ($DC00-$DC0F)
 ; ============================================================
 read_cia1_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$0F
         tax
 
@@ -1022,7 +1022,7 @@ _rc1_icr:
         pha
         lda #0
         sta cia1_icr_data
-        sta p4_irq_pending      ; Clear pending IRQ
+        sta c128_irq_pending      ; Clear pending IRQ
         pla
         rts
 
@@ -1031,7 +1031,7 @@ _rc1_icr:
 ; CIA2 Register Reads ($DD00-$DD0F)
 ; ============================================================
 read_cia2_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$0F
         tax
 
@@ -1052,7 +1052,7 @@ _rc2_port_a:
 ; VDC Register Reads ($D600-$D601)
 ; ============================================================
 read_vdc_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$01
         beq _rv_d600
 
@@ -1101,19 +1101,19 @@ _rv_vdc_data:
 
 ; ============================================================
 ; C128_Write - Full memory write handler
-; Input: p4_addr_hi:p4_addr_lo = C128 address
-;        p4_data = byte to write
+; Input: c128_addr_hi:c128_addr_lo = C128 address
+;        c128_data = byte to write
 ; ============================================================
 C128_Write:
-        lda p4_data
+        lda c128_data
         sta c128_saved_data
 
-        lda p4_addr_hi
+        lda c128_addr_hi
 
         ; $FF00-$FF04: ALWAYS MMU registers
         cmp #$FF
         bne _wr_not_ff
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$05
         bcc write_mmu_register  ; $FF00-$FF04 -> MMU
         ; $FF05-$FFFF: Write to RAM under ROM
@@ -1121,7 +1121,7 @@ C128_Write:
 
 _wr_not_ff:
         ; $D000-$DFFF: I/O or RAM
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$D0
         bcc _wr_not_io
         cmp #$E0
@@ -1133,7 +1133,7 @@ _wr_not_ff:
         jmp write_ram_direct    ; I/O not visible, write to RAM
 
 _wr_io_dispatch:
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$D0
         beq _wr_vic
         cmp #$D4
@@ -1157,7 +1157,7 @@ _wr_vic:
 
 _wr_sid:
         ; SID write - pass through to real MEGA65 SID
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$1F
         tax
         lda c128_saved_data
@@ -1166,7 +1166,7 @@ _wr_sid:
 
 _wr_mmu_io:
         ; $D500-$D50B: MMU via I/O
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$0C
         bcs _wr_to_ram          ; $D50C+ = open
         jmp write_mmu_d500
@@ -1177,13 +1177,13 @@ _wr_vdc:
 _wr_color_ram:
         ; Color RAM $D800-$DBFF
         ; Write to MEGA65's real color RAM
-        lda p4_addr_hi
+        lda c128_addr_hi
         sec
         sbc #$D8
         clc
         adc #$D8
         sta _wr_col+2
-        ldx p4_addr_lo
+        ldx c128_addr_lo
         lda c128_saved_data
         and #$0F               ; Color RAM is 4 bits
 _wr_col:
@@ -1212,19 +1212,19 @@ _wr_to_ram:
 ; ============================================================
 write_ram_direct:
         ; Invalidate code cache if writing to current code page
-        lda p4_addr_hi
-        cmp p4_code_page_hi
+        lda c128_addr_hi
+        cmp c128_code_page_hi
         bne _wrd_no_inv
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
 _wrd_no_inv:
 
         jsr get_physical_bank
         sta C128_MEM_PTR+2
         sta _wrd_saved_bank     ; Save bank for mirror check
-        lda p4_addr_lo
+        lda c128_addr_lo
         sta C128_MEM_PTR
-        lda p4_addr_hi
+        lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #$00
         sta C128_MEM_PTR+3
@@ -1238,10 +1238,10 @@ _wrd_no_inv:
         lda _wrd_saved_bank
         cmp #BANK_RAM0
         bne _wrd_done
-        lda p4_addr_hi
+        lda c128_addr_hi
         cmp #$10
         bcs _wrd_done
-        ; Set C128_MEM_PTR to LOW_RAM_BUFFER + p4_addr_hi page
+        ; Set C128_MEM_PTR to LOW_RAM_BUFFER + c128_addr_hi page
         clc
         adc #>LOW_RAM_BUFFER
         sta C128_MEM_PTR+1
@@ -1250,7 +1250,7 @@ _wrd_no_inv:
         lda #$00
         sta C128_MEM_PTR+2
         sta C128_MEM_PTR+3
-        lda p4_addr_lo
+        lda c128_addr_lo
         taz
         lda c128_saved_data
         sta [C128_MEM_PTR],z
@@ -1266,7 +1266,7 @@ _wrd_saved_bank: .byte 0
 
 ; Write via $FF00-$FF04 (always accessible)
 write_mmu_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$00
         beq wmmu_cr
         cmp #$01
@@ -1313,7 +1313,7 @@ wmmu_lcrd:
 
 ; Write via $D500-$D50B (I/O mapped)
 write_mmu_d500:
-        lda p4_addr_lo
+        lda c128_addr_lo
         cmp #$00
         beq wmmu_cr
         cmp #$01
@@ -1390,7 +1390,7 @@ wmmu_d50a:
 ; VIC-II Register Writes ($D000-$D03F)
 ; ============================================================
 write_vic_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$3F
         tax
 
@@ -1534,20 +1534,20 @@ _wv_d019:
         eor vic_regs+$19
         ; Recalculate bit 7: set if any remaining flags match enable mask
         and #$0F                ; keep only individual flags (bits 0-3)
-        sta p4_tmp
+        sta c128_tmp
         lda vic_regs+$1A
-        and p4_tmp              ; AND with enable mask
+        and c128_tmp              ; AND with enable mask
         beq _wv_d019_no_irq
         ; Still have active IRQ sources
-        lda p4_tmp
+        lda c128_tmp
         ora #$80
         sta vic_regs+$19
         rts
 _wv_d019_no_irq:
-        lda p4_tmp
+        lda c128_tmp
         sta vic_regs+$19       ; bit 7 clear
         lda #0
-        sta p4_irq_pending
+        sta c128_irq_pending
         rts
 
 _wv_d020:
@@ -1571,7 +1571,7 @@ _wv_d021:
 ; CIA1 Register Writes ($DC00-$DC0F)
 ; ============================================================
 write_cia1_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$0F
         tax
 
@@ -1654,7 +1654,7 @@ _wc1_ta_ctrl:
 ; CIA2 Register Writes ($DD00-$DD0F)
 ; ============================================================
 write_cia2_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$0F
         tax
 
@@ -1674,7 +1674,7 @@ _wc2_not_00:
 ; VDC Register Writes ($D600-$D601)
 ; ============================================================
 write_vdc_register:
-        lda p4_addr_lo
+        lda c128_addr_lo
         and #$01
         beq _wvdc_index
 
@@ -1837,43 +1837,13 @@ _hex_chars:
 
 
 ; ============================================================
-; Compatibility aliases for code that still uses P4 names
-; (These will be removed as we update all files)
+; Aliases used by hooks and host code
 ; ============================================================
-P4MEM_Read      = C128_Read
-P4MEM_ReadFast  = C128_ReadFast
-P4MEM_Write     = C128_Write
-P4MEM_Init      = C128_MemInit
-P4MEM_InitVideo = C128_VideoInit
-P4MEM_ClearRAM  = C128_MemClearRAM
 BANK_RAM        = BANK_RAM0             ; Default RAM bank alias
-P4_MEM_PTR      = C128_MEM_PTR          ; ZP pointer alias
 
-; Aliases for Plus/4 variable names used in hooks/host
-p4_file_op_active = c128_file_op_active
-p4_video_mode     = c128_video_mode
+; Stub variable referenced by hooks (bitmap mode not yet implemented)
+c128_gfx_dirty:     .byte 0
 
-; Stub variables referenced by hooks (will be replaced)
-p4_gfx_dirty:     .byte 0
-p4_multicolor:    .byte 0
-p4_host_bmp_on:   .byte 0
-p4_bitmap_was_active: .byte 0
-p4_screen_fill_pending: .byte 0
-
-; Video stub routines referenced by hooks (will be replaced)
-P4VID_DisableHostBitmap:
-P4VID_GfxConfigChanged:
-P4VID_CharsetChanged:
-P4VID_UpdateCursor:
-P4VID_Frame:
-P4VID_InitPalette:
-P4_CheckCursorKeys:
+; Stub routines (bitmap/graphics not yet implemented for C128)
+C128Vid_DisableHostBitmap:
         rts
-
-; Aliases for TED references in existing code (temporary)
-ted_regs        = vic_regs              ; VIC regs in place of TED
-ted_timer1_lo:  .byte $FF
-ted_timer1_hi:  .byte $FF
-ted_raster_lo:  .byte 0
-ted_raster_hi:  .byte 0
-ted_cycle_accum: .byte 0

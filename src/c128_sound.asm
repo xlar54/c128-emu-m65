@@ -29,19 +29,3 @@ _snd_clr:
         lda #$00
         sta SID_BASE+$18        ; Filter/volume register
         rts
-
-; ============================================================
-; Compatibility aliases for code referencing Plus/4 sound names
-; ============================================================
-P4SND_Init = C128_SndInit
-
-; Stubs for TED sound routines referenced by old code
-P4SND_UpdateVoice1:
-P4SND_UpdateVoice1_WithHigh:
-P4SND_UpdateVolume:
-P4SND_UpdateVoice2_FromBasic:
-        rts
-
-; TED sound state variables (compatibility stubs)
-p4snd_voice1_on:   .byte 0
-p4snd_v1_freq_hi:  .byte 0

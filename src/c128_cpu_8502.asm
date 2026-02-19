@@ -14,27 +14,27 @@
         .cpu "45gs02"
 
 ; Zero-page CPU state
-p4_a        = $02
-p4_x        = $03
-p4_y        = $04
-p4_sp       = $05
-p4_p        = $06
-p4_pc_lo    = $07
-p4_pc_hi    = $08
-p4_addr_lo  = $09
-p4_addr_hi  = $0A
-p4_data     = $0b
-p4_vec_lo   = $0c
-p4_vec_hi   = $0d
-p4_tmp      = $0e
-p4_tmp2     = $0f
+c128_a        = $02
+c128_x        = $03
+c128_y        = $04
+c128_sp       = $05
+c128_p        = $06
+c128_pc_lo    = $07
+c128_pc_hi    = $08
+c128_addr_lo  = $09
+c128_addr_hi  = $0A
+c128_data     = $0b
+c128_vec_lo   = $0c
+c128_vec_hi   = $0d
+c128_tmp      = $0e
+c128_tmp2     = $0f
 
-p4_xtra     = $11
-p4_dec_a    = $12           ; Saved A for decimal mode ADC/SBC
-p4_inst_pc_lo = $1A
-p4_inst_pc_hi = $1B
-p4_irq_pending = $19
-p4_nmi_pending = $1C
+c128_xtra     = $11
+c128_dec_a    = $12           ; Saved A for decimal mode ADC/SBC
+c128_inst_pc_lo = $1A
+c128_inst_pc_hi = $1B
+c128_irq_pending = $19
+c128_nmi_pending = $1C
 
 
 ; Status flags
@@ -52,9 +52,9 @@ P_N = %10000000
 c128_kbd_col:        .byte $FF  ; Last keyboard column written to CIA1 $DC00
 
 ; Debug trace variables
-p4_trace_enabled:    .byte $00  ; Set to 1 after LOAD to enable tracing
-p4_trace_pos_lo:     .byte $00  ; Screen position low byte
-p4_trace_pos_hi:     .byte $08  ; Screen position high byte ($0800)
+c128_trace_enabled:    .byte $00  ; Set to 1 after LOAD to enable tracing
+c128_trace_pos_lo:     .byte $00  ; Screen position low byte
+c128_trace_pos_hi:     .byte $08  ; Screen position high byte ($0800)
 
 ; VIC-II timing constants (PAL)
 VIC_CYCLES_PER_LINE = 63    ; 63 cycles per scanline (VIC-II PAL)
@@ -63,10 +63,10 @@ VIC_LINES_PER_FRAME = 312   ; PAL has 312 lines
 
 set_zna .macro
         tax                     ; X = result byte (original A)
-        lda p4_p
+        lda c128_p
         and #(~(P_Z|P_N)) & $ff  ; clear old Z/N
         ora zn_table,x           ; OR in new Z/N
-        sta p4_p
+        sta c128_p
         txa
 .endmacro
 
@@ -77,7 +77,7 @@ set_zna .macro
 ; ------------------------------------------------------------
 finish_cycles_inline .macro
         clc
-        adc p4_xtra             ; Add extra cycles (page crossing, etc.)
+        adc c128_xtra             ; Add extra cycles (page crossing, etc.)
         adc vic_cycle_accum     ; Add to accumulated cycles
         sta vic_cycle_accum
         cmp #VIC_CYCLES_PER_LINE
@@ -113,16 +113,16 @@ zn_table:
 ; -----------------------------------------------------------------
 ; ZP: fast code-fetch cache (host-side)
 ; -----------------------------------------------------------------
-p4_code_ptr       = $E0   ; 4 bytes: lo, hi, bank, megabyte
-p4_code_page_hi   = $E4   ; cached p4_pc_hi (guest)
-p4_code_valid     = $E5   ; 0=invalid, !=0 valid
-p4_code_romvis    = $E6   ; cached mmu_cr snapshot (for ROM visibility change detection)
-p4_hook_pc_changed = $E7  ; Set by hooks when they modify PC
+c128_code_ptr       = $E0   ; 4 bytes: lo, hi, bank, megabyte
+c128_code_page_hi   = $E4   ; cached c128_pc_hi (guest)
+c128_code_valid     = $E5   ; 0=invalid, !=0 valid
+c128_code_romvis    = $E6   ; cached mmu_cr snapshot (for ROM visibility change detection)
+c128_hook_pc_changed = $E7  ; Set by hooks when they modify PC
 
 ; Call this when you want to force cache rebuild (optional helper)
 invalidate_code_cache:
         lda #$00
-        sta p4_code_valid
+        sta c128_code_valid
         rts
 
 ; -----------------------------------------------------------------
@@ -136,16 +136,16 @@ invalidate_code_cache:
 ; -----------------------------------------------------------------
 fetch8:
         ; If cache invalid, rebuild
-        lda p4_code_valid
+        lda c128_code_valid
         beq _f8_rebuild
 
         ; If page changed, rebuild
-        lda p4_pc_hi
-        cmp p4_code_page_hi
+        lda c128_pc_hi
+        cmp c128_code_page_hi
         bne _f8_rebuild
 
         ; If we are in >=$40, ROM visibility affects whether we read ROM or RAM
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$40
         bcc _f8_do_read
 
@@ -160,27 +160,27 @@ fetch8:
 _f8_check_romvis:
         ; MMU config changed since cache built?
         lda mmu_cr
-        cmp p4_code_romvis
+        cmp c128_code_romvis
         bne _f8_rebuild
 
 _f8_do_read:
-        ldz p4_pc_lo
-        lda [p4_code_ptr],z
-        inw p4_pc_lo
+        ldz c128_pc_lo
+        lda [c128_code_ptr],z
+        inw c128_pc_lo
         rts
 
 ; -----------------------------
 ; Cache rebuild
 ; -----------------------------
 _f8_rebuild:
-        lda p4_pc_hi
-        sta p4_code_page_hi
+        lda c128_pc_hi
+        sta c128_code_page_hi
 
         ; Remember current MMU config for change detection
         lda mmu_cr
-        sta p4_code_romvis
+        sta c128_code_romvis
 
-        lda p4_pc_hi
+        lda c128_pc_hi
 
         ; $0000-$0FFF => physical bank (same as other RAM)
         cmp #$10
@@ -231,71 +231,71 @@ _f8_build_rom:
         ; Exception: pages $F8-$FF are relocated to $2000-$27FF
         ; because $1F800-$1FFFF is the MEGA65 color RAM window
         lda #$00
-        sta p4_code_ptr+0
-        lda p4_pc_hi
+        sta c128_code_ptr+0
+        lda c128_pc_hi
         cmp #$F8
         bcc _f8_rom_normal
         ; Relocated: $F8->$20, $F9->$21, ..., $FF->$27
         sec
         sbc #$D8
-        sta p4_code_ptr+1
+        sta c128_code_ptr+1
         jmp _f8_rom_set_bank
 _f8_rom_normal:
-        sta p4_code_ptr+1
+        sta c128_code_ptr+1
 _f8_rom_set_bank:
         lda #BANK_ROM
-        sta p4_code_ptr+2
+        sta c128_code_ptr+2
         lda #$00
-        sta p4_code_ptr+3
+        sta c128_code_ptr+3
         lda #$01
-        sta p4_code_valid
+        sta c128_code_valid
         jmp _f8_do_read
 
 _f8_build_ram:
         ; RAM => use physical bank from MMU (with shared RAM logic)
         lda #$00
-        sta p4_code_ptr+0
-        lda p4_pc_hi
-        sta p4_code_ptr+1
-        ; get_physical_bank uses p4_addr_hi, so set it to PC page
-        sta p4_addr_hi
+        sta c128_code_ptr+0
+        lda c128_pc_hi
+        sta c128_code_ptr+1
+        ; get_physical_bank uses c128_addr_hi, so set it to PC page
+        sta c128_addr_hi
         jsr get_physical_bank   ; Returns MEGA65 bank in A
-        sta p4_code_ptr+2
+        sta c128_code_ptr+2
         lda #$00
-        sta p4_code_ptr+3
+        sta c128_code_ptr+3
         lda #$01
-        sta p4_code_valid
+        sta c128_code_valid
         jmp _f8_do_read
 
 _f8_build_low:
         lda #$00
-        sta p4_code_ptr+0
-        lda p4_pc_hi
+        sta c128_code_ptr+0
+        lda c128_pc_hi
         clc
         adc #>LOW_RAM_BUFFER
-        sta p4_code_ptr+1
+        sta c128_code_ptr+1
         lda #$00
-        sta p4_code_ptr+2
-        sta p4_code_ptr+3
+        sta c128_code_ptr+2
+        sta c128_code_ptr+3
         lda #$01
-        sta p4_code_valid
+        sta c128_code_valid
         jmp _f8_do_read
 
 _f8_build_slow:
         lda #$00
-        sta p4_code_valid
+        sta c128_code_valid
         ; fall through
 
 ; -----------------------------
 ; Slow path: use full memory read
 ; -----------------------------
 _f8_slow:
-        lda p4_pc_lo
-        sta p4_addr_lo
-        lda p4_pc_hi
-        sta p4_addr_hi
+        lda c128_pc_lo
+        sta c128_addr_lo
+        lda c128_pc_hi
+        sta c128_addr_hi
         jsr C128_ReadFast
-        inw p4_pc_lo
+        inw c128_pc_lo
         rts
 
 ;===========end new
@@ -306,11 +306,11 @@ _f8_slow:
 ; --- fetch16_to_addr ---
 fetch16_to_addr:
         jsr fetch8
-        sta p4_tmp
+        sta c128_tmp
         jsr fetch8
-        sta p4_addr_hi
-        lda p4_tmp
-        sta p4_addr_lo
+        sta c128_addr_hi
+        lda c128_tmp
+        sta c128_addr_lo
         rts
 
 ; Cached bank for stack page ($0100-$01FF)
@@ -324,24 +324,24 @@ push_data:
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3
-        lda p4_sp
+        lda c128_sp
         sta C128_MEM_PTR+0
         lda #$01
         sta C128_MEM_PTR+1
         ldz #0
-        lda p4_data
+        lda c128_data
         sta [C128_MEM_PTR],z
-        dec p4_sp
+        dec c128_sp
         rts
 
 ; --- pull_to_a ---
 pull_to_a:
-        inc p4_sp
+        inc c128_sp
         lda cached_stack_bank
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3
-        lda p4_sp
+        lda c128_sp
         sta C128_MEM_PTR+0
         lda #$01
         sta C128_MEM_PTR+1
@@ -491,9 +491,9 @@ _rzpx_ddr:
         rts
 _rzpx_tmp: .byte 0
 
-; Read from ZP address in p4_addr_lo, result in A
+; Read from ZP address in c128_addr_lo, result in A
 read_zp:
-        ldx p4_addr_lo
+        ldx c128_addr_lo
         cpx #$02
         bcc _rzp_port
         #setup_bank4_zp
@@ -554,19 +554,19 @@ _wzpx_ddr:
         pla
         rts
 
-; Write p4_data to ZP address in p4_addr_lo
+; Write c128_data to ZP address in c128_addr_lo
 write_zp:
-        ldx p4_addr_lo
+        ldx c128_addr_lo
         cpx #$02
         bcc _wzp_port
         #setup_bank4_zp
         stx C128_MEM_PTR+0
         ldz #0
-        lda p4_data
+        lda c128_data
         sta [C128_MEM_PTR],z
         rts
 _wzp_port:
-        lda p4_data
+        lda c128_data
         cpx #$00
         beq _wzp_ddr
         sta cpu_port_data
@@ -591,43 +591,43 @@ _wzp_ddr:
         pla
         rts
 
-; Read 16-bit pointer from ZP address Y, result in p4_addr_lo/hi
+; Read 16-bit pointer from ZP address Y, result in c128_addr_lo/hi
 ; (Used for indirect addressing modes)
 read_zp_ptr_y:
         #setup_bank4_zp
         sty C128_MEM_PTR+0
         ldz #0
         lda [C128_MEM_PTR],z
-        sta p4_addr_lo
+        sta c128_addr_lo
         inc C128_MEM_PTR+0
         lda [C128_MEM_PTR],z
-        sta p4_addr_hi
+        sta c128_addr_hi
         rts
 
 ; --- Addressing modes ---
 addr_zp:
         jsr fetch8
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$00
-        sta p4_addr_hi
+        sta c128_addr_hi
         rts
 
 addr_zpx:
         jsr fetch8
         clc
-        adc p4_x
-        sta p4_addr_lo
+        adc c128_x
+        sta c128_addr_lo
         lda #$00
-        sta p4_addr_hi
+        sta c128_addr_hi
         rts
 
 addr_zpy:
         jsr fetch8
         clc
-        adc p4_y
-        sta p4_addr_lo
+        adc c128_y
+        sta c128_addr_lo
         lda #$00
-        sta p4_addr_hi
+        sta c128_addr_hi
         rts
 
 addr_abs:
@@ -636,72 +636,72 @@ addr_abs:
 addr_absx:
         jsr fetch16_to_addr
         lda #$00
-        sta p4_xtra
-        lda p4_addr_lo
+        sta c128_xtra
+        lda c128_addr_lo
         clc
-        adc p4_x
-        sta p4_addr_lo
+        adc c128_x
+        sta c128_addr_lo
         bcc _absx_nc
-        inc p4_addr_hi
+        inc c128_addr_hi
         lda #$01
-        sta p4_xtra
+        sta c128_xtra
 _absx_nc:
         rts
 
 addr_absy:
         jsr fetch16_to_addr
         lda #$00
-        sta p4_xtra
-        lda p4_addr_lo
+        sta c128_xtra
+        lda c128_addr_lo
         clc
-        adc p4_y
-        sta p4_addr_lo
+        adc c128_y
+        sta c128_addr_lo
         bcc _absy_nc
-        inc p4_addr_hi
+        inc c128_addr_hi
         lda #$01
-        sta p4_xtra
+        sta c128_xtra
 _absy_nc:
         rts
 
 addr_indx:
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tay                             ; Y = ZP address
         ; Read 16-bit pointer directly from ZP
         jsr lrb_read_y
-        sta p4_addr_lo
+        sta c128_addr_lo
         iny
         jsr lrb_read_y
-        sta p4_addr_hi
+        sta c128_addr_hi
         rts
 
 addr_indy:
         jsr fetch8
         tay                             ; Y = ZP address
         lda #$00
-        sta p4_xtra
+        sta c128_xtra
         ; Read 16-bit pointer directly from ZP
         jsr lrb_read_y
-        sta p4_tmp
+        sta c128_tmp
         iny
         jsr lrb_read_y
-        sta p4_tmp2
+        sta c128_tmp2
         ; Add Y register to form final address
-        lda p4_tmp
+        lda c128_tmp
         clc
-        adc p4_y
-        sta p4_addr_lo
-        lda p4_tmp2
+        adc c128_y
+        sta c128_addr_lo
+        lda c128_tmp2
         adc #$00
-        sta p4_addr_hi
+        sta c128_addr_hi
         ; Check for page crossing
-        lda p4_tmp
+        lda c128_tmp
         clc
-        adc p4_y
+        adc c128_y
         bcc _indy_nc
         lda #$01
-        sta p4_xtra
+        sta c128_xtra
 _indy_nc:
         rts
 
@@ -710,27 +710,27 @@ addr_ind_jmp:
 
 ;debug
         ;  save the pointer address (e.g. $0318)
-        lda p4_addr_lo
-        sta p4_vec_lo
-        lda p4_addr_hi
-        sta p4_vec_hi
+        lda c128_addr_lo
+        sta c128_vec_lo
+        lda c128_addr_hi
+        sta c128_vec_hi
 ;
 
         jsr C128_ReadFast
-        sta p4_tmp
-        inc p4_addr_lo
+        sta c128_tmp
+        inc c128_addr_lo
         jsr C128_ReadFast
-        sta p4_tmp2
+        sta c128_tmp2
 
-        lda p4_tmp
-        sta p4_addr_lo
-        lda p4_tmp2
-        sta p4_addr_hi
+        lda c128_tmp
+        sta c128_addr_lo
+        lda c128_tmp2
+        sta c128_addr_hi
         rts
 
 fetch_rel:
         jsr fetch8
-        sta p4_tmp
+        sta c128_tmp
         rts
 
 ; ============================================================
@@ -792,7 +792,7 @@ _vic_line_loop:
         ora #$80                ; Set IR bit
         sta cia1_icr_data
         lda #1
-        sta p4_irq_pending
+        sta c128_irq_pending
 
 _timer_a_no_borrow:
         ; Advance raster line
@@ -845,7 +845,7 @@ _vic_check_raster_irq:
         ora #$80                ; Set IRQ flag
         sta vic_regs+$19
         lda #1
-        sta p4_irq_pending
+        sta c128_irq_pending
 
 _vic_next_line:
         ; More lines to process?
@@ -902,22 +902,22 @@ hook_vdc_screen_clear:
         lda #$E0
         sta [C128_MEM_PTR],z
         lda #$4B
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$CE
-        sta p4_pc_hi
+        sta c128_pc_hi
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
         rts
 
 ; hook_raster_wait_1 - Skip "LDA $D011 / BPL $E142" at $E142
 ; This waits for raster >= 256. Skip to $E147.
 hook_raster_wait_1:
         lda #$47
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$E1
-        sta p4_pc_hi
+        sta c128_pc_hi
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
@@ -926,11 +926,11 @@ hook_raster_wait_1:
 ; This waits for raster < 256. Skip to $E153.
 hook_raster_wait_2:
         lda #$53
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$E1
-        sta p4_pc_hi
+        sta c128_pc_hi
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
@@ -1000,34 +1000,34 @@ pc_trace_sp:           .fill 128, 0
 cpu_take_irq:
 
         ; Push PC high
-        lda p4_pc_hi
-        sta p4_data
+        lda c128_pc_hi
+        sta c128_data
         jsr push_data
         ; Push PC low
-        lda p4_pc_lo
-        sta p4_data
+        lda c128_pc_lo
+        sta c128_data
         jsr push_data
         ; Push P with B=0, U=1
-        lda p4_p
+        lda c128_p
         and #(~P_B) & $ff       ; Clear B flag
         ora #P_U
-        sta p4_data
+        sta c128_data
         jsr push_data
         ; Set I flag
-        lda p4_p
+        lda c128_p
         ora #P_I
-        sta p4_p
+        sta c128_p
         ; Load IRQ vector from $FFFE/$FFFF
         lda #$FE
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$FF
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_ReadFast
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$FF
-        sta p4_addr_lo
+        sta c128_addr_lo
         jsr C128_ReadFast
-        sta p4_pc_hi
+        sta c128_pc_hi
         rts
 
 ; ============================================================
@@ -1036,38 +1036,38 @@ cpu_take_irq:
 ; ============================================================
 cpu_take_nmi:
         ; Push PC high
-        lda p4_pc_hi
-        sta p4_data
+        lda c128_pc_hi
+        sta c128_data
         jsr push_data
         ; Push PC low
-        lda p4_pc_lo
-        sta p4_data
+        lda c128_pc_lo
+        sta c128_data
         jsr push_data
         ; Push P with B=0, U=1
-        lda p4_p
+        lda c128_p
         and #(~P_B) & $ff
         ora #P_U
-        sta p4_data
+        sta c128_data
         jsr push_data
         ; Set I flag
-        lda p4_p
+        lda c128_p
         ora #P_I
-        sta p4_p
+        sta c128_p
         ; Load NMI vector from $FFFA/$FFFB
         lda #$FA
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$FF
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_ReadFast
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$FB
-        sta p4_addr_lo
+        sta c128_addr_lo
         jsr C128_ReadFast
-        sta p4_pc_hi
+        sta c128_pc_hi
         rts
 
 ; --- Reset/Step ---
-P4CPU_Reset:
+C128CPU_Reset:
 C128_CPUReset:
         ; Reset video mode first
         lda #0
@@ -1081,7 +1081,7 @@ C128_CPUReset:
         jsr C128_VideoInit
         
         ; Reset hook state
-        jsr P4HOOK_Reset
+        jsr C128Hook_Reset
 
         ; ============================================================
         ; Simulate Z80 boot initialization
@@ -1093,11 +1093,11 @@ C128_CPUReset:
         
         ; Reset CPU registers
         lda #$00
-        sta p4_a
-        sta p4_x
-        sta p4_y
-        sta p4_irq_pending
-        sta p4_nmi_pending
+        sta c128_a
+        sta c128_x
+        sta c128_y
+        sta c128_irq_pending
+        sta c128_nmi_pending
         sta vic_cycle_accum
         sta vic_raster_lo
         sta vic_raster_hi
@@ -1117,21 +1117,21 @@ C128_CPUReset:
         sta cia1_icr_data
 
         lda #$FF
-        sta p4_sp
+        sta c128_sp
         lda #(P_I|P_U)
-        sta p4_p
+        sta c128_p
         
         ; Get reset vector from ROM ($FFFC/$FFFD)
         lda #$fc
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$ff
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_ReadFast
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$fd
-        sta p4_addr_lo
+        sta c128_addr_lo
         jsr C128_ReadFast
-        sta p4_pc_hi
+        sta c128_pc_hi
         rts
 
 ; ============================================================
@@ -1154,13 +1154,13 @@ z80_pre_init:
         ldx #0
 z80_wr_ffd0:
         lda z80_ffd0_data,x
-        sta p4_data
+        sta c128_data
         txa
         clc
         adc #$D0
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$FF
-        sta p4_addr_hi
+        sta c128_addr_hi
         phx
         jsr C128_Write
         plx
@@ -1173,13 +1173,13 @@ z80_wr_ffd0:
         ldx #0
 z80_wr_ffe0:
         lda z80_ffe0_data,x
-        sta p4_data
+        sta c128_data
         txa
         clc
         adc #$E0
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$FF
-        sta p4_addr_hi
+        sta c128_addr_hi
         phx
         jsr C128_Write
         plx
@@ -1192,13 +1192,13 @@ z80_wr_ffe0:
         ldx #0
 z80_wr_1100:
         lda z80_1100_data,x
-        sta p4_data
+        sta c128_data
         txa
         clc
         adc #$00
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$11
-        sta p4_addr_hi
+        sta c128_addr_hi
         phx
         jsr C128_Write
         plx
@@ -1208,20 +1208,20 @@ z80_wr_1100:
 
         ; --- Set INIT_STATUS ($0A04) = 0 ---
         lda #$00
-        sta p4_data
+        sta c128_data
         lda #$04
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$0A
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_Write
 
         ; --- Set $0A03 = 0 (40/80 column flag area) ---
         lda #$00
-        sta p4_data
+        sta c128_data
         lda #$03
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$0A
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_Write
 
         rts
@@ -1265,21 +1265,21 @@ BREAK_ADDR_LO = $00
 BREAK_ADDR_HI = $FD     ; Break at $FD00
 
 ; ============================================================
-; P4CPU_StepMultiple - Execute multiple instructions
-; Simple batch version - calls P4CPU_Step repeatedly
+; C128CPU_StepMultiple - Execute multiple instructions
+; Simple batch version - calls C128CPU_Step repeatedly
 ; ============================================================
 BATCH_SIZE = 64         ; Number of instructions per batch
 
-P4CPU_StepMultiple:
+C128CPU_StepMultiple:
 C128_CPUStepMultiple:
         ; Check monitor ONCE per batch, not per instruction
-        jsr P4MON_Check
+        jsr C128Mon_Check
         bcs _sm_monitor_active  ; Monitor took over, skip batch
         
         ldx #BATCH_SIZE
 _sm_batch_loop:
         phx                     ; Save counter
-        jsr P4CPU_Step
+        jsr C128CPU_Step
         plx                     ; Restore counter
         dex
         bne _sm_batch_loop
@@ -1287,9 +1287,9 @@ _sm_monitor_active:
         rts
 
 ; ============================================================
-; P4CPU_Step - Single instruction execution
+; C128CPU_Step - Single instruction execution
 ; ============================================================
-P4CPU_Step:
+C128CPU_Step:
         ; --- Boot milestone & hook checks ---
         ; Milestones write progress byte to $0FE0F via 32-bit store.
         ; Check $0FE0F in the monitor to see how far boot got.
@@ -1299,12 +1299,12 @@ P4CPU_Step:
         ;          $08=E093  $09=E056  $0A=C07B  $0B=B000
         ;          $0C=B021  $0D=BASIC running
         ;
-        lda p4_pc_hi
+        lda c128_pc_hi
 
         ; Hook $CE0C: VDC screen clear (skip the polling loop)
         cmp #$CE
         bne _hook_not_ce
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$0C
         bne _hook_not_ce
         jsr hook_vdc_screen_clear
@@ -1316,7 +1316,7 @@ _hook_not_ce:
         ; Hook $E142/$E14E: raster wait loops (skip busy waits)
         cmp #$E1
         bne _hook_not_e1
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$42
         beq hook_raster_wait_1
         cmp #$4E
@@ -1326,88 +1326,88 @@ _hook_not_ce:
         bne +
         lda #$05
         jsr write_milestone     ; $05 = E109 entered
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$14
         bne +
         lda #$15
         jsr write_milestone     ; $15 = E114 (STA $DC0E)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$2E
         bne +
         lda #$16
         jsr write_milestone     ; $16 = E12E (LDA #$07 STA $DD00)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$38
         bne +
         lda #$17
         jsr write_milestone     ; $17 = E138 (STA $01 cpu port)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$40
         bne +
         lda #$18
         jsr write_milestone     ; $18 = E140 (LDX #$FF before raster)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$47
         bne +
         lda #$19
         jsr write_milestone     ; $19 = E147 (past raster wait 1)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$53
         bne +
         lda #$1A
         jsr write_milestone     ; $1A = E153 (INX past raster wait 2)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$54
         bne +
         lda #$10
         jsr write_milestone     ; $10 = E154
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$5C
         bne +
         lda #$11
         jsr write_milestone     ; $11 = E15C
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$6E
         bne +
         lda #$12
         jsr write_milestone     ; $12 = E16E
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$79
         bne +
         lda #$13
         jsr write_milestone     ; $13 = E179 (JSR E1DC)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$7E
         bne +
         lda #$14
         jsr write_milestone     ; $14 = E17E (after JSR E1DC returns)
 +       ; E1DC = VDC init loop entry
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$DC
         bne +
         lda #$20
         jsr write_milestone     ; $20 = E1DC (VDC loop entry/iteration)
         jsr write_loop_counter  ; increment counter at $0FE0E
 +       ; E1E6 = STY $D600 inside VDC loop
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$E6
         bne +
         lda #$21
         jsr write_milestone     ; $21 = E1E6 (STY $D600 in loop)
 +       ; E1EC = BPL at end of VDC loop
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$EC
         bne +
         lda #$22
         jsr write_milestone     ; $22 = E1EC (BPL loop-back)
 +       ; E1EE = loop exit (end marker hit)
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$EE
         bne +
         lda #$23
         jsr write_milestone     ; $23 = E1EE (loop done, about to RTS)
 +       ; E1EF = RTS from E1DC
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$EF
         bne +
         lda #$24
@@ -1418,27 +1418,27 @@ _hook_not_e1:
         ; Milestones in $E0xx page
         cmp #$E0
         bne _hook_not_e0
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$00
         bne +
         lda #$01
         jsr write_milestone     ; $01 = E000
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$24
         bne +
         lda #$07
         jsr write_milestone     ; $07 = E024 (post-E109)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$93
         bne +
         lda #$08
         jsr write_milestone     ; $08 = E093 (IOINIT)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$56
         bne +
         lda #$09
         jsr write_milestone     ; $09 = E056 (RAMTAS)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$CD
         bne _hook_not_e0
         lda #$02
@@ -1446,54 +1446,54 @@ _hook_not_e1:
 _hook_not_e0:
 
         ; Milestones in other pages
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$E2
         bne +
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$42
         bne +
         lda #$04
         jsr write_milestone     ; $04 = E242 (C128 mode check)
 +
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$E1
         bne +
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$F0
         bne +
         lda #$03
         jsr write_milestone     ; $03 = E1F0 (auto-boot check)
 +
         ; CINT screen editor init
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$C0
         bne _hook_not_c0
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$7B
         bne +
         lda #$0A
         jsr write_milestone     ; $0A = C07B (CINT entered)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$8B
         bne +
         lda #$40
         jsr write_milestone     ; $40 = C08B (JSR $FFCC / CLRCHN)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$8E
         bne +
         lda #$41
         jsr write_milestone     ; $41 = C08E (past CLRCHN)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$D0
         bne +
         lda #$42
         jsr write_milestone     ; $42 = C0D0 (JSR $C983)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$D3
         bne +
         lda #$43
         jsr write_milestone     ; $43 = C0D3 (past C983)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$F6
         bne +
         lda #$44
@@ -1502,86 +1502,86 @@ _hook_not_e0:
 _hook_not_c0:
 
         ; Deeper CINT milestones (page $C1)
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$C1
         bne _hook_not_c1
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$01
         bne +
         lda #$45
         jsr write_milestone     ; $45 = C101 (BIT $0A04)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$11
         bne +
         lda #$46
         jsr write_milestone     ; $46 = C111 (copy CEA8 to $1000)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$24
         bne +
         lda #$47
         jsr write_milestone     ; $47 = C124 (JSR $CD2E)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$2A
         bne +
         lda #$48
         jsr write_milestone     ; $48 = C12A (JSR $CA24)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$2D
         bne +
         lda #$49
         jsr write_milestone     ; $49 = C12D (JSR $C142)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$30
         bne +
         lda #$4A
         jsr write_milestone     ; $4A = C130 (JSR $CD2E again)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$39
         bne +
         lda #$4B
         jsr write_milestone     ; $4B = C139 (BIT $D505)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$41
         bne +
         lda #$4C
         jsr write_milestone     ; $4C = C141 (RTS from CINT)
 +       ; Inside C142
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$42
         bne +
         lda #$50
         jsr write_milestone     ; $50 = C142 (entered)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$45
         bne +
         lda #$51
         jsr write_milestone     ; $51 = C145 (JSR $C15E)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$48
         bne +
         lda #$52
         jsr write_milestone     ; $52 = C148 (JSR $C4A5)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$4B
         bne +
         lda #$53
         jsr write_milestone     ; $53 = C14B (CPX loop check)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$5C
         bne +
         lda #$55
         jsr write_milestone     ; $55 = C15C (after CPX loop)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$7A
         bne +
         lda #$56
         jsr write_milestone     ; $56 = C17A
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$91
         bne +
         lda #$57
         jsr write_milestone     ; $57 = C191
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$93
         bne +
         lda #$58
@@ -1590,10 +1590,10 @@ _hook_not_c0:
 _hook_not_c1:
 
         ; C4A5 screen clear milestones
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$C4
         bne _hook_not_c4
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$A5
         bne +
         lda #$54
@@ -1604,25 +1604,25 @@ _hook_not_c4:
 _c4c0_fired: .byte 0
 _past_c4_data:
         ; Post-CINT milestones
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$E0
         bne _hook_not_e0_post
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$3A
         bne +
         lda #$30
         jsr write_milestone     ; $30 = E03A (PLA after CINT returned)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$3B
         bne +
         lda #$31
         jsr write_milestone     ; $31 = E03B (CLI - enables interrupts!)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$3E
         bne +
         lda #$32
         jsr write_milestone     ; $32 = E03E (JMP $B000)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$3C
         bne +
         lda #$33
@@ -1631,15 +1631,15 @@ _past_c4_data:
 _hook_not_e0_post:
 
         ; BASIC cold start paths
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$E0
         bne _not_e0_alt
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$41
         bne +
         lda #$35
         jsr write_milestone     ; $35 = E041 (BMI target - alt boot)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$45
         bne +
         lda #$36
@@ -1647,45 +1647,45 @@ _hook_not_e0_post:
 +
 _not_e0_alt:
 
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$40
         bne _not_40
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$00
         bne +
         lda #$37
         jsr write_milestone     ; $37 = 4000 (BASIC LO entry!)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$23
         bne +
         lda #$38
         jsr write_milestone     ; $38 = 4023 (BASIC LO cold start)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$45
         bne +
         lda #$39
         jsr write_milestone     ; $39 = 4045
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$1C
         bne +
         lda #$3A
         jsr write_milestone     ; $3A = 401C (CLI before main loop)
 +
         ; Check for $4Dxx range
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$4D
         bne _not_4d
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$37
         bne +
         lda #$3B
         jsr write_milestone     ; $3B = 4D37 (BASIC main loop entry)
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$B7
         bne +
         lda #$3C
         jsr write_milestone     ; $3C = 4DB7 (after JMP ($0300))
-+       lda p4_pc_lo
++       lda c128_pc_lo
         cmp #$C6
         bne +
         lda #$3D
@@ -1693,10 +1693,10 @@ _not_e0_alt:
 +
 _not_4d:
         ; Check for $4Fxx (input routine)
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$4F
         bne _not_4f
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$93
         bne +
         lda #$3E
@@ -1706,26 +1706,26 @@ _not_4f:
 
 _not_40:
 
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$B0
         bne +
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$00
         bne +
         lda #$0B
         jsr write_milestone     ; $0B = B000 (BASIC HI entry)
-+       lda p4_pc_hi
++       lda c128_pc_hi
         cmp #$B0
         bne +
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$03
         bne +
         lda #$34
         jsr write_milestone     ; $34 = B003 (BASIC IRQ handler)
-+       lda p4_pc_hi
++       lda c128_pc_hi
         cmp #$B0
         bne +
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$21
         bne +
         lda #$0C
@@ -1734,10 +1734,10 @@ _not_40:
         ; Hook: VDC polling loops at $C543, $CDCF, $CDDD
         ; These poll $D600 bit 7 (VDC ready). Since we return $A0,
         ; they should exit immediately. But add hooks as safety.
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$CD
         bne _hook_not_cdxx
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$CF
         beq _hook_vdc_poll_skip
         cmp #$DD
@@ -1746,35 +1746,35 @@ _not_40:
 _hook_vdc_poll_skip:
         ; Skip the BIT/BPL loop: advance PC past BPL
         ; BIT $D600 = 3 bytes, BPL = 2 bytes, total 5
-        lda p4_pc_lo
+        lda c128_pc_lo
         clc
         adc #$05
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
 _hook_not_cdxx:
 
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$C5
         bne _no_hooks
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$43
         bne _no_hooks
         ; $C543 VDC poll - skip it
         lda #$48                ; $C543 + 5 = $C548
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
 
 _no_hooks:
         ; DEBUG TRACE DISABLED
-        ; lda p4_trace_enabled
+        ; lda c128_trace_enabled
         ; beq _skip_trace
         ; ... trace code ...
         
@@ -1786,31 +1786,31 @@ _skip_trace_old:
         sta $7701
         lda mmu_kernal_rom
         sta $7702
-        lda p4_pc_lo
+        lda c128_pc_lo
         sta $7710
-        lda p4_pc_hi
+        lda c128_pc_hi
         sta $7711
         ; --------------------------------------------------------
         ; Check for pending interrupts (NMI first, then IRQ)
         ; --------------------------------------------------------
-        lda p4_nmi_pending
+        lda c128_nmi_pending
         beq _step_chk_irq
         lda #0
-        sta p4_nmi_pending
+        sta c128_nmi_pending
         jsr cpu_take_nmi
         lda #7
         #finish_cycles_inline
         rts
         
 _step_chk_irq:
-        lda p4_irq_pending
+        lda c128_irq_pending
         beq _step_execute
-        lda p4_p
+        lda c128_p
         and #P_I
         bne _step_execute       ; I=1, IRQ masked
         
         lda #0
-        sta p4_irq_pending
+        sta c128_irq_pending
         jsr cpu_take_irq
         lda #7
         #finish_cycles_inline
@@ -1818,13 +1818,13 @@ _step_chk_irq:
 
 _step_execute:
         lda #$00
-        sta p4_xtra
+        sta c128_xtra
         
         ; Save instruction PC for debugging
-        lda p4_pc_lo
-        sta p4_inst_pc_lo
-        lda p4_pc_hi
-        sta p4_inst_pc_hi
+        lda c128_pc_lo
+        sta c128_inst_pc_lo
+        lda c128_pc_hi
+        sta c128_inst_pc_hi
 
         ; Record PC and SP in trace ring buffer (only on page change or branch)
         ldx pc_trace_idx
@@ -1832,15 +1832,15 @@ _step_execute:
         txa
         and #$7F
         tax
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp pc_trace_hi,x       ; Same page as last entry?
         beq _skip_trace2
         ; Different page - record it
         ldx pc_trace_idx
         sta pc_trace_hi,x
-        lda p4_pc_lo
+        lda c128_pc_lo
         sta pc_trace_lo,x
-        lda p4_sp
+        lda c128_sp
         sta pc_trace_sp,x
         inx
         txa
@@ -1854,10 +1854,10 @@ live_trace_done:
 
         ; Check breakpoint BEFORE we fetch/execute
 .if TRACE_ENABLED
-        lda p4_inst_pc_hi
+        lda c128_inst_pc_hi
         cmp #BREAK_ADDR_HI
         bne _no_break
-        lda p4_inst_pc_lo
+        lda c128_inst_pc_lo
         cmp #BREAK_ADDR_LO
         bne _no_break
         ; Hit breakpoint! Halt with red border
@@ -1871,20 +1871,20 @@ _no_break:
         ; --------------------------------------------------------
         ; BASIC/KERNAL hooks - only for ROM area ($8000+)
         ; --------------------------------------------------------
-        lda p4_pc_hi
+        lda c128_pc_hi
         bpl _step_fetch         ; Skip hooks if PC < $8000
         
         ; Clear hook PC changed flag before calling hooks
         lda #0
-        sta p4_hook_pc_changed
+        sta c128_hook_pc_changed
         
-        jsr P4HOOK_CheckAndRun
+        jsr C128Hook_CheckAndRun
         
         ; Check if hook modified PC - if so, invalidate code cache
-        lda p4_hook_pc_changed
+        lda c128_hook_pc_changed
         beq _step_fetch
         lda #0
-        sta p4_code_valid       ; Force code cache rebuild
+        sta c128_code_valid       ; Force code cache rebuild
         jmp _step_fetch
 
 _trap_fb:
@@ -1913,11 +1913,11 @@ _trap_trace:
         tax
         cpy #0                  ; 256 bytes = 128 entries * 2
         bne _trap_trace
-        lda p4_pc_hi
+        lda c128_pc_hi
         sta $7200
-        lda p4_pc_lo
+        lda c128_pc_lo
         sta $7201
-        lda p4_sp
+        lda c128_sp
         sta $7202
         lda mmu_cr
         sta $7203
@@ -1946,7 +1946,7 @@ _trap_trace:
         sta $7209
         lda mmu_cr
         sta $720A
-        lda p4_sp
+        lda c128_sp
         sta $720B
         ; Halt with white border
         lda #$01
@@ -1976,7 +1976,7 @@ _step_dispatch_lo:
 finish_cycles:
         ; Add extra cycles and accumulate
         clc
-        adc p4_xtra
+        adc c128_xtra
         adc vic_cycle_accum
         sta vic_cycle_accum
         
@@ -2017,50 +2017,50 @@ trace_count_lo: .byte 0
 trace_count_hi: .byte 0
 
 ; --- branch_do ---
-; Called when branch is taken. Sets p4_xtra to:
+; Called when branch is taken. Sets c128_xtra to:
 ;   1 = branch taken, no page cross
 ;   2 = branch taken, page crossed
 branch_do:
         lda #$01                ; Start with 1 (branch taken)
-        sta p4_xtra
-        lda p4_pc_lo
+        sta c128_xtra
+        lda c128_pc_lo
         clc
-        adc p4_tmp
-        sta p4_addr_lo
-        lda p4_pc_hi
+        adc c128_tmp
+        sta c128_addr_lo
+        lda c128_pc_hi
         adc #$00
-        sta p4_addr_hi
-        lda p4_tmp
+        sta c128_addr_hi
+        lda c128_tmp
         bpl _br_hi_ok
-        dec p4_addr_hi
+        dec c128_addr_hi
 _br_hi_ok:
-        lda p4_pc_hi
-        cmp p4_addr_hi
+        lda c128_pc_hi
+        cmp c128_addr_hi
         beq _br_same
-        inc p4_xtra             ; Page crossed, increment to 2
+        inc c128_xtra             ; Page crossed, increment to 2
 _br_same:
-        lda p4_addr_lo
-        sta p4_pc_lo
-        lda p4_addr_hi
-        sta p4_pc_hi
+        lda c128_addr_lo
+        sta c128_pc_lo
+        lda c128_addr_hi
+        sta c128_pc_hi
         rts
 
 ; --- do_adc ---  (supports decimal mode when P_D set)
 do_adc:
-        sta p4_tmp
+        sta c128_tmp
 
         ; If D flag clear -> original binary path
-        lda p4_p
+        lda c128_p
         and #P_D
         beq _do_adc_bin
 
         ; ---------- decimal ADC ----------
         ; Save original A
-        lda p4_a
-        sta p4_dec_a
+        lda c128_a
+        sta c128_dec_a
 
-        ; carry_in -> p4_vec_lo (0/1)
-        lda p4_p
+        ; carry_in -> c128_vec_lo (0/1)
+        lda c128_p
         and #P_C
         beq _adc_dec_c0
         lda #1
@@ -2068,80 +2068,80 @@ do_adc:
 _adc_dec_c0:
         lda #0
 _adc_dec_cstore:
-        sta p4_vec_lo
+        sta c128_vec_lo
 
         ; Binary add first (for V computation)
-        lda p4_vec_lo
+        lda c128_vec_lo
         beq _adc_dec_clc
         sec
         bne _adc_dec_go
 _adc_dec_clc:
         clc
 _adc_dec_go:
-        lda p4_dec_a
-        adc p4_tmp
-        sta p4_a
+        lda c128_dec_a
+        adc c128_tmp
+        sta c128_a
         php                     ; save binary flags (esp V)
 
         ; Low nibble adjust test: (A_lo + M_lo + carry_in) > 9 ?
-        lda p4_tmp
+        lda c128_tmp
         and #$0F
-        sta p4_tmp2             ; m_lo
-        lda p4_dec_a
+        sta c128_tmp2             ; m_lo
+        lda c128_dec_a
         and #$0F
         clc
-        adc p4_tmp2
+        adc c128_tmp2
         clc
-        adc p4_vec_lo           ; + carry_in (0/1)
+        adc c128_vec_lo           ; + carry_in (0/1)
         cmp #$0A
         bcc _adc_dec_no6
-        lda p4_a
+        lda c128_a
         clc
         adc #$06
-        sta p4_a
+        sta c128_a
 _adc_dec_no6:
 
         ; High adjust if result >= $9A (i.e., > 99 in BCD)
         lda #0
-        sta p4_vec_hi           ; decimal carry out (0/1)
-        lda p4_a
+        sta c128_vec_hi           ; decimal carry out (0/1)
+        lda c128_a
         cmp #$9A
         bcc _adc_dec_no60
         clc
         adc #$60
-        sta p4_a
+        sta c128_a
         lda #1
-        sta p4_vec_hi
+        sta c128_vec_hi
 _adc_dec_no60:
 
-        ; Restore binary flags for V via PLP, then rebuild p4_p C/V
+        ; Restore binary flags for V via PLP, then rebuild c128_p C/V
         plp
-        lda p4_p
+        lda c128_p
         and #(~(P_C|P_V)) & $ff
-        sta p4_p
+        sta c128_p
 
-        ; C from decimal carry (p4_vec_hi)
-        lda p4_vec_hi
+        ; C from decimal carry (c128_vec_hi)
+        lda c128_vec_hi
         beq _adc_dec_noc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _adc_dec_noc:
 
         ; V from binary add (host V flag after PLP)
         bvc _adc_dec_nov
-        lda p4_p
+        lda c128_p
         ora #P_V
-        sta p4_p
+        sta c128_p
 _adc_dec_nov:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         rts
 
 _do_adc_bin:
         ; ---------- your original binary ADC ----------
-        lda p4_p
+        lda c128_p
         and #P_C
         beq _adc_nc
         sec
@@ -2149,25 +2149,25 @@ _do_adc_bin:
 _adc_nc:
         clc
 _adc_go2:
-        lda p4_a
-        adc p4_tmp
-        sta p4_a
+        lda c128_a
+        adc c128_tmp
+        sta c128_a
         php
-        lda p4_p
+        lda c128_p
         and #(~(P_C|P_V)) & $ff
-        sta p4_p
+        sta c128_p
         plp
         bcc _adc_noc2
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _adc_noc2:
         bvc _adc_nov2
-        lda p4_p
+        lda c128_p
         ora #P_V
-        sta p4_p
+        sta c128_p
 _adc_nov2:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         rts
@@ -2175,10 +2175,10 @@ _adc_nov2:
 
 ; --- do_sbc --- (supports decimal mode when P_D set)
 do_sbc:
-        sta p4_tmp
+        sta c128_tmp
 
         ; If D flag clear -> original binary path
-        lda p4_p
+        lda c128_p
         and #P_D
         bne _do_sbc_decimal      ; D set, do decimal
         jmp _do_sbc_bin          ; D clear, do binary
@@ -2186,11 +2186,11 @@ do_sbc:
 _do_sbc_decimal:
         ; ---------- decimal SBC ----------
         ; Save original A for nibble comparisons
-        lda p4_a
-        sta p4_dec_a
+        lda c128_a
+        sta c128_dec_a
 
         ; Do binary subtraction first (for V flag)
-        lda p4_p
+        lda c128_p
         and #P_C
         beq _sbc_dec_clc
         sec
@@ -2198,70 +2198,70 @@ _do_sbc_decimal:
 _sbc_dec_clc:
         clc
 _sbc_dec_go:
-        lda p4_a
-        sbc p4_tmp
-        sta p4_a
+        lda c128_a
+        sbc c128_tmp
+        sta c128_a
         php                     ; save flags for V
 
         ; Save carry (1 = no borrow, 0 = borrow)
         lda #0
         rol                     ; A = carry (0 or 1)
-        sta p4_vec_hi           ; save for later
+        sta c128_vec_hi           ; save for later
 
         ; Check if low nibble needs adjustment
         ; If (A_lo & $0F) > (orig_A_lo & $0F), we had a borrow from high nibble
-        lda p4_a
+        lda c128_a
         and #$0F
-        sta p4_tmp2             ; result low nibble
-        lda p4_dec_a
+        sta c128_tmp2             ; result low nibble
+        lda c128_dec_a
         and #$0F                ; original low nibble
-        cmp p4_tmp2
+        cmp c128_tmp2
         bcs _sbc_no_lo_adj      ; orig >= result, no low borrow
         ; Low nibble borrowed, subtract 6
-        lda p4_a
+        lda c128_a
         sec
         sbc #$06
-        sta p4_a
+        sta c128_a
 _sbc_no_lo_adj:
 
         ; Check if high nibble needs adjustment
         ; If we had an overall borrow (carry was 0), subtract $60
-        lda p4_vec_hi
+        lda c128_vec_hi
         bne _sbc_no_hi_adj      ; carry was 1, no borrow
-        lda p4_a
+        lda c128_a
         sec
         sbc #$60
-        sta p4_a
+        sta c128_a
 _sbc_no_hi_adj:
 
-        ; Restore flags and set C/V in p4_p
+        ; Restore flags and set C/V in c128_p
         plp
-        lda p4_p
+        lda c128_p
         and #(~(P_C|P_V)) & $ff
-        sta p4_p
+        sta c128_p
 
         ; Set C from saved carry
-        lda p4_vec_hi
+        lda c128_vec_hi
         beq _sbc_dec_noc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _sbc_dec_noc:
 
         ; Set V from binary subtract
         bvc _sbc_dec_nov
-        lda p4_p
+        lda c128_p
         ora #P_V
-        sta p4_p
+        sta c128_p
 _sbc_dec_nov:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         rts
 
 _do_sbc_bin:
         ; ---------- your original binary SBC ----------
-        lda p4_p
+        lda c128_p
         and #P_C
         bne _sbc_c
         clc
@@ -2269,117 +2269,117 @@ _do_sbc_bin:
 _sbc_c:
         sec
 _sbc_go2:
-        lda p4_a
-        sbc p4_tmp
-        sta p4_a
+        lda c128_a
+        sbc c128_tmp
+        sta c128_a
         php
-        lda p4_p
+        lda c128_p
         and #(~(P_C|P_V)) & $ff
-        sta p4_p
+        sta c128_p
         plp
         bcc _sbc_noc2
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _sbc_noc2:
         bvc _sbc_nov2
-        lda p4_p
+        lda c128_p
         ora #P_V
-        sta p4_p
+        sta c128_p
 _sbc_nov2:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         rts
 
 ; --- do_cmp ---
 do_cmp:
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #(~(P_C|P_Z|P_N)) & $ff
-        sta p4_p
-        lda p4_a
-        cmp p4_tmp
+        sta c128_p
+        lda c128_a
+        cmp c128_tmp
         bcc _cmp_noc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _cmp_noc:
-        lda p4_a
+        lda c128_a
         sec
-        sbc p4_tmp
+        sbc c128_tmp
         beq _cmp_z
         bmi _cmp_n
         rts
 _cmp_z:
-        lda p4_p
+        lda c128_p
         ora #P_Z
-        sta p4_p
+        sta c128_p
         rts
 _cmp_n:
-        lda p4_p
+        lda c128_p
         ora #P_N
-        sta p4_p
+        sta c128_p
         rts
 
 ; --- do_cpx ---
 do_cpx:
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #(~(P_C|P_Z|P_N)) & $ff
-        sta p4_p
-        lda p4_x
-        cmp p4_tmp
+        sta c128_p
+        lda c128_x
+        cmp c128_tmp
         bcc _cpx_noc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _cpx_noc:
-        lda p4_x
+        lda c128_x
         sec
-        sbc p4_tmp
+        sbc c128_tmp
         beq _cpx_z
         bmi _cpx_n
         rts
 _cpx_z:
-        lda p4_p
+        lda c128_p
         ora #P_Z
-        sta p4_p
+        sta c128_p
         rts
 _cpx_n:
-        lda p4_p
+        lda c128_p
         ora #P_N
-        sta p4_p
+        sta c128_p
         rts
 
 ; --- do_cpy ---
 do_cpy:
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #(~(P_C|P_Z|P_N)) & $ff
-        sta p4_p
-        lda p4_y
-        cmp p4_tmp
+        sta c128_p
+        lda c128_y
+        cmp c128_tmp
         bcc _cpy_noc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _cpy_noc:
-        lda p4_y
+        lda c128_y
         sec
-        sbc p4_tmp
+        sbc c128_tmp
         beq _cpy_z
         bmi _cpy_n
         rts
 _cpy_z:
-        lda p4_p
+        lda c128_p
         ora #P_Z
-        sta p4_p
+        sta c128_p
         rts
 _cpy_n:
-        lda p4_p
+        lda c128_p
         ora #P_N
-        sta p4_p
+        sta c128_p
         rts
 
 ; ============================================================
@@ -2396,57 +2396,57 @@ op_00:
         sta $D020
 
         ; Dump BRK diagnostic info at $7050
-        lda p4_inst_pc_hi
+        lda c128_inst_pc_hi
         sta $7050               ; PC hi where BRK was
-        lda p4_inst_pc_lo
+        lda c128_inst_pc_lo
         sta $7051               ; PC lo where BRK was
-        lda p4_sp
+        lda c128_sp
         sta $7052
-        lda p4_a
+        lda c128_a
         sta $7053
-        lda p4_x
+        lda c128_x
         sta $7054
-        lda p4_y
+        lda c128_y
         sta $7055
-        lda p4_p
+        lda c128_p
         sta $7056
         lda mmu_cr
         sta $7057
 
         ; Standard BRK sequence
         ; BRK: increment PC past signature byte
-        inw p4_pc_lo
+        inw c128_pc_lo
         ; Push PC high
-        lda p4_pc_hi
-        sta p4_data
+        lda c128_pc_hi
+        sta c128_data
         jsr push_data
         ; Push PC low
-        lda p4_pc_lo
-        sta p4_data
+        lda c128_pc_lo
+        sta c128_data
         jsr push_data
         ; Push P with B=1, U=1
-        lda p4_p
+        lda c128_p
         ora #P_B                ; Set B flag (distinguishes BRK from IRQ)
         ora #P_U
-        sta p4_data
+        sta c128_data
         jsr push_data
         ; Set I flag
-        lda p4_p
+        lda c128_p
         ora #P_I
-        sta p4_p
+        sta c128_p
         ; Load IRQ vector from $FFFE/$FFFF
         lda #$FE
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$FF
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_ReadFast
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda #$FF
-        sta p4_addr_lo
+        sta c128_addr_lo
         jsr C128_ReadFast
-        sta p4_pc_hi
+        sta c128_pc_hi
         lda #0
-        sta p4_code_valid
+        sta c128_code_valid
         lda #7
         jmp finish_cycles
 
@@ -2454,8 +2454,8 @@ op_00:
 op_01:
         jsr addr_indx
         jsr C128_ReadFast
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -2468,8 +2468,8 @@ op_05:
         jsr fetch8
         tax
         jsr lrb_read_x
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #3
@@ -2483,12 +2483,12 @@ op_06:
         ; ASL directly in LOW_RAM_BUFFER
         jsr lrb_asl_x
         ; Update carry flag
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
         bcc _op06_nc
         ora #P_C
 _op06_nc:
-        sta p4_p
+        sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
         #set_zna
@@ -2498,9 +2498,9 @@ _op06_nc:
 
 ; $08 PHP
 op_08:
-        lda p4_p
+        lda c128_p
         ora #(P_B|P_U)
-        sta p4_data
+        sta c128_data
         jsr push_data
         lda #3
         #finish_cycles_inline
@@ -2509,8 +2509,8 @@ op_08:
 ; $09 ORA #imm
 op_09:
         jsr fetch8
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -2518,20 +2518,20 @@ op_09:
 
 ; $0A ASL A
 op_0a:
-        lda p4_a
+        lda c128_a
         asl
-        sta p4_a
+        sta c128_a
         php
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
+        sta c128_p
         plp
         bcc _op0a_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op0a_nc:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         lda #2
@@ -2542,8 +2542,8 @@ _op0a_nc:
 op_0d:
         jsr addr_abs
         jsr C128_ReadFast
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -2556,18 +2556,18 @@ op_0e:
         jsr C128_ReadFast
         asl
         php
-        sta p4_data
+        sta c128_data
         jsr C128_Write
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
+        sta c128_p
         plp
         bcc _op0e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op0e_nc:
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -2577,8 +2577,8 @@ _op0e_nc:
 ; $10 BPL
 op_10:
         jsr fetch_rel
-        bbs 7, p4_p,_op10_nt
-        ;lda p4_p
+        bbs 7, c128_p,_op10_nt
+        ;lda c128_p
         ;and #P_N
         ;bne _op10_nt
         jsr branch_do
@@ -2587,7 +2587,7 @@ op_10:
         rts
 _op10_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -2596,8 +2596,8 @@ _op10_nt:
 op_11:
         jsr addr_indy
         jsr C128_ReadFast
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #5
@@ -2609,11 +2609,11 @@ op_15:
         ; Optimized ORA zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -2625,17 +2625,17 @@ op_16:
         ; Optimized ASL zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         ; ASL directly in LOW_RAM_BUFFER
         jsr lrb_asl_x
         ; Update carry flag
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
         bcc _op16_nc
         ora #P_C
 _op16_nc:
-        sta p4_p
+        sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
         #set_zna
@@ -2645,9 +2645,9 @@ _op16_nc:
 
 ; $18 CLC
 op_18:
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -2656,8 +2656,8 @@ op_18:
 op_19:
         jsr addr_absy
         jsr C128_ReadFast
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -2668,8 +2668,8 @@ op_19:
 op_1d:
         jsr addr_absx
         jsr C128_ReadFast
-        ora p4_a
-        sta p4_a
+        ora c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -2682,18 +2682,18 @@ op_1e:
         jsr C128_ReadFast
         asl
         php
-        sta p4_data
+        sta c128_data
         jsr C128_Write
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
+        sta c128_p
         plp
         bcc _op1e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op1e_nc:
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #7
@@ -2703,25 +2703,25 @@ _op1e_nc:
 ; $20 JSR
 op_20:
         jsr fetch16_to_addr
-        lda p4_addr_lo
-        sta p4_vec_lo
-        lda p4_addr_hi
-        sta p4_vec_hi
-        lda p4_pc_lo
+        lda c128_addr_lo
+        sta c128_vec_lo
+        lda c128_addr_hi
+        sta c128_vec_hi
+        lda c128_pc_lo
         sec
         sbc #1
-        sta p4_tmp
-        lda p4_pc_hi
+        sta c128_tmp
+        lda c128_pc_hi
         sbc #0
-        sta p4_data
+        sta c128_data
         jsr push_data
-        lda p4_tmp
-        sta p4_data
+        lda c128_tmp
+        sta c128_data
         jsr push_data
-        lda p4_vec_lo
-        sta p4_pc_lo
-        lda p4_vec_hi
-        sta p4_pc_hi
+        lda c128_vec_lo
+        sta c128_pc_lo
+        lda c128_vec_hi
+        sta c128_pc_hi
         lda #6
         #finish_cycles_inline
         rts
@@ -2730,8 +2730,8 @@ op_20:
 op_21:
         jsr addr_indx
         jsr C128_ReadFast
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -2744,24 +2744,24 @@ op_24:
         jsr fetch8
         tax
         jsr lrb_read_x
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #(~(P_N|P_V|P_Z)) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #P_N
-        ora p4_p
-        sta p4_p
-        lda p4_tmp
+        ora c128_p
+        sta c128_p
+        lda c128_tmp
         and #P_V
-        ora p4_p
-        sta p4_p
-        lda p4_tmp
-        and p4_a
+        ora c128_p
+        sta c128_p
+        lda c128_tmp
+        and c128_a
         bne _op24_nz
-        lda p4_p
+        lda c128_p
         ora #P_Z
-        sta p4_p
+        sta c128_p
 _op24_nz:
         lda #3
         #finish_cycles_inline
@@ -2773,8 +2773,8 @@ op_25:
         jsr fetch8
         tax
         jsr lrb_read_x
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #3
@@ -2786,25 +2786,25 @@ op_26:
         jsr fetch8
         tax
         ; Get old carry into bit 0 position
-        lda p4_p
+        lda c128_p
         and #P_C
-        sta p4_tmp2
+        sta c128_tmp2
         ; Get memory, save bit 7 for new carry
         jsr lrb_read_x
-        sta p4_tmp
+        sta c128_tmp
         ; Shift left and OR in old carry
         asl
-        ora p4_tmp2
+        ora c128_tmp2
         jsr lrb_write_x
         ; Update carry from old bit 7
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         bpl _op26_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op26_nc:
         ; Set N/Z from result
         jsr lrb_read_x
@@ -2818,7 +2818,7 @@ op_28:
         jsr pull_to_a
         and #(~P_B) & $ff
         ora #P_U
-        sta p4_p
+        sta c128_p
         lda #4
         #finish_cycles_inline
         rts
@@ -2826,8 +2826,8 @@ op_28:
 ; $29 AND #imm
 op_29:
         jsr fetch8
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -2835,25 +2835,25 @@ op_29:
 
 ; $2A ROL A
 op_2a:
-        lda p4_p
+        lda c128_p
         and #P_C
-        sta p4_tmp2
-        lda p4_a
-        sta p4_tmp
+        sta c128_tmp2
+        lda c128_a
+        sta c128_tmp
         asl
-        ora p4_tmp2
-        sta p4_a
-        lda p4_p
+        ora c128_tmp2
+        sta c128_a
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$80
         beq _op2a_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op2a_nc:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         lda #2
@@ -2864,24 +2864,24 @@ _op2a_nc:
 op_2c:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #(~(P_N|P_V|P_Z)) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #P_N
-        ora p4_p
-        sta p4_p
-        lda p4_tmp
+        ora c128_p
+        sta c128_p
+        lda c128_tmp
         and #P_V
-        ora p4_p
-        sta p4_p
-        lda p4_tmp
-        and p4_a
+        ora c128_p
+        sta c128_p
+        lda c128_tmp
+        and c128_a
         bne _op2c_nz
-        lda p4_p
+        lda c128_p
         ora #P_Z
-        sta p4_p
+        sta c128_p
 _op2c_nz:
         lda #4
         #finish_cycles_inline
@@ -2891,8 +2891,8 @@ _op2c_nz:
 op_2d:
         jsr addr_abs
         jsr C128_ReadFast
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -2903,26 +2903,26 @@ op_2d:
 op_2e:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #P_C
-        sta p4_tmp2
-        lda p4_tmp
+        sta c128_tmp2
+        lda c128_tmp
         asl
-        ora p4_tmp2
-        sta p4_data
-        lda p4_p
+        ora c128_tmp2
+        sta c128_data
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$80
         beq _op2e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op2e_nc:
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -2932,8 +2932,8 @@ _op2e_nc:
 ; $30 BMI
 op_30:
         jsr fetch_rel
-        bbr 7, p4_p, _op30_nt
-        ;lda p4_p
+        bbr 7, c128_p, _op30_nt
+        ;lda c128_p
         ;and #P_N
         ;beq _op30_nt
         jsr branch_do
@@ -2942,7 +2942,7 @@ op_30:
         rts
 _op30_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -2951,8 +2951,8 @@ _op30_nt:
 op_31:
         jsr addr_indy
         jsr C128_ReadFast
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #5
@@ -2964,11 +2964,11 @@ op_35:
         ; Optimized AND zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -2980,28 +2980,28 @@ op_36:
         ; Optimized ROL zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         ; Get old carry into bit 0 position
-        lda p4_p
+        lda c128_p
         and #P_C
-        sta p4_tmp2
+        sta c128_tmp2
         ; Get memory, save bit 7 for new carry
         jsr lrb_read_x
-        sta p4_tmp
+        sta c128_tmp
         ; Shift left and OR in old carry
         asl
-        ora p4_tmp2
+        ora c128_tmp2
         jsr lrb_write_x
         ; Update carry from old bit 7
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         bpl _op36_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op36_nc:
         ; Set N/Z from result
         jsr lrb_read_x
@@ -3012,9 +3012,9 @@ _op36_nc:
 
 ; $38 SEC
 op_38:
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -3023,8 +3023,8 @@ op_38:
 op_39:
         jsr addr_absy
         jsr C128_ReadFast
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3035,8 +3035,8 @@ op_39:
 op_3d:
         jsr addr_absx
         jsr C128_ReadFast
-        and p4_a
-        sta p4_a
+        and c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3047,26 +3047,26 @@ op_3d:
 op_3e:
         jsr addr_absx
         jsr C128_ReadFast
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #P_C
-        sta p4_tmp2
-        lda p4_tmp
+        sta c128_tmp2
+        lda c128_tmp
         asl
-        ora p4_tmp2
-        sta p4_data
-        lda p4_p
+        ora c128_tmp2
+        sta c128_data
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$80
         beq _op3e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op3e_nc:
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #7
@@ -3078,11 +3078,11 @@ op_40:
         jsr pull_to_a
         and #(~P_B) & $ff
         ora #P_U
-        sta p4_p
+        sta c128_p
         jsr pull_to_a
-        sta p4_pc_lo
+        sta c128_pc_lo
         jsr pull_to_a
-        sta p4_pc_hi
+        sta c128_pc_hi
         lda #6
         #finish_cycles_inline
         rts
@@ -3091,8 +3091,8 @@ op_40:
 op_41:
         jsr addr_indx
         jsr C128_ReadFast
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -3105,8 +3105,8 @@ op_45:
         jsr fetch8
         tax
         jsr lrb_read_x
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #3
@@ -3122,12 +3122,12 @@ op_46:
         lsr
         jsr lrb_write_x
         ; Update carry - carry flag is already set correctly by LSR
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
         bcc _op46_nc
         ora #P_C
 _op46_nc:
-        sta p4_p
+        sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
         #set_zna
@@ -3137,8 +3137,8 @@ _op46_nc:
 
 ; $48 PHA
 op_48:
-        lda p4_a
-        sta p4_data
+        lda c128_a
+        sta c128_data
         jsr push_data
         lda #3
         #finish_cycles_inline
@@ -3147,8 +3147,8 @@ op_48:
 ; $49 EOR #imm
 op_49:
         jsr fetch8
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3156,21 +3156,21 @@ op_49:
 
 ; $4A LSR A
 op_4a:
-        lda p4_a
-        sta p4_tmp
+        lda c128_a
+        sta c128_tmp
         lsr
-        sta p4_a
-        lda p4_p
+        sta c128_a
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op4a_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op4a_nc:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         lda #2
@@ -3180,10 +3180,10 @@ _op4a_nc:
 ; $4C JMP abs
 op_4c:
         jsr fetch16_to_addr
-        lda p4_addr_lo
-        sta p4_pc_lo
-        lda p4_addr_hi
-        sta p4_pc_hi
+        lda c128_addr_lo
+        sta c128_pc_lo
+        lda c128_addr_hi
+        sta c128_pc_hi
         lda #3
         #finish_cycles_inline
         rts
@@ -3192,8 +3192,8 @@ op_4c:
 op_4d:
         jsr addr_abs
         jsr C128_ReadFast
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3204,21 +3204,21 @@ op_4d:
 op_4e:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_tmp
+        sta c128_tmp
         lsr
-        sta p4_data
-        lda p4_p
+        sta c128_data
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op4e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op4e_nc:
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -3228,8 +3228,8 @@ _op4e_nc:
 ; $50 BVC
 op_50:
         jsr fetch_rel
-        bbs 6, p4_p, _op50_nt
-        ;lda p4_p
+        bbs 6, c128_p, _op50_nt
+        ;lda c128_p
         ;and #P_V
         ;bne _op50_nt
         jsr branch_do
@@ -3238,7 +3238,7 @@ op_50:
         rts
 _op50_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -3247,8 +3247,8 @@ _op50_nt:
 op_51:
         jsr addr_indy
         jsr C128_ReadFast
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #5
@@ -3260,11 +3260,11 @@ op_55:
         ; Optimized EOR zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3276,19 +3276,19 @@ op_56:
         ; Optimized LSR zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         ; Shift right directly
         jsr lrb_read_x
         lsr
         jsr lrb_write_x
         ; Update carry - carry flag already set by LSR
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
         bcc _op56_nc
         ora #P_C
 _op56_nc:
-        sta p4_p
+        sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
         #set_zna
@@ -3298,9 +3298,9 @@ _op56_nc:
 
 ; $58 CLI
 op_58:
-        lda p4_p
+        lda c128_p
         and #(~P_I) & $ff
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -3309,8 +3309,8 @@ op_58:
 op_59:
         jsr addr_absy
         jsr C128_ReadFast
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3321,8 +3321,8 @@ op_59:
 op_5d:
         jsr addr_absx
         jsr C128_ReadFast
-        eor p4_a
-        sta p4_a
+        eor c128_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3333,21 +3333,21 @@ op_5d:
 op_5e:
         jsr addr_absx
         jsr C128_ReadFast
-        sta p4_tmp
+        sta c128_tmp
         lsr
-        sta p4_data
-        lda p4_p
+        sta c128_data
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op5e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op5e_nc:
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #7
@@ -3357,10 +3357,10 @@ _op5e_nc:
 ; $60 RTS
 op_60:
         jsr pull_to_a
-        sta p4_pc_lo
+        sta c128_pc_lo
         jsr pull_to_a
-        sta p4_pc_hi
-        inw p4_pc_lo            ; 16-bit increment
+        sta c128_pc_hi
+        inw c128_pc_lo            ; 16-bit increment
         lda #6
         #finish_cycles_inline
         rts
@@ -3390,33 +3390,33 @@ op_66:
         jsr fetch8
         tax
         ; Get old carry into bit 7 position
-        lda p4_p
+        lda c128_p
         and #P_C
         beq _op66_nci
         lda #$80
-        sta p4_tmp2
+        sta c128_tmp2
         bra _op66_do
 _op66_nci:
         lda #$00
-        sta p4_tmp2
+        sta c128_tmp2
 _op66_do:
         ; Get memory, save bit 0 for new carry
         jsr lrb_read_x
-        sta p4_tmp
+        sta c128_tmp
         ; Shift right and OR in old carry
         lsr
-        ora p4_tmp2
+        ora c128_tmp2
         jsr lrb_write_x
         ; Update carry from old bit 0
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op66_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op66_nc:
         ; Set N/Z from result
         jsr lrb_read_x
@@ -3428,7 +3428,7 @@ _op66_nc:
 ; $68 PLA
 op_68:
         jsr pull_to_a
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3445,32 +3445,32 @@ op_69:
 
 ; $6A ROR A
 op_6a:
-        lda p4_p
+        lda c128_p
         and #P_C
         beq _op6a_nci
         lda #$80
-        sta p4_tmp2
+        sta c128_tmp2
         jmp _op6a_do
 _op6a_nci:
         lda #$00
-        sta p4_tmp2
+        sta c128_tmp2
 _op6a_do:
-        lda p4_a
-        sta p4_tmp
+        lda c128_a
+        sta c128_tmp
         lsr
-        ora p4_tmp2
-        sta p4_a
-        lda p4_p
+        ora c128_tmp2
+        sta c128_a
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op6a_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op6a_nc:
-        lda p4_a
+        lda c128_a
         ;jsr set_zn_a
         #set_zna
         lda #2
@@ -3481,10 +3481,10 @@ _op6a_nc:
 op_6c:
         jsr addr_ind_jmp
 
-        lda p4_addr_lo
-        sta p4_pc_lo
-        lda p4_addr_hi
-        sta p4_pc_hi
+        lda c128_addr_lo
+        sta c128_pc_lo
+        lda c128_addr_hi
+        sta c128_pc_hi
         lda #5
         #finish_cycles_inline
         rts
@@ -3502,33 +3502,33 @@ op_6d:
 op_6e:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #P_C
         beq _op6e_nci
         lda #$80
-        sta p4_tmp2
+        sta c128_tmp2
         jmp _op6e_do
 _op6e_nci:
         lda #$00
-        sta p4_tmp2
+        sta c128_tmp2
 _op6e_do:
-        lda p4_tmp
+        lda c128_tmp
         lsr
-        ora p4_tmp2
-        sta p4_data
-        lda p4_p
+        ora c128_tmp2
+        sta c128_data
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op6e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op6e_nc:
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -3538,8 +3538,8 @@ _op6e_nc:
 ; $70 BVS
 op_70:
         jsr fetch_rel
-        bbr 6, p4_p, _op70_nt
-        ;lda p4_p
+        bbr 6, c128_p, _op70_nt
+        ;lda c128_p
         ;and #P_V
         ;beq _op70_nt
         jsr branch_do
@@ -3548,7 +3548,7 @@ op_70:
         rts
 _op70_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -3567,7 +3567,7 @@ op_75:
         ; Optimized ADC zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
         jsr do_adc
@@ -3580,36 +3580,36 @@ op_76:
         ; Optimized ROR zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         ; Get old carry into bit 7 position
-        lda p4_p
+        lda c128_p
         and #P_C
         beq _op76_nci
         lda #$80
-        sta p4_tmp2
+        sta c128_tmp2
         bra _op76_do
 _op76_nci:
         lda #$00
-        sta p4_tmp2
+        sta c128_tmp2
 _op76_do:
         ; Get memory, save bit 0 for new carry
         jsr lrb_read_x
-        sta p4_tmp
+        sta c128_tmp
         ; Shift right and OR in old carry
         lsr
-        ora p4_tmp2
+        ora c128_tmp2
         jsr lrb_write_x
         ; Update carry from old bit 0
-        lda p4_p
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op76_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op76_nc:
         ; Set N/Z from result
         jsr lrb_read_x
@@ -3620,9 +3620,9 @@ _op76_nc:
 
 ; $78 SEI
 op_78:
-        lda p4_p
+        lda c128_p
         ora #P_I
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -3649,33 +3649,33 @@ op_7d:
 op_7e:
         jsr addr_absx
         jsr C128_ReadFast
-        sta p4_tmp
-        lda p4_p
+        sta c128_tmp
+        lda c128_p
         and #P_C
         beq _op7e_nci
         lda #$80
-        sta p4_tmp2
+        sta c128_tmp2
         jmp _op7e_do
 _op7e_nci:
         lda #$00
-        sta p4_tmp2
+        sta c128_tmp2
 _op7e_do:
-        lda p4_tmp
+        lda c128_tmp
         lsr
-        ora p4_tmp2
-        sta p4_data
-        lda p4_p
+        ora c128_tmp2
+        sta c128_data
+        lda c128_p
         and #(~P_C) & $ff
-        sta p4_p
-        lda p4_tmp
+        sta c128_p
+        lda c128_tmp
         and #$01
         beq _op7e_nc
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
 _op7e_nc:
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #7
@@ -3685,8 +3685,8 @@ _op7e_nc:
 ; $81 STA (zp,X)
 op_81:
         jsr addr_indx
-        lda p4_a
-        sta p4_data
+        lda c128_a
+        sta c128_data
         jsr C128_Write
         lda #6
         #finish_cycles_inline
@@ -3697,7 +3697,7 @@ op_84:
         ; Optimized STY zp
         jsr fetch8
         tax
-        lda p4_y
+        lda c128_y
         jsr lrb_write_x
         lda #3
         #finish_cycles_inline
@@ -3708,7 +3708,7 @@ op_84:
 op_85:
         jsr fetch8
         tax
-        lda p4_a
+        lda c128_a
         jsr lrb_write_x
         lda #3
         #finish_cycles_inline
@@ -3718,7 +3718,7 @@ op_85:
 op_86:
         jsr fetch8
         tax
-        lda p4_x
+        lda c128_x
         jsr lrb_write_x
         lda #3
         #finish_cycles_inline
@@ -3726,8 +3726,8 @@ op_86:
 
 ; $88 DEY
 op_88:
-        dec p4_y
-        lda p4_y
+        dec c128_y
+        lda c128_y
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3735,8 +3735,8 @@ op_88:
 
 ; $8A TXA
 op_8a:
-        lda p4_x
-        sta p4_a
+        lda c128_x
+        sta c128_a
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3745,8 +3745,8 @@ op_8a:
 ; $8C STY abs
 op_8c:
         jsr addr_abs
-        lda p4_y
-        sta p4_data
+        lda c128_y
+        sta c128_data
         jsr C128_Write
         lda #4
         #finish_cycles_inline
@@ -3756,8 +3756,8 @@ op_8c:
 op_8d:
         jsr addr_abs
         sei
-        lda p4_a
-        sta p4_data
+        lda c128_a
+        sta c128_data
         cli
         jsr C128_Write
         lda #4
@@ -3767,8 +3767,8 @@ op_8d:
 ; $8E STX abs
 op_8e:
         jsr addr_abs
-        lda p4_x
-        sta p4_data
+        lda c128_x
+        sta c128_data
         jsr C128_Write
         lda #4
         #finish_cycles_inline
@@ -3779,9 +3779,9 @@ op_90:
         jsr fetch_rel
 
         ; P_C is Bit 0. If Bit 0 is Set, we do NOT take the branch (BCC).
-        bbs 0, p4_p, _op90_nt 
+        bbs 0, c128_p, _op90_nt 
 
-        ;lda p4_p
+        ;lda c128_p
         ;and #P_C
         ;bne _op90_nt
         jsr branch_do
@@ -3790,7 +3790,7 @@ op_90:
         rts
 _op90_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -3798,8 +3798,8 @@ _op90_nt:
 ; $91 STA (zp),Y
 op_91:
         jsr addr_indy
-        lda p4_a
-        sta p4_data
+        lda c128_a
+        sta c128_data
         jsr C128_Write
         lda #6
         #finish_cycles_inline
@@ -3810,9 +3810,9 @@ op_94:
         ; Optimized STY zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
-        lda p4_y
+        lda c128_y
         jsr lrb_write_x
         lda #4
         #finish_cycles_inline
@@ -3823,9 +3823,9 @@ op_95:
         ; Optimized STA zp,X - direct access to LOW_RAM_BUFFER
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
-        lda p4_a
+        lda c128_a
         jsr lrb_write_x
         lda #4
         #finish_cycles_inline
@@ -3836,9 +3836,9 @@ op_96:
         ; Optimized STX zp,Y - direct access to LOW_RAM_BUFFER
         jsr fetch8
         clc
-        adc p4_y
+        adc c128_y
         tax
-        lda p4_x
+        lda c128_x
         jsr lrb_write_x
         lda #4
         #finish_cycles_inline
@@ -3846,8 +3846,8 @@ op_96:
 
 ; $98 TYA
 op_98:
-        lda p4_y
-        sta p4_a
+        lda c128_y
+        sta c128_a
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3856,8 +3856,8 @@ op_98:
 ; $99 STA abs,Y
 op_99:
         jsr addr_absy
-        lda p4_a
-        sta p4_data
+        lda c128_a
+        sta c128_data
         jsr C128_Write
         lda #5
         #finish_cycles_inline
@@ -3865,8 +3865,8 @@ op_99:
 
 ; $9A TXS
 op_9a:
-        lda p4_x
-        sta p4_sp
+        lda c128_x
+        sta c128_sp
         lda #2
         #finish_cycles_inline
         rts
@@ -3874,8 +3874,8 @@ op_9a:
 ; $9D STA abs,X
 op_9d:
         jsr addr_absx
-        lda p4_a
-        sta p4_data
+        lda c128_a
+        sta c128_data
         jsr C128_Write
         lda #5
         #finish_cycles_inline
@@ -3884,7 +3884,7 @@ op_9d:
 ; $A0 LDY #imm
 op_a0:
         jsr fetch8
-        sta p4_y
+        sta c128_y
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3894,7 +3894,7 @@ op_a0:
 op_a1:
         jsr addr_indx
         jsr C128_ReadFast
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -3904,7 +3904,7 @@ op_a1:
 ; $A2 LDX #imm
 op_a2:
         jsr fetch8
-        sta p4_x
+        sta c128_x
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3916,7 +3916,7 @@ op_a4:
         jsr fetch8
         tax
         jsr lrb_read_x
-        sta p4_y
+        sta c128_y
         #set_zna
         lda #3
         #finish_cycles_inline
@@ -3928,7 +3928,7 @@ op_a5:
         jsr fetch8              ; Get zero page address in A
         tax
         jsr lrb_read_x
-        sta p4_a
+        sta c128_a
         #set_zna
         lda #3
         #finish_cycles_inline
@@ -3940,7 +3940,7 @@ op_a6:
         jsr fetch8
         tax
         jsr lrb_read_x
-        sta p4_x
+        sta c128_x
         #set_zna
         lda #3
         #finish_cycles_inline
@@ -3948,8 +3948,8 @@ op_a6:
 
 ; $A8 TAY
 op_a8:
-        lda p4_a
-        sta p4_y
+        lda c128_a
+        sta c128_y
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3958,7 +3958,7 @@ op_a8:
 ; $A9 LDA #imm
 op_a9:
         jsr fetch8
-        sta p4_a
+        sta c128_a
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3966,8 +3966,8 @@ op_a9:
 
 ; $AA TAX
 op_aa:
-        lda p4_a
-        sta p4_x
+        lda c128_a
+        sta c128_x
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -3977,7 +3977,7 @@ op_aa:
 op_ac:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_y
+        sta c128_y
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3988,7 +3988,7 @@ op_ac:
 op_ad:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -3999,7 +3999,7 @@ op_ad:
 op_ae:
         jsr addr_abs
         jsr C128_ReadFast
-        sta p4_x
+        sta c128_x
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4009,8 +4009,8 @@ op_ae:
 ; $B0 BCS
 op_b0:
         jsr fetch_rel
-        bbr 0, p4_p, _opb0_nt
-        ;lda p4_p
+        bbr 0, c128_p, _opb0_nt
+        ;lda c128_p
         ;and #P_C
         ;beq _opb0_nt
         jsr branch_do
@@ -4019,7 +4019,7 @@ op_b0:
         rts
 _opb0_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -4028,7 +4028,7 @@ _opb0_nt:
 op_b1:
         jsr addr_indy
         jsr C128_ReadFast
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #5
@@ -4040,10 +4040,10 @@ op_b4:
         ; Optimized LDY zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
-        sta p4_y
+        sta c128_y
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4055,10 +4055,10 @@ op_b5:
         ; Optimized LDA zp,X - direct access to LOW_RAM_BUFFER
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4070,10 +4070,10 @@ op_b6:
         ; Optimized LDX zp,Y - direct access to LOW_RAM_BUFFER
         jsr fetch8
         clc
-        adc p4_y
+        adc c128_y
         tax
         jsr lrb_read_x
-        sta p4_x
+        sta c128_x
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4082,9 +4082,9 @@ op_b6:
 
 ; $B8 CLV
 op_b8:
-        lda p4_p
+        lda c128_p
         and #(~P_V) & $ff
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -4093,7 +4093,7 @@ op_b8:
 op_b9:
         jsr addr_absy
         jsr C128_ReadFast
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4102,8 +4102,8 @@ op_b9:
 
 ; $BA TSX
 op_ba:
-        lda p4_sp
-        sta p4_x
+        lda c128_sp
+        sta c128_x
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -4113,7 +4113,7 @@ op_ba:
 op_bc:
         jsr addr_absx
         jsr C128_ReadFast
-        sta p4_y
+        sta c128_y
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4124,7 +4124,7 @@ op_bc:
 op_bd:
         jsr addr_absx
         jsr C128_ReadFast
-        sta p4_a
+        sta c128_a
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4135,7 +4135,7 @@ op_bd:
 op_be:
         jsr addr_absy
         jsr C128_ReadFast
-        sta p4_x
+        sta c128_x
         ;jsr set_zn_a
         #set_zna
         lda #4
@@ -4196,8 +4196,8 @@ op_c6:
 
 ; $C8 INY
 op_c8:
-        inc p4_y
-        lda p4_y
+        inc c128_y
+        lda c128_y
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -4213,8 +4213,8 @@ op_c9:
 
 ; $CA DEX
 op_ca:
-        dec p4_x
-        lda p4_x
+        dec c128_x
+        lda c128_x
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -4244,9 +4244,9 @@ op_ce:
         jsr C128_ReadFast
         sec
         sbc #1
-        sta p4_data
+        sta c128_data
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -4256,8 +4256,8 @@ op_ce:
 ; $D0 BNE
 op_d0:
         jsr fetch_rel
-        bbs 1, p4_p, _opd0_nt
-        ;lda p4_p
+        bbs 1, c128_p, _opd0_nt
+        ;lda c128_p
         ;and #P_Z
         ;bne _opd0_nt
         jsr branch_do
@@ -4266,7 +4266,7 @@ op_d0:
         rts
 _opd0_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -4285,7 +4285,7 @@ op_d5:
         ; Optimized CMP zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
         jsr do_cmp
@@ -4298,7 +4298,7 @@ op_d6:
         ; Optimized DEC zp,X - direct access to LOW_RAM_BUFFER
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_dec_x
         jsr lrb_read_x
@@ -4310,9 +4310,9 @@ op_d6:
 
 ; $D8 CLD
 op_d8:
-        lda p4_p
+        lda c128_p
         and #(~P_D) & $ff
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -4341,9 +4341,9 @@ op_de:
         jsr C128_ReadFast
         sec
         sbc #1
-        sta p4_data
+        sta c128_data
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #7
@@ -4404,8 +4404,8 @@ op_e6:
 
 ; $E8 INX
 op_e8:
-        inc p4_x
-        lda p4_x
+        inc c128_x
+        lda c128_x
         #set_zna
         lda #2
         #finish_cycles_inline
@@ -4449,9 +4449,9 @@ op_ee:
         jsr C128_ReadFast
         clc
         adc #1
-        sta p4_data
+        sta c128_data
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #6
@@ -4461,8 +4461,8 @@ op_ee:
 ; $F0 BEQ
 op_f0:
         jsr fetch_rel
-        bbr 1, p4_p, _opf0_nt
-        ;lda p4_p
+        bbr 1, c128_p, _opf0_nt
+        ;lda c128_p
         ;and #P_Z
         ;beq _opf0_nt
         jsr branch_do
@@ -4471,7 +4471,7 @@ op_f0:
         rts
 _opf0_nt:
         lda #0
-        sta p4_xtra
+        sta c128_xtra
         lda #2
         #finish_cycles_inline
         rts
@@ -4490,7 +4490,7 @@ op_f5:
         ; Optimized SBC zp,X
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_read_x
         jsr do_sbc
@@ -4503,7 +4503,7 @@ op_f6:
         ; Optimized INC zp,X - direct access to LOW_RAM_BUFFER
         jsr fetch8
         clc
-        adc p4_x
+        adc c128_x
         tax
         jsr lrb_inc_x
         jsr lrb_read_x
@@ -4515,9 +4515,9 @@ op_f6:
 
 ; $F8 SED
 op_f8:
-        lda p4_p
+        lda c128_p
         ora #P_D
-        sta p4_p
+        sta c128_p
         lda #2
         #finish_cycles_inline
         rts
@@ -4546,9 +4546,9 @@ op_fe:
         jsr C128_ReadFast
         clc
         adc #1
-        sta p4_data
+        sta c128_data
         jsr C128_Write
-        lda p4_data
+        lda c128_data
         ;jsr set_zn_a
         #set_zna
         lda #7
@@ -4678,8 +4678,8 @@ op_83: jmp op_illegal
 op_87:
         jsr fetch8
         tax
-        lda p4_a
-        and p4_x
+        lda c128_a
+        and c128_x
         jsr lrb_write_x
         lda #3
         #finish_cycles_inline

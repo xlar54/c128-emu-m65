@@ -1,5 +1,5 @@
 ; ============================================================
-; p4hooks.asm - BASIC/KERNAL hook points for Plus/4 emulator
+; c128_hooks.asm - BASIC/KERNAL hook points for C128 emulator
 ; Host: MEGA65
 ; Assembler: 64tass (45GS02)
 ;
@@ -11,59 +11,59 @@
 
         .cpu "45gs02"
 
-; p4_hook_pc_changed is defined in plus4_cpu_m65.asm at ZP $E7
+; c128_hook_pc_changed is defined in c128_cpu_8502.asm at ZP $E7
 ; Hooks set this flag when they modify PC, so the threaded
 ; interpreter knows to invalidate the code cache.
 
 ; ------------------------------------------------------------
 ; Hooked guest PC locations
 ; ------------------------------------------------------------
-; Plus/4 KERNAL jump table entries
-P4_SETNAM               = $FFBD         ; SETNAM entry point
-P4_SETLFS               = $FFBA         ; SETLFS entry point  
-P4_LOAD                 = $FFD5         ; LOAD entry point
-P4_SAVE                 = $FFD8         ; SAVE entry point
+; C128 KERNAL jump table entries
+C128_SETNAM               = $FFBD         ; SETNAM entry point
+C128_SETLFS               = $FFBA         ; SETLFS entry point  
+C128_LOAD                 = $FFD5         ; LOAD entry point
+C128_SAVE                 = $FFD8         ; SAVE entry point
 ; Additional KERNAL entries used for DIRECTORY (host-side)
-P4_OPEN                 = $FFC0         ; OPEN
-P4_CLOSE                = $FFC3         ; CLOSE
-P4_CHKIN                = $FFC6         ; CHKIN
-P4_CHKOUT               = $FFC9         ; CHKOUT  
-P4_CLRCHN               = $FFCC         ; CLRCHN
-P4_CHRIN                = $FFCF         ; CHRIN
-; P4_CHROUT defined in p4host.asm
-P4_READST               = $FFB7         ; READST
+C128_OPEN                 = $FFC0         ; OPEN
+C128_CLOSE                = $FFC3         ; CLOSE
+C128_CHKIN                = $FFC6         ; CHKIN
+C128_CHKOUT               = $FFC9         ; CHKOUT  
+C128_CLRCHN               = $FFCC         ; CLRCHN
+C128_CHRIN                = $FFCF         ; CHRIN
+; C128_CHROUT defined in c128_host.asm
+C128_READST               = $FFB7         ; READST
 
 
 ; MEGA65 KERNAL routines are defined in main.asm:
 ; OPEN, CLOSE, CHKIN, CHKOUT, CLRCHN, CHRIN, CHROUT, READST
 
 ; Sequential file I/O constants
-MAX_SEQ_FILES           = 10            ; Maximum simultaneous open files (matches Plus/4 KERNAL)
+MAX_SEQ_FILES           = 10            ; Maximum simultaneous open files (matches C128 KERNAL)
 SEQ_LFN_BASE            = 10            ; Host logical file numbers start here
 
 ; Inside BASIC LOAD handler: the JSR $FFD5 instruction
-P4HOOK_ROM_LOAD_KERNAL_CALL      = $A800
-P4HOOK_ROM_AFTER_KERNAL_CALL     = $A803
+C128Hook_ROM_LOAD_KERNAL_CALL      = $A800
+C128Hook_ROM_AFTER_KERNAL_CALL     = $A803
 
 ; Inside BASIC SAVE handler: the JSR $FFD8 instruction
 ; We'll find this by hooking KERNAL SAVE directly
-P4HOOK_ROM_SAVE_KERNAL_CALL      = $A851  ; Approximate - we hook $FFD8 instead
-P4HOOK_ROM_AFTER_SAVE_CALL       = $A854  ; Return address after SAVE
+C128Hook_ROM_SAVE_KERNAL_CALL      = $A851  ; Approximate - we hook $FFD8 instead
+C128Hook_ROM_AFTER_SAVE_CALL       = $A854  ; Return address after SAVE
 
 ; DIRECTORY keyword handler - actual entry point in BASIC ROM
-P4HOOK_ROM_DIRECTORY             = $C8BC
+C128Hook_ROM_DIRECTORY             = $C8BC
 
 ; DIRECTORY keyword handler entry (from BASIC keyword vector table) - old
-P4HOOK_ROM_PERFORM_DIRECTORY     = $ED7F
+C128Hook_ROM_PERFORM_DIRECTORY     = $ED7F
 
 ; LIST keyword handler entry (from BASIC keyword vector table)
-P4HOOK_ROM_PERFORM_LIST          = $8AFE
+C128Hook_ROM_PERFORM_LIST          = $8AFE
 
 ; A "fake" return address used to regain control after LIST prints.
-P4HOOK_DIR_RESTORE_TRAP          = $02F6
+C128Hook_DIR_RESTORE_TRAP          = $02F6
 
 ; ------------------------------------------------------------
-; Plus/4 BASIC low-RAM pointers we need
+; C128 BASIC low-RAM pointers we need
 ; ------------------------------------------------------------
 ZP_TXTTAB_LO = $2B
 ZP_TXTTAB_HI = $2C
@@ -78,59 +78,59 @@ ZP_PTRS_COUNT = 10
 ; ------------------------------------------------------------
 ; Directory load configuration
 ; ------------------------------------------------------------
-P4_BANK_RAM     = $05           ; emulated Plus/4 RAM lives in MEGA65 bank 5
+C128_BANK_RAM     = $05           ; emulated C128 RAM lives in MEGA65 bank 5
 
 ; Host-side staging buffer (bank 0 address)
-P4_DIR_BUF      = $6000         ; 4KB staging buffer in bank 0
+C128_DIR_BUF      = $6000         ; 4KB staging buffer in bank 0
 
 ; MEGA65 KERNAL SAVE (may not be in main.asm)
 SAVE            = $FFD8
 
-p4_dir_len_lo:  .byte 0
-p4_dir_len_hi:  .byte 0
+c128_dir_len_lo:  .byte 0
+c128_dir_len_hi:  .byte 0
 
-p4_dir_dest_lo: .byte 0
-p4_dir_dest_hi: .byte 0
+c128_dir_dest_lo: .byte 0
+c128_dir_dest_hi: .byte 0
 
-p4_saved_basic_ptrs:
+c128_saved_basic_ptrs:
         .fill ZP_PTRS_COUNT, 0
 
-p4_dir_temp_lo: .byte 0
-p4_dir_temp_hi: .byte 0
+c128_dir_temp_lo: .byte 0
+c128_dir_temp_hi: .byte 0
 
 tmp_lo: .byte 0
 tmp_hi: .byte 0
 
 ; Filename "$" for CBM directory listing
-p4_dir_name:
+c128_dir_name:
         .byte '$'
 
 ; ------------------------------------------------------------
 ; SETNAM capture variables - this is the key new addition!
 ; ------------------------------------------------------------
-p4_setnam_len:    .byte 0       ; Captured filename length
-p4_setnam_ptr_lo: .byte 0       ; Captured filename pointer lo
-p4_setnam_ptr_hi: .byte 0       ; Captured filename pointer hi
-p4_setnam_valid:  .byte 0       ; Flag: 1 = we have valid SETNAM data
+c128_setnam_len:    .byte 0       ; Captured filename length
+c128_setnam_ptr_lo: .byte 0       ; Captured filename pointer lo
+c128_setnam_ptr_hi: .byte 0       ; Captured filename pointer hi
+c128_setnam_valid:  .byte 0       ; Flag: 1 = we have valid SETNAM data
 
 ; SETLFS capture variables
-p4_setlfs_dev:    .byte 8       ; Device number (default 8)
-p4_setlfs_sa:     .byte 0       ; Secondary address
+c128_setlfs_dev:    .byte 8       ; Device number (default 8)
+c128_setlfs_sa:     .byte 0       ; Secondary address
 
 ; File load buffer
-p4_fl_buf:      .fill 17, 0     ; Filename buffer (16 chars + null)
-p4_fl_len:      .byte 0
-p4_fl_end_lo:   .byte 0
-p4_fl_end_hi:   .byte 0
+c128_fl_buf:      .fill 17, 0     ; Filename buffer (16 chars + null)
+c128_fl_len:      .byte 0
+c128_fl_end_lo:   .byte 0
+c128_fl_end_hi:   .byte 0
 
 ; SAVE variables
-p4_save_start_lo: .byte 0       ; Start address of data to save
-p4_save_start_hi: .byte 0
-p4_save_end_lo:   .byte 0       ; End address + 1
-p4_save_end_hi:   .byte 0
+c128_save_start_lo: .byte 0       ; Start address of data to save
+c128_save_start_hi: .byte 0
+c128_save_end_lo:   .byte 0       ; End address + 1
+c128_save_end_hi:   .byte 0
 
 ; Monitor LOAD flag - if set, return via RTS not jump to BASIC
-p4_monitor_load:  .byte 0
+c128_monitor_load:  .byte 0
 
 ; ------------------------------------------------------------
 ; Sequential File I/O Variables
@@ -157,38 +157,38 @@ seq_filename:     .fill 17, 0           ; Filename buffer for sequential files
 seq_filename_len: .byte 0
 
 ; ------------------------------------------------------------
-; P4HOOK_Reset - Reset all hook state variables
+; C128Hook_Reset - Reset all hook state variables
 ; Called during emulator reset
 ; ------------------------------------------------------------
-P4HOOK_Reset:
+C128Hook_Reset:
         lda #0
-        sta p4_setnam_valid
-        sta p4_setnam_len
-        sta p4_setlfs_sa
-        sta p4_monitor_load
-        sta p4_fl_len
+        sta c128_setnam_valid
+        sta c128_setnam_len
+        sta c128_setlfs_sa
+        sta c128_monitor_load
+        sta c128_fl_len
         lda #8
-        sta p4_setlfs_dev       ; Default device 8
+        sta c128_setlfs_dev       ; Default device 8
         rts
 
 ; ------------------------------------------------------------
-; P4HOOK_CheckAndRun
+; C128Hook_CheckAndRun
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
-P4HOOK_CheckAndRun:
+C128Hook_CheckAndRun:
         pha
         txa
         pha
         tya
         pha
 
-        lda p4_pc_hi
+        lda c128_pc_hi
 
         ; ----- Check for $FFxx addresses (KERNAL calls) -----
         cmp #$FF
         bne _not_ff
         
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$BD                        ; SETNAM = $FFBD
         beq _do_setnam
         cmp #$BA                        ; SETLFS = $FFBA
@@ -217,56 +217,56 @@ P4HOOK_CheckAndRun:
         jmp _check_other
 
 _do_setnam:
-        jsr P4HOOK_OnSETNAM
+        jsr C128Hook_OnSETNAM
         jmp _done
 
 _do_setlfs:
-        jsr P4HOOK_OnSETLFS
+        jsr C128Hook_OnSETLFS
         jmp _done
 
 _do_save:
-        jsr P4HOOK_OnSAVE
+        jsr C128Hook_OnSAVE
         jmp _done
 
 _do_open:
-        jsr P4HOOK_OnOPEN
+        jsr C128Hook_OnOPEN
         jmp _done
 
 _do_close:
-        jsr P4HOOK_OnCLOSE
+        jsr C128Hook_OnCLOSE
         jmp _done
 
 _do_chkin:
-        jsr P4HOOK_OnCHKIN
+        jsr C128Hook_OnCHKIN
         jmp _done
 
 _do_chkout:
-        jsr P4HOOK_OnCHKOUT
+        jsr C128Hook_OnCHKOUT
         jmp _done
 
 _do_clrchn:
-        jsr P4HOOK_OnCLRCHN
+        jsr C128Hook_OnCLRCHN
         jmp _done
 
 _do_chrin:
         lda seq_input_slot
         cmp #$FF
         beq _done               ; No file input - let ROM handle
-        jsr P4HOOK_OnCHRIN
+        jsr C128Hook_OnCHRIN
         jmp _done
 
 _do_chrout:
         lda seq_output_slot
         cmp #$FF
         beq _done               ; Let guest ROM handle it
-        jsr P4HOOK_OnCHROUT
+        jsr C128Hook_OnCHROUT
         jmp _done
 
 _do_getin:
         lda seq_input_slot
         cmp #$FF
         beq _done               ; No file input - let ROM handle
-        jsr P4HOOK_OnGETIN
+        jsr C128Hook_OnGETIN
         jmp _done
 
 _do_load_direct:
@@ -283,17 +283,17 @@ _do_load_direct:
         ; If return address is $A802, skip - the $A800 hook handles BASIC.
         ; Otherwise, this is the monitor - handle LOAD here.
         ;
-        ldy p4_sp
+        ldy c128_sp
         iny                             ; Point to return address lo on stack
         lda #$01
-        sta p4_addr_hi
-        sty p4_addr_lo
-        jsr P4MEM_Read
+        sta c128_addr_hi
+        sty c128_addr_lo
+        jsr C128_Read
         cmp #$02                        ; Return lo = $02?
         bne _do_load_monitor
         iny
-        sty p4_addr_lo
-        jsr P4MEM_Read
+        sty c128_addr_lo
+        jsr C128_Read
         cmp #$A8                        ; Return hi = $A8?
         bne _do_load_monitor
         ; Return addr is $A802 = BASIC calling $FFD5, skip
@@ -301,14 +301,14 @@ _do_load_direct:
         
 _do_load_monitor:
         ; Monitor or other non-BASIC caller - handle LOAD here
-        jsr P4HOOK_OnLOAD
+        jsr C128Hook_OnLOAD
         jmp _done
 
 _not_ff:
         ; ----- Check for $F8xx (auto-boot) -----
         cmp #$F8
         bne _check_f9
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$67                        ; $F867 = IOINIT entry (serial init + auto-boot)
         bne _f8_done
         ; Skip IOINIT entirely - no serial bus or disk drive
@@ -330,7 +330,7 @@ _not_ff:
         lda #$FF
         sta $DC00
         ; Simulate RTS to return to caller (who did JSR $FF56)
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
 _f8_done:
         jmp _done
 
@@ -346,36 +346,36 @@ _check_fa:
 
 _check_c4_rom:
 _check_c4_done:
-        ; Reload p4_pc_hi for next check
-        lda p4_pc_hi
+        ; Reload c128_pc_hi for next check
+        lda c128_pc_hi
 
         ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
 _check_c8:
         cmp #$C8
         bne _check_a8
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$BC                        ; DIRECTORY = $C8BC
         bne _done
-        jsr P4HOOK_OnDIRECTORY
+        jsr C128Hook_OnDIRECTORY
         jmp _done
 
 _check_a8:
         ; ----- Check for LOAD hook at $A800 -----
         cmp #$A8
         bne _done
-        lda p4_pc_lo
+        lda c128_pc_lo
         cmp #$00
         bne _done
 
 _check_other:
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$A8
         bne _done
-        lda p4_pc_lo
+        lda c128_pc_lo
         bne _done
         
         ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
-        jsr P4HOOK_OnLOAD
+        jsr C128Hook_OnLOAD
 
 _done:
         pla
@@ -399,23 +399,23 @@ _done:
 ;   1st call: length=0 to clear filename
 ;   2nd call: length>0 with actual filename, pointer to RAM UNDER ROM
 ; ============================================================
-P4HOOK_OnSETNAM:
+C128Hook_OnSETNAM:
         ; Only capture if length > 0 (skip the clearing call)
-        lda p4_a
+        lda c128_a
         beq _setnam_skip
         
         ; Capture the parameters from emulated CPU registers
-        sta p4_setnam_len
+        sta c128_setnam_len
         
-        lda p4_x
-        sta p4_setnam_ptr_lo
+        lda c128_x
+        sta c128_setnam_ptr_lo
         
-        lda p4_y
-        sta p4_setnam_ptr_hi
+        lda c128_y
+        sta c128_setnam_ptr_hi
         
         ; Mark that we have valid SETNAM data
         lda #1
-        sta p4_setnam_valid
+        sta c128_setnam_valid
         
 _setnam_skip:
         ; Let the ROM SETNAM continue normally
@@ -431,13 +431,13 @@ _setnam_skip:
 ;   X = device number
 ;   Y = secondary address
 ; ============================================================
-P4HOOK_OnSETLFS:
+C128Hook_OnSETLFS:
         ; Capture device and secondary address
-        lda p4_x
-        sta p4_setlfs_dev
+        lda c128_x
+        sta c128_setlfs_dev
         
-        lda p4_y
-        sta p4_setlfs_sa
+        lda c128_y
+        sta c128_setlfs_sa
         
         ; Let the ROM SETLFS continue normally
         rts
@@ -447,29 +447,29 @@ P4HOOK_OnSETLFS:
 ; Hook: LOAD - Handle the actual file loading
 ; Called when guest PC == $A800 (JSR $FFD5 inside BASIC LOAD)
 ; ============================================================
-P4HOOK_OnLOAD:
+C128Hook_OnLOAD:
         ; Check if we have valid SETNAM data
-        lda p4_setnam_valid
+        lda c128_setnam_valid
         beq _load_no_setnam
         
         ; Check filename length - if 1, might be "$" for directory
-        lda p4_setnam_len
+        lda c128_setnam_len
         cmp #1
         bne _load_file
         
         ; Check if it's "$" for directory
         ; Read from RAM under ROM using 32-bit addressing
-        lda p4_setnam_ptr_lo
-        sta P4_MEM_PTR
-        lda p4_setnam_ptr_hi
-        sta P4_MEM_PTR+1
+        lda c128_setnam_ptr_lo
+        sta C128_MEM_PTR
+        lda c128_setnam_ptr_hi
+        sta C128_MEM_PTR+1
         lda #BANK_RAM
-        sta P4_MEM_PTR+2
+        sta C128_MEM_PTR+2
         lda #$00
-        sta P4_MEM_PTR+3
+        sta C128_MEM_PTR+3
         
         ldz #0
-        lda [P4_MEM_PTR],z
+        lda [C128_MEM_PTR],z
         cmp #'$'
         beq _load_directory
         
@@ -487,20 +487,20 @@ _load_no_setnam:
         ; Mark this as a monitor load - needs RTS return, not jump to BASIC
         pha
         lda #1
-        sta p4_monitor_load
+        sta c128_monitor_load
         pla
         
         ; Get SETLFS values from KERNAL variables
         ; $AC = logical file, $AD = secondary address, $AE = device
         lda LOW_RAM_BUFFER + $AD        ; Secondary address
-        sta p4_setlfs_sa
+        sta c128_setlfs_sa
         lda LOW_RAM_BUFFER + $AE        ; Device number
-        sta p4_setlfs_dev
+        sta c128_setlfs_dev
         
         ; Use KERNAL variables - copy filename from LOW_RAM_BUFFER
         ; since monitor stores filename at $025D which is in low RAM
         lda LOW_RAM_BUFFER + $AB        ; Reload filename length
-        sta p4_fl_len
+        sta c128_fl_len
         
         ; Set up pointer: LOW_RAM_BUFFER + $AF/$B0 value
         lda LOW_RAM_BUFFER + $AF        ; Pointer lo ($5D)
@@ -513,16 +513,16 @@ _load_no_setnam:
         ; Copy filename bytes
         ldy #0
 _load_copy_fn:
-        cpy p4_fl_len
+        cpy c128_fl_len
         beq _load_copy_done
         lda ($FB),y
-        sta p4_fl_buf,y
+        sta c128_fl_buf,y
         iny
         cpy #17
         bcc _load_copy_fn
 _load_copy_done:
         lda #0
-        sta p4_fl_buf,y                 ; Null terminate
+        sta c128_fl_buf,y                 ; Null terminate
         jmp _load_do_it                 ; Skip to loading
 
 _load_no_setnam_rts:
@@ -530,163 +530,163 @@ _load_no_setnam_rts:
 
 _load_directory:
         ; Check device number - only intercept device 8 (disk)
-        lda p4_setlfs_dev
+        lda c128_setlfs_dev
         cmp #$08
         beq _load_dir_disk
         ; Not device 8 - let ROM handle
         lda #0
-        sta p4_setnam_valid
+        sta c128_setnam_valid
         rts
         
 _load_dir_disk:
         ; Clear the valid flag
         lda #0
-        sta p4_setnam_valid
+        sta c128_setnam_valid
         
         ; Print "SEARCHING FOR "
-        lda #<P4Host_Msg_Searching
-        ldx #>P4Host_Msg_Searching
-        jsr P4Host_PrintString
+        lda #<C128Host_Msg_Searching
+        ldx #>C128Host_Msg_Searching
+        jsr C128Host_PrintString
         
         ; Print the filename
         lda #'$'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         
-        lda #<P4Host_Msg_Loading
-        ldx #>P4Host_Msg_Loading
-        jsr P4Host_PrintString
+        lda #<C128Host_Msg_Loading
+        ldx #>C128Host_Msg_Loading
+        jsr C128Host_PrintString
 
         ; Load directory listing
-        jsr P4HOOK_LoadDirectory
+        jsr C128Hook_LoadDirectory
         rts
 
 _load_file:
         ; Check device number - only intercept device 8 (disk)
-        lda p4_setlfs_dev
+        lda c128_setlfs_dev
         cmp #$08
         beq _load_file_disk
         ; Not device 8 - let ROM handle (tape, or no device specified)
         ; Clear the valid flag first
         lda #0
-        sta p4_setnam_valid
+        sta c128_setnam_valid
         rts
         
 _load_file_disk:
         ; Clear the valid flag
         lda #0
-        sta p4_setnam_valid
+        sta c128_setnam_valid
         
         ; Check if we were called from the $A800 hook (BASIC) or $FFD5 hook (direct)
         ; If PC is currently $A800, we're in BASIC path
-        lda p4_pc_hi
+        lda c128_pc_hi
         cmp #$A8
         bne _lfd_not_basic
-        lda p4_pc_lo
+        lda c128_pc_lo
         bne _lfd_not_basic
         
         ; Caller is BASIC (PC = $A800)
         lda #0
-        sta p4_monitor_load
+        sta c128_monitor_load
         jmp _lfd_continue
         
 _lfd_not_basic:
         ; Caller is NOT BASIC - set monitor flag for RTS return
         lda #1
-        sta p4_monitor_load
+        sta c128_monitor_load
         
 _lfd_continue:
         ; Copy filename from guest RAM to our buffer
-        jsr P4HOOK_CopyFilename
+        jsr C128Hook_CopyFilename
         bcs _load_file_error
         
 _load_do_it:
         ; Print "SEARCHING FOR "
-        lda #<P4Host_Msg_Searching
-        ldx #>P4Host_Msg_Searching
-        jsr P4Host_PrintString
+        lda #<C128Host_Msg_Searching
+        ldx #>C128Host_Msg_Searching
+        jsr C128Host_PrintString
         
         ; Print the filename
         ldy #0
     _print_name:
-        cpy p4_fl_len
+        cpy c128_fl_len
         beq _print_done
-        lda p4_fl_buf,y
+        lda c128_fl_buf,y
         phy
-        jsr P4Host_PutChar          ; (alias for P4Host_PrintCharSync)
+        jsr C128Host_PutChar          ; (alias for C128Host_PrintCharSync)
         ply
         iny
         bne _print_name
     _print_done:
         
         ; Now load the file using host KERNAL
-        jsr P4HOOK_DoHostLoad
+        jsr C128Hook_DoHostLoad
         rts
 
 _load_file_error:
         ; Set carry and error code
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
         lda #$04                        ; FILE NOT FOUND
-        sta p4_a
+        sta c128_a
         lda #$42
         sta LOW_RAM_BUFFER + $90        ; Also set STATUS byte!
         
         ; Check if this was a monitor/direct load or BASIC load
-        lda p4_monitor_load
+        lda c128_monitor_load
         beq _lfe_basic
         
         ; Monitor/direct load - return via RTS
         lda #0
-        sta p4_monitor_load
-        jsr P4HOOK_RTS_Guest
+        sta c128_monitor_load
+        jsr C128Hook_RTS_Guest
         rts
         
 _lfe_basic:
         ; BASIC load - skip to after JSR $FFD5
-        lda #<P4HOOK_ROM_AFTER_KERNAL_CALL
-        sta p4_pc_lo
-        lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
-        sta p4_pc_hi
+        lda #<C128Hook_ROM_AFTER_KERNAL_CALL
+        sta c128_pc_lo
+        lda #>C128Hook_ROM_AFTER_KERNAL_CALL
+        sta c128_pc_hi
         lda #1
-        sta p4_hook_pc_changed    ; Signal to threaded interpreter
+        sta c128_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 ; ============================================================
-; P4HOOK_CopyFilename - Copy filename from guest RAM to buffer
+; C128Hook_CopyFilename - Copy filename from guest RAM to buffer
 ; 
 ; NOTE: The filename pointer points to RAM UNDER ROM, so we must
-; read directly from Bank 5 (guest RAM), NOT through P4MEM_Read
+; read directly from Bank 5 (guest RAM), NOT through C128_Read
 ; which would see the ROM overlay.
 ;
 ; Returns: C=0 success, C=1 error
 ; ============================================================
-P4HOOK_CopyFilename:
-        lda p4_setnam_len
+C128Hook_CopyFilename:
+        lda c128_setnam_len
         beq _cf_error                   ; No filename
         cmp #17
         bcs _cf_error                   ; Too long
-        sta p4_fl_len
+        sta c128_fl_len
         
         ; Check if filename is in low RAM ($0000-$0FFF) or bank 5 ($1000+)
-        lda p4_setnam_ptr_hi
+        lda c128_setnam_ptr_hi
         cmp #$10
         bcs _cf_bank5                   ; >= $1000, use bank 5
         
         ; Filename is in low RAM - read from LOW_RAM_BUFFER
-        lda p4_setnam_ptr_lo
+        lda c128_setnam_ptr_lo
         sta $FB
         clc
-        lda p4_setnam_ptr_hi
+        lda c128_setnam_ptr_hi
         adc #>LOW_RAM_BUFFER            ; Add $A0
         sta $FC
         
         ldy #0
 _cf_low_loop:
-        cpy p4_fl_len
+        cpy c128_fl_len
         beq _cf_done
         lda ($FB),y
-        sta p4_fl_buf,y
+        sta c128_fl_buf,y
         iny
         cpy #17
         bcc _cf_low_loop
@@ -694,30 +694,30 @@ _cf_low_loop:
         
 _cf_bank5:
         ; Set up 32-bit pointer to read from Bank 5 (guest RAM)
-        ; P4_MEM_PTR is at $F0-$F3
-        lda p4_setnam_ptr_lo
-        sta P4_MEM_PTR
-        lda p4_setnam_ptr_hi
-        sta P4_MEM_PTR+1
+        ; C128_MEM_PTR is at $F0-$F3
+        lda c128_setnam_ptr_lo
+        sta C128_MEM_PTR
+        lda c128_setnam_ptr_hi
+        sta C128_MEM_PTR+1
         lda #BANK_RAM                   ; Bank 5 = guest RAM
-        sta P4_MEM_PTR+2
+        sta C128_MEM_PTR+2
         lda #$00
-        sta P4_MEM_PTR+3
+        sta C128_MEM_PTR+3
         
         ; Copy bytes using 32-bit indirect addressing
         ldy #0
 _cf_loop:
-        cpy p4_fl_len
+        cpy c128_fl_len
         beq _cf_done
         
-        ; Read from [P4_MEM_PTR],y - this reads from Bank 5 directly
+        ; Read from [C128_MEM_PTR],y - this reads from Bank 5 directly
         ldz #0
         tya
         taz                             ; Z = Y (offset)
-        lda [P4_MEM_PTR],z
+        lda [C128_MEM_PTR],z
         
         ; Store in buffer
-        sta p4_fl_buf,y
+        sta c128_fl_buf,y
         
         iny
         bne _cf_loop                    ; Always branch (Y < 17)
@@ -725,7 +725,7 @@ _cf_loop:
 _cf_done:
         ; Null terminate
         lda #0
-        sta p4_fl_buf,y
+        sta c128_fl_buf,y
         clc
         rts
         
@@ -734,11 +734,11 @@ _cf_error:
         rts
 
 
-; Old print routines removed - now using P4Host_* routines from p4host.asm
+; Old print routines removed - now using C128Host_* routines from c128_host.asm
 
 
 ; ============================================================
-; P4HOOK_DoHostLoad - Load file using host MEGA65 KERNAL
+; C128Hook_DoHostLoad - Load file using host MEGA65 KERNAL
 ;
 ; The MEGA65 KERNAL LOAD with SA=0 reads the 2-byte header but then
 ; loads to the address we specify in X/Y (ignoring header address).
@@ -753,20 +753,20 @@ _cf_error:
 ; ============================================================
 
 ; Storage for the captured PRG header (load address)
-p4_prg_header_lo: .byte 0
-p4_prg_header_hi: .byte 0
+c128_prg_header_lo: .byte 0
+c128_prg_header_hi: .byte 0
 
 ; Saved video mode across host file operations (for error recovery)
-p4_prev_video_mode: .byte 0
+c128_prev_video_mode: .byte 0
 
-P4HOOK_DoHostLoad:
+C128Hook_DoHostLoad:
         ; Mark file operation in progress (prevents video mode switching)
         lda #1
-        sta p4_file_op_active
+        sta c128_file_op_active
 
-        ; Remember current Plus/4 video mode (for error recovery)
-        lda p4_video_mode
-        sta p4_prev_video_mode
+        ; Remember current C128 video mode (for error recovery)
+        lda c128_video_mode
+        sta c128_prev_video_mode
         
         ; Set up host KERNAL for file operations
         lda #$00
@@ -774,21 +774,21 @@ P4HOOK_DoHostLoad:
         jsr SETBNK
         
         ; Check if we need the header address (SA != 0)
-        lda p4_setlfs_sa
+        lda c128_setlfs_sa
         beq _dhl_do_load            ; SA=0, skip header reading
         
         ; --------------------------------------------------------
         ; SA != 0: Need to read header address first
         ; --------------------------------------------------------
         ; Set filename for OPEN
-        ldx #<p4_fl_buf
-        ldy #>p4_fl_buf
-        lda p4_fl_len
+        ldx #<c128_fl_buf
+        ldy #>c128_fl_buf
+        lda c128_fl_len
         jsr SETNAM
         
         ; SETLFS: lfn=15, device, sa=15 (command channel style read)
         lda #$0F                        ; Logical file number 15
-        ldx p4_setlfs_dev
+        ldx c128_setlfs_dev
         bne +
         ldx #$08                        ; Default to device 8
 +       ldy #$00                        ; SA=0 for sequential
@@ -804,15 +804,15 @@ P4HOOK_DoHostLoad:
         
         ; Read header bytes
         jsr CHRIN
-        sta p4_prg_header_lo
+        sta c128_prg_header_lo
         jsr CHRIN
-        sta p4_prg_header_hi
+        sta c128_prg_header_hi
         
         ; Close
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
+        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhl_do_load_after_header
 
 _dhl_header_error:
@@ -820,7 +820,7 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
+        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -832,52 +832,52 @@ _dhl_do_load:
         
         ; First we need to know the destination address
         ; SA=0: use TXTTAB, SA!=0: use file header
-        lda p4_setlfs_sa
+        lda c128_setlfs_sa
         bne _dhl_use_header_addr
         
         ; SA=0: destination = TXTTAB
         lda LOW_RAM_BUFFER + ZP_TXTTAB_LO
-        sta p4_dir_dest_lo
+        sta c128_dir_dest_lo
         lda LOW_RAM_BUFFER + ZP_TXTTAB_HI
-        sta p4_dir_dest_hi
+        sta c128_dir_dest_hi
         jmp _dhl_setup_load
         
 _dhl_use_header_addr:
         ; SA!=0: use the header address we captured earlier
-        lda p4_prg_header_lo
-        sta p4_dir_dest_lo
-        lda p4_prg_header_hi
-        sta p4_dir_dest_hi
+        lda c128_prg_header_lo
+        sta c128_dir_dest_lo
+        lda c128_prg_header_hi
+        sta c128_dir_dest_hi
         
 _dhl_setup_load:
         ; Set filename
-        ldx #<p4_fl_buf
-        ldy #>p4_fl_buf
-        lda p4_fl_len
+        ldx #<c128_fl_buf
+        ldy #>c128_fl_buf
+        lda c128_fl_len
         jsr SETNAM
         
         ; SETLFS: lfn=1, device, sa=0 (we provide our own address)
         lda #$01                        ; Logical file number
-        ldx p4_setlfs_dev
+        ldx c128_setlfs_dev
         bne +
         ldx #$08                        ; Default to device 8
 +       ldy #$00                        ; SA=0: use X/Y address, not file header
         jsr SETLFS
         
         ; Set destination bank to 5 (guest RAM)
-        lda #P4_BANK_RAM                ; Bank 5 for LOAD destination
+        lda #C128_BANK_RAM                ; Bank 5 for LOAD destination
         ldx #$00                        ; Bank 0 for filename
         jsr SETBNK
         
         ; Load directly to guest RAM in bank 5
         lda #$00                        ; 0 = LOAD (not verify)
-        ldx p4_dir_dest_lo
-        ldy p4_dir_dest_hi
+        ldx c128_dir_dest_lo
+        ldy c128_dir_dest_hi
         jsr LOAD
         
         ; Save end address from LOAD (in X/Y)
-        stx p4_fl_end_lo
-        sty p4_fl_end_hi
+        stx c128_fl_end_lo
+        sty c128_fl_end_hi
         php                             ; Save carry flag (error status from LOAD)
         
         ; Close the logical file to clean up KERNAL state
@@ -890,7 +890,7 @@ _dhl_setup_load:
         ldx #$00
         jsr SETBNK
         
-        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
+        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         
         plp                             ; Restore carry flag from LOAD
         bcc _dhl_load_ok
@@ -900,30 +900,30 @@ _dhl_setup_load:
 
 _dhl_load_ok:
         ; Print "LOADING" message
-        lda #<P4Host_Msg_Loading
-        ldx #>P4Host_Msg_Loading
-        jsr P4Host_PrintString
+        lda #<C128Host_Msg_Loading
+        ldx #>C128Host_Msg_Loading
+        jsr C128Host_PrintString
         
         ; Calculate loaded length
         ; We loaded directly to destination, so length = end - dest
-        lda p4_fl_end_lo
+        lda c128_fl_end_lo
         sec
-        sbc p4_dir_dest_lo
-        sta p4_dir_len_lo
-        lda p4_fl_end_hi
-        sbc p4_dir_dest_hi
-        sta p4_dir_len_hi
+        sbc c128_dir_dest_lo
+        sta c128_dir_len_lo
+        lda c128_fl_end_hi
+        sbc c128_dir_dest_hi
+        sta c128_dir_len_hi
         
         ; Need at least 1 byte of data
-        lda p4_dir_len_hi
+        lda c128_dir_len_hi
         bne _dhl_has_data
-        lda p4_dir_len_lo
+        lda c128_dir_len_lo
         beq _dhl_error_set
 
 _dhl_has_data:
         ; We loaded directly to bank 5, so we need to sync LOW_RAM_BUFFER
         ; for addresses $0000-$0FFF if the load touched that area
-        jsr P4HOOK_SyncLowRAMFromBank5
+        jsr C128Hook_SyncLowRAMFromBank5
         
         ; Clear KERNAL status
         lda #$00
@@ -931,17 +931,17 @@ _dhl_has_data:
         
         ; Set end address in X/Y registers
         clc
-        lda p4_dir_dest_lo
-        adc p4_dir_len_lo
-        sta p4_x
-        lda p4_dir_dest_hi
-        adc p4_dir_len_hi
-        sta p4_y
+        lda c128_dir_dest_lo
+        adc c128_dir_len_lo
+        sta c128_x
+        lda c128_dir_dest_hi
+        adc c128_dir_len_hi
+        sta c128_y
         
         ; Clear carry = success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
+        sta c128_p
         jmp _dhl_set_pc
 
 _dhl_error_set:
@@ -952,10 +952,10 @@ _dhl_error_set:
         lda #$00
         ldx #$00
         jsr SETBNK                      ; Reset to bank 0
-        jsr P4HOOK_UnlockVIC
+        jsr C128Hook_UnlockVIC
         
         ; Print appropriate error message based on caller
-        lda p4_monitor_load
+        lda c128_monitor_load
         bne _dhl_error_monitor
         jmp _dhl_error_set_status
 
@@ -963,49 +963,49 @@ _dhl_error_monitor:
        ; Since we are bypassing the kernal load routine,
        ; if its the monitor thats failing to load, we 
        ; need to print its error message
-        lda #<P4Host_Msg_Monitor_FileNotFound
-        ldx #>P4Host_Msg_Monitor_FileNotFound
-        jsr P4Host_PrintString
+        lda #<C128Host_Msg_Monitor_FileNotFound
+        ldx #>C128Host_Msg_Monitor_FileNotFound
+        jsr C128Host_PrintString
 
 _dhl_error_set_status:
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
         lda #$04                        ; FILE NOT FOUND
-        sta p4_a
+        sta c128_a
         lda #$42
         sta LOW_RAM_BUFFER + $90        ; set STATUS byte
 
 _dhl_set_pc:
         ; Clear file operation flag - allow video mode switching again
         lda #0
-        sta p4_file_op_active
+        sta c128_file_op_active
 
         ; If LOAD failed, force text mode to recover host video state
-        jsr P4HOOK_PostFileOpVideoFix
+        jsr C128Hook_PostFileOpVideoFix
         
         ; Check if this was a monitor load
-        lda p4_monitor_load
+        lda c128_monitor_load
         beq _dhl_basic_return
         
         ; Monitor load - return via RTS to caller
         lda #0
-        sta p4_monitor_load             ; Clear the flag
-        jsr P4HOOK_RTS_Guest
+        sta c128_monitor_load             ; Clear the flag
+        jsr C128Hook_RTS_Guest
         rts
         
 _dhl_basic_return:
         ; BASIC load - skip past the JSR $FFD5
-        lda #<P4HOOK_ROM_AFTER_KERNAL_CALL
-        sta p4_pc_lo
-        lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
-        sta p4_pc_hi
+        lda #<C128Hook_ROM_AFTER_KERNAL_CALL
+        sta c128_pc_lo
+        lda #>C128Hook_ROM_AFTER_KERNAL_CALL
+        sta c128_pc_hi
         
         lda #1
-        sta p4_hook_pc_changed    ; Signal to threaded interpreter
+        sta c128_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
-P4Host_Msg_Monitor_FileNotFound:
+C128Host_Msg_Monitor_FileNotFound:
         .byte $0d
         .text "i/o error #4"
         .byte $00
@@ -1022,9 +1022,9 @@ P4Host_Msg_Monitor_FileNotFound:
 ; The start address is read from the ZP location pointed to by A.
 ; End address is the first byte NOT to save (exclusive).
 ; ============================================================
-P4HOOK_OnSAVE:
+C128Hook_OnSAVE:
         ; Check device number - only intercept device 8 (disk)
-        lda p4_setlfs_dev
+        lda c128_setlfs_dev
         cmp #$08
         beq _save_check_setnam
         ; Not device 8 - let ROM handle (tape, or no device specified)
@@ -1032,7 +1032,7 @@ P4HOOK_OnSAVE:
         
 _save_check_setnam:
         ; Check if we have valid SETNAM data
-        lda p4_setnam_valid
+        lda c128_setnam_valid
         bne _save_have_setnam
         
         ; No SETNAM called - check if monitor set filename directly
@@ -1044,7 +1044,7 @@ _save_check_setnam:
         
         ; Use KERNAL variables - copy filename from LOW_RAM_BUFFER
         ; since monitor stores filename at $025D which is in low RAM
-        sta p4_fl_len
+        sta c128_fl_len
         
         ; Set up pointer: LOW_RAM_BUFFER + $AF/$B0 value
         lda LOW_RAM_BUFFER + $AF        ; Pointer lo ($5D)
@@ -1057,49 +1057,49 @@ _save_check_setnam:
         ; Copy filename bytes
         ldy #0
 _save_copy_fn:
-        cpy p4_fl_len
+        cpy c128_fl_len
         beq _save_copy_done
         lda ($FB),y
-        sta p4_fl_buf,y
+        sta c128_fl_buf,y
         iny
         cpy #17
         bcc _save_copy_fn
 _save_copy_done:
         lda #0
-        sta p4_fl_buf,y                 ; Null terminate
+        sta c128_fl_buf,y                 ; Null terminate
         bra _save_do_it
         
 _save_have_setnam:
         ; Clear the valid flag
         lda #0
-        sta p4_setnam_valid
+        sta c128_setnam_valid
         
         ; Copy filename from guest RAM to buffer (uses bank 5)
-        jsr P4HOOK_CopyFilename
+        jsr C128Hook_CopyFilename
         bcs _save_error
         
 _save_do_it:
         ; Get end address from X/Y registers
-        lda p4_x
-        sta p4_save_end_lo
-        lda p4_y
-        sta p4_save_end_hi
+        lda c128_x
+        sta c128_save_end_lo
+        lda c128_y
+        sta c128_save_end_hi
         
         ; Get start address - A register contains ZP address
         ; The ZP location contains a 2-byte pointer to start of data
         ; ZP is in LOW_RAM_BUFFER, not Bank 5!
-        lda p4_a                        ; ZP address (e.g., $2B for TXTTAB)
+        lda c128_a                        ; ZP address (e.g., $2B for TXTTAB)
         tax
         
         ; Read start address from LOW_RAM_BUFFER (ZP is in low RAM)
         jsr lrb_read_x  ; Start lo
-        sta p4_save_start_lo
+        sta c128_save_start_lo
         inx
         jsr lrb_read_x  ; Start hi
-        sta p4_save_start_hi
+        sta c128_save_start_hi
         
         ; Perform the save
-        jsr P4HOOK_DoHostSave
+        jsr C128Hook_DoHostSave
         rts
 
 _save_no_setnam:
@@ -1108,61 +1108,61 @@ _save_no_setnam:
 
 _save_error:
         ; Filename copy error
-        jsr P4HOOK_SaveSetError
+        jsr C128Hook_SaveSetError
         rts
 
 
 ; ============================================================
-; P4HOOK_DoHostSave - Save file using host MEGA65 KERNAL
+; C128Hook_DoHostSave - Save file using host MEGA65 KERNAL
 ; ============================================================
-P4HOOK_DoHostSave:
+C128Hook_DoHostSave:
         ; Mark file operation in progress (prevents video mode switching)
         lda #1
-        sta p4_file_op_active
+        sta c128_file_op_active
 
-        ; Remember current Plus/4 video mode (for error recovery)
-        lda p4_video_mode
-        sta p4_prev_video_mode
+        ; Remember current C128 video mode (for error recovery)
+        lda c128_video_mode
+        sta c128_prev_video_mode
         
         ; Calculate data length
-        lda p4_save_end_lo
+        lda c128_save_end_lo
         sec
-        sbc p4_save_start_lo
-        sta p4_dir_len_lo
-        lda p4_save_end_hi
-        sbc p4_save_start_hi
-        sta p4_dir_len_hi
+        sbc c128_save_start_lo
+        sta c128_dir_len_lo
+        lda c128_save_end_hi
+        sbc c128_save_start_hi
+        sta c128_dir_len_hi
         
         ; Check for zero or negative length
-        lda p4_dir_len_hi
+        lda c128_dir_len_hi
         bmi _dhs_error                  ; Negative = error
-        ora p4_dir_len_lo
+        ora c128_dir_len_lo
         beq _dhs_error                  ; Zero length = error
         
         ; DMA copy from guest RAM to staging buffer
         ; First 2 bytes = load address header
-        lda p4_save_start_lo
-        sta P4_DIR_BUF
-        lda p4_save_start_hi
-        sta P4_DIR_BUF+1
+        lda c128_save_start_lo
+        sta C128_DIR_BUF
+        lda c128_save_start_hi
+        sta C128_DIR_BUF+1
         
         ; Copy program data from guest RAM (bank 5) to staging buffer+2
-        jsr P4HOOK_DMACopyGuestToHost
+        jsr C128Hook_DMACopyGuestToHost
 
 
         ; Print "SAVING "
-        lda #<P4Host_Msg_Saving
-        ldx #>P4Host_Msg_Saving
-        jsr P4Host_PrintString
+        lda #<C128Host_Msg_Saving
+        ldx #>C128Host_Msg_Saving
+        jsr C128Host_PrintString
         
         ; Print the filename
         ldy #0
     _print_name:
-        cpy p4_fl_len
+        cpy c128_fl_len
         beq _print_done
-        lda p4_fl_buf,y
+        lda c128_fl_buf,y
         phy
-        jsr P4Host_PutChar          ; (alias for P4Host_PrintCharSync)
+        jsr C128Host_PutChar          ; (alias for C128Host_PrintCharSync)
         ply
         iny
         bne _print_name
@@ -1174,14 +1174,14 @@ P4HOOK_DoHostSave:
         jsr SETBNK
         
         ; Set filename
-        ldx #<p4_fl_buf
-        ldy #>p4_fl_buf
-        lda p4_fl_len
+        ldx #<c128_fl_buf
+        ldy #>c128_fl_buf
+        lda c128_fl_len
         jsr SETNAM
         
         ; Set device - use OPEN/CHKOUT/CHROUT method
         lda #$01                        ; Logical file number
-        ldx p4_setlfs_dev
+        ldx c128_setlfs_dev
         bne +
         ldx #$08                        ; Default to device 8
 +       ldy #$01                        ; SA=1 for save with relocate address
@@ -1198,17 +1198,17 @@ P4HOOK_DoHostSave:
         
         ; Calculate total length including 2-byte header
         clc
-        lda p4_dir_len_lo
+        lda c128_dir_len_lo
         adc #2
         sta _save_total_lo
-        lda p4_dir_len_hi
+        lda c128_dir_len_hi
         adc #0
         sta _save_total_hi
         
         ; Output all bytes using CHROUT
-        lda #<P4_DIR_BUF
+        lda #<C128_DIR_BUF
         sta $FB
-        lda #>P4_DIR_BUF
+        lda #>C128_DIR_BUF
         sta $FC
         
         ldy #0
@@ -1240,7 +1240,7 @@ _save_loop_done:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
-        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
+        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         
         jmp _dhs_ok
 
@@ -1249,7 +1249,7 @@ _dhs_chkout_error:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
-        jsr P4HOOK_UnlockVIC            ; Just re-unlock VIC, don't change mode
+        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhs_error
 
 _dhs_ok:
@@ -1258,68 +1258,68 @@ _dhs_ok:
         sta LOW_RAM_BUFFER + $90
         
         ; Clear carry = success in guest P register
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
+        sta c128_p
         
         ; Set A to 0 (no error)
         lda #$00
-        sta p4_a
+        sta c128_a
         
         ; Clear file operation flag - allow video mode switching again
         lda #0
-        sta p4_file_op_active
+        sta c128_file_op_active
 
         ; If SAVE failed, force text mode to recover host video state
-        jsr P4HOOK_PostFileOpVideoFix
+        jsr C128Hook_PostFileOpVideoFix
         
         ; We intercepted at $FFD8 (KERNAL SAVE entry)
         ; Pop the return address from guest stack and set PC to return
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 _dhs_error:
         ; Clear file operation flag even on error
         lda #0
-        sta p4_file_op_active
+        sta c128_file_op_active
 
         ; If SAVE failed, force text mode to recover host video state
-        jsr P4HOOK_PostFileOpVideoFix
-        jsr P4HOOK_SaveSetError
+        jsr C128Hook_PostFileOpVideoFix
+        jsr C128Hook_SaveSetError
         rts
 
 _save_total_lo: .byte 0
 _save_total_hi: .byte 0
 
 ; ============================================================
-; P4HOOK_SaveSetError - Set error status for failed SAVE
+; C128Hook_SaveSetError - Set error status for failed SAVE
 ; ============================================================
-P4HOOK_SaveSetError:
-        lda p4_p
+C128Hook_SaveSetError:
+        lda c128_p
         ora #P_C
-        sta p4_p
+        sta c128_p
         lda #$05                        ; DEVICE NOT PRESENT or similar
-        sta p4_a
+        sta c128_a
         
         ; Pop return address and return from SAVE
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 
 ; ============================================================
-; P4HOOK_DMACopyGuestToHost - Copy from guest RAM to staging buffer
+; C128Hook_DMACopyGuestToHost - Copy from guest RAM to staging buffer
 ; Source: Bank 5 at p4_save_start
-; Dest: P4_DIR_BUF+2 (after load address header)
+; Dest: C128_DIR_BUF+2 (after load address header)
 ; Length: p4_dir_len
 ; ============================================================
-P4HOOK_DMACopyGuestToHost:
-        lda p4_dir_len_lo
+C128Hook_DMACopyGuestToHost:
+        lda c128_dir_len_lo
         sta _dma_g2h_len_lo
-        lda p4_dir_len_hi
+        lda c128_dir_len_hi
         sta _dma_g2h_len_hi
-        lda p4_save_start_lo
+        lda c128_save_start_lo
         sta _dma_g2h_src_lo
-        lda p4_save_start_hi
+        lda c128_save_start_hi
         sta _dma_g2h_src_hi
 
         lda #$00
@@ -1335,8 +1335,8 @@ _dma_g2h_src_lo:
 _dma_g2h_src_hi:
         .byte $00
         .byte BANK_RAM                  ; src bank 5 (guest RAM)
-        .byte <(P4_DIR_BUF+2)           ; dest lo
-        .byte >(P4_DIR_BUF+2)           ; dest hi
+        .byte <(C128_DIR_BUF+2)           ; dest lo
+        .byte >(C128_DIR_BUF+2)           ; dest hi
         .byte $00                       ; dest bank 0 (host RAM)
         .byte $00
         .word $0000
@@ -1344,17 +1344,17 @@ _dma_g2h_src_hi:
 
 
 ; ============================================================
-; P4HOOK_LoadDirectory - Load "$" directory as BASIC program
+; C128Hook_LoadDirectory - Load "$" directory as BASIC program
 ; ============================================================
-P4HOOK_LoadDirectory:
+C128Hook_LoadDirectory:
         ; Set up host KERNAL
         lda #$00
         ldx #$00
         jsr SETBNK
         
         ; SETNAM("$", len=1)
-        ldx #<p4_dir_name
-        ldy #>p4_dir_name
+        ldx #<c128_dir_name
+        ldy #>c128_dir_name
         lda #$01
         jsr SETNAM
         
@@ -1366,8 +1366,8 @@ P4HOOK_LoadDirectory:
         
         ; LOAD to staging buffer
         lda #$00
-        ldx #<P4_DIR_BUF
-        ldy #>P4_DIR_BUF
+        ldx #<C128_DIR_BUF
+        ldy #>C128_DIR_BUF
         jsr LOAD
         bcc _ld_ok
         
@@ -1382,55 +1382,55 @@ _ld_ok:
         ; Calculate length
         lda _ld_end_lo
         sec
-        sbc #<P4_DIR_BUF
-        sta p4_dir_len_lo
+        sbc #<C128_DIR_BUF
+        sta c128_dir_len_lo
         lda _ld_end_hi
-        sbc #>P4_DIR_BUF
-        sta p4_dir_len_hi
+        sbc #>C128_DIR_BUF
+        sta c128_dir_len_hi
         
         ; Check for zero length
-        lda p4_dir_len_lo
-        ora p4_dir_len_hi
+        lda c128_dir_len_lo
+        ora c128_dir_len_hi
         beq _ld_bypass
         
         ; Destination = TXTTAB
-        jsr P4HOOK_SetDestFromTXTTAB
+        jsr C128Hook_SetDestFromTXTTAB
         
         ; Clear first byte
-        jsr P4HOOK_ClearGuestDest1
+        jsr C128Hook_ClearGuestDest1
         
         ; DMA copy
-        jsr P4HOOK_DMACopyDirToGuest
+        jsr C128Hook_DMACopyDirToGuest
 
 _ld_bypass:
         ; Clear KERNAL status
         lda #$00
-        sta p4_addr_hi
+        sta c128_addr_hi
         lda #$90
-        sta p4_addr_lo
-        jsr P4MEM_WriteA0
+        sta c128_addr_lo
+        jsr C128_WriteA0
         
         ; Set end address in X/Y
         clc
-        lda p4_dir_dest_lo
-        adc p4_dir_len_lo
-        sta p4_x
-        lda p4_dir_dest_hi
-        adc p4_dir_len_hi
-        sta p4_y
+        lda c128_dir_dest_lo
+        adc c128_dir_len_lo
+        sta c128_x
+        lda c128_dir_dest_hi
+        adc c128_dir_len_hi
+        sta c128_y
         
         ; Clear carry
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $ff)
-        sta p4_p
+        sta c128_p
         
         ; Skip JSR $FFD5
-        lda #<P4HOOK_ROM_AFTER_KERNAL_CALL
-        sta p4_pc_lo
-        lda #>P4HOOK_ROM_AFTER_KERNAL_CALL
-        sta p4_pc_hi
+        lda #<C128Hook_ROM_AFTER_KERNAL_CALL
+        sta c128_pc_lo
+        lda #>C128Hook_ROM_AFTER_KERNAL_CALL
+        sta c128_pc_hi
         lda #1
-        sta p4_hook_pc_changed    ; Signal to threaded interpreter
+        sta c128_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 _ld_end_lo: .byte 0
@@ -1439,18 +1439,18 @@ _ld_end_hi: .byte 0
 
 ; ============================================================
 ; DMA copy file data to guest RAM
-; Source: P4_DIR_BUF (staging buffer - data only, no header)
+; Source: C128_DIR_BUF (staging buffer - data only, no header)
 ; Dest: p4_dir_dest in Bank 5 (guest RAM)
 ; Length: p4_dir_len
 ; ============================================================
-P4HOOK_DMACopyFileToGuest:
-        lda p4_dir_len_lo
+C128Hook_DMACopyFileToGuest:
+        lda c128_dir_len_lo
         sta _dma_fl_len_lo
-        lda p4_dir_len_hi
+        lda c128_dir_len_hi
         sta _dma_fl_len_hi
-        lda p4_dir_dest_lo
+        lda c128_dir_dest_lo
         sta _dma_fl_dst_lo
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         sta _dma_fl_dst_hi
 
         ; --------------------------------------------------------
@@ -1468,7 +1468,7 @@ P4HOOK_DMACopyFileToGuest:
         .byte $00                       ; src bank 0
         .byte $00                       ; dest lo
         .byte $00                       ; dest hi  
-        .byte P4_BANK_RAM               ; dest bank 5
+        .byte C128_BANK_RAM               ; dest bank 5
         .byte $00
         .word $0000
 
@@ -1483,14 +1483,14 @@ _dma_fl_len_lo:
         .byte $00
 _dma_fl_len_hi:
         .byte $00
-        .byte <P4_DIR_BUF               ; src lo (buffer contains data only)
-        .byte >P4_DIR_BUF               ; src hi
+        .byte <C128_DIR_BUF               ; src lo (buffer contains data only)
+        .byte >C128_DIR_BUF               ; src hi
         .byte $00                       ; src bank 0
 _dma_fl_dst_lo:
         .byte $00
 _dma_fl_dst_hi:
         .byte $00
-        .byte P4_BANK_RAM               ; dest bank 5
+        .byte C128_BANK_RAM               ; dest bank 5
         .byte $00
         .word $0000
 
@@ -1498,7 +1498,7 @@ _dma_fl_dst_hi:
         ; Check if load destination overlaps LOW_RAM_BUFFER range ($0000-$0FFF)
         ; If dest_hi >= $10, no overlap - we're done
         ; --------------------------------------------------------
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         cmp #$10
         bcs _dma_fl_done                ; dest >= $1000, no overlap with low RAM
 
@@ -1506,11 +1506,11 @@ _dma_fl_dst_hi:
         ; Calculate end of loaded data, clamped to $1000
         ; --------------------------------------------------------
         clc
-        lda p4_dir_dest_lo
-        adc p4_dir_len_lo
+        lda c128_dir_dest_lo
+        adc c128_dir_len_lo
         sta _sync_end_lo
-        lda p4_dir_dest_hi
-        adc p4_dir_len_hi
+        lda c128_dir_dest_hi
+        adc c128_dir_len_hi
         sta _sync_end_hi
         
         ; Clamp end to $1000 if it exceeds
@@ -1526,9 +1526,9 @@ _sync_calc_range:
         ; Calculate start of sync: use actual dest address
         ; We MUST sync stack page ($0100-$01FF) because depackers run from there!
         ; The original code skipped $0000-$01FF but this breaks depackers
-        lda p4_dir_dest_lo
+        lda c128_dir_dest_lo
         sta _sync_start_lo
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         sta _sync_start_hi
 
 _sync_check_range:
@@ -1578,7 +1578,7 @@ _dma_sync_src_lo:
         .byte $00
 _dma_sync_src_hi:
         .byte $00
-        .byte P4_BANK_RAM               ; src bank 5
+        .byte C128_BANK_RAM               ; src bank 5
 _dma_sync_dst_lo:
         .byte $00
 _dma_sync_dst_hi:
@@ -1599,27 +1599,27 @@ _sync_end_hi:   .byte 0
 ; Helper routines (from original)
 ; ============================================================
 
-P4HOOK_SetDestFromTXTTAB:
+C128Hook_SetDestFromTXTTAB:
         lda #$00
-        sta p4_addr_hi
+        sta c128_addr_hi
         lda #ZP_TXTTAB_LO
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta p4_dir_dest_lo
+        sta c128_addr_lo
+        jsr C128_Read
+        sta c128_dir_dest_lo
         lda #ZP_TXTTAB_HI
-        sta p4_addr_lo
-        jsr P4MEM_Read
-        sta p4_dir_dest_hi
+        sta c128_addr_lo
+        jsr C128_Read
+        sta c128_dir_dest_hi
         rts
 
-P4HOOK_DMACopyDirToGuest:
-        lda p4_dir_len_lo
+C128Hook_DMACopyDirToGuest:
+        lda c128_dir_len_lo
         sta _dma_count_lo
-        lda p4_dir_len_hi
+        lda c128_dir_len_hi
         sta _dma_count_hi
-        lda p4_dir_dest_lo
+        lda c128_dir_dest_lo
         sta _dma_dst_lo
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         sta _dma_dst_hi
 
         lda #$00
@@ -1630,22 +1630,22 @@ _dma_count_lo:
         .byte $00
 _dma_count_hi:
         .byte $00
-        .byte <P4_DIR_BUF
-        .byte >P4_DIR_BUF
+        .byte <C128_DIR_BUF
+        .byte >C128_DIR_BUF
         .byte $00
 _dma_dst_lo:
         .byte $00
 _dma_dst_hi:
         .byte $00
-        .byte P4_BANK_RAM
+        .byte C128_BANK_RAM
         .byte $00
         .word $0000
         rts
 
-P4HOOK_ClearGuestDest1:
-        lda p4_dir_dest_lo
+C128Hook_ClearGuestDest1:
+        lda c128_dir_dest_lo
         sta _fill_dst_lo
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         sta _fill_dst_hi
 
         lda #$00
@@ -1659,21 +1659,21 @@ _fill_dst_lo:
         .byte $00
 _fill_dst_hi:
         .byte $00
-        .byte P4_BANK_RAM
+        .byte C128_BANK_RAM
         .byte $00
         .word $0000
         rts
 
 ; --- Memory write helpers ---
-P4MEM_WriteA:
-        sta p4_data
-        jsr P4MEM_Write
+C128_WriteA:
+        sta c128_data
+        jsr C128_Write
         rts
 
-P4MEM_WriteA0:
+C128_WriteA0:
         lda #$00
-        sta p4_data
-        jsr P4MEM_Write
+        sta c128_data
+        jsr C128_Write
         rts
 
 
@@ -1682,20 +1682,20 @@ P4MEM_WriteA0:
 ; ============================================================
 
 ; Called when PC = $C8BC (DIRECTORY keyword entry)
-P4HOOK_OnDIRECTORY:
+C128Hook_OnDIRECTORY:
         ; ------------------------------------------------------------
         ; DIRECTORY hook (print-only, do not alter BASIC program memory)
         ;
         ; We mimic the ROM strategy: OPEN a directory channel and read
         ; bytes via CHRIN, sending them to the guest console.
         ;
-        ; We try secondary address $60 first (what the Plus/4 KERNAL uses),
+        ; We try secondary address $60 first (what the C128 KERNAL uses),
         ; and fall back to $00 if needed on the host filesystem.
         ; ------------------------------------------------------------
 
         ; Reset any stale bitmap mode flags to prevent graphics glitch
         lda #0
-        sta p4_gfx_dirty
+        sta c128_gfx_dirty
         
         ; Ensure host KERNAL I/O uses bank 0
         lda #$00
@@ -1703,54 +1703,54 @@ P4HOOK_OnDIRECTORY:
         jsr SETBNK
 
         ; Name = "$"
-        ldx #<p4_dir_name
-        ldy #>p4_dir_name
+        ldx #<c128_dir_name
+        ldy #>c128_dir_name
         lda #$01
         jsr SETNAM
 
-        ; Try OPEN with SA=$60 (Plus/4 style)
+        ; Try OPEN with SA=$60 (C128 style)
         lda #$02                        ; logical file #
         ldx #$08                        ; device 8
         ldy #$60                        ; secondary for directory
         jsr SETLFS
-        jsr P4_OPEN
+        jsr C128_OPEN
 
-        jsr P4_READST
+        jsr C128_READST
         beq _dir_open_ok
 
         ; Fall back: try OPEN with SA=$00
         lda #$02
-        jsr P4_CLOSE
+        jsr C128_CLOSE
 
         lda #$02
         ldx #$08
         ldy #$00
         jsr SETLFS
-        jsr P4_OPEN
+        jsr C128_OPEN
 
-        jsr P4_READST
+        jsr C128_READST
         bne _dir_open_fail
 
 _dir_open_ok:
         ; Make it the current input channel
         ldx #$02
-        jsr P4_CHKIN
+        jsr C128_CHKIN
 
         ; ---- Directory stream is a BASIC "program" ----
         ; First two bytes are the LOAD address ($0401 typically). Discard them.
-        jsr P4_CHRIN
-        jsr P4_CHRIN
+        jsr C128_CHRIN
+        jsr C128_CHRIN
 
 _dir_line_loop:
         ; If EOF flagged, bail (safety)
-        jsr P4_READST
+        jsr C128_READST
         and #$40                        ; EOF?
         bne _dir_done
 
         ; Read next-line pointer (lo/hi)
-        jsr P4_CHRIN
+        jsr C128_CHRIN
         sta _dir_nextptr
-        jsr P4_CHRIN
+        jsr C128_CHRIN
         sta _dir_nextptr+1
 
         ; 0000 means end-of-program
@@ -1759,9 +1759,9 @@ _dir_line_loop:
         beq _dir_done
 
         ; Read "line number" (lo/hi) which is blocks used/free
-        jsr P4_CHRIN
+        jsr C128_CHRIN
         sta _dir_blocks
-        jsr P4_CHRIN
+        jsr C128_CHRIN
         sta _dir_blocks+1
 
         jsr _dir_print_blocks_u16_left4_sp   ; prints number + pads + trailing space
@@ -1769,7 +1769,7 @@ _dir_line_loop:
 
         ; Print text bytes until $00 (end of line)
 _dir_text_loop:
-        jsr P4_CHRIN
+        jsr C128_CHRIN
         beq _dir_eol
 
         ; D81/1581 padding uses $A0 - treat it like space
@@ -1777,13 +1777,13 @@ _dir_text_loop:
         bne _dir_put
         lda #$20
 _dir_put:
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         jmp _dir_text_loop
 
 _dir_eol:
         ; End of "line" -> newline
         lda #$0D
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         jmp _dir_line_loop
 
 
@@ -1850,7 +1850,7 @@ _dir_print_blocks_u16_left4_sp:
         bcs _dir_pad_done
 _dir_pad_loop:
         lda #$20
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         inc _dir_ndig
         lda _dir_ndig
         cmp #4
@@ -1858,7 +1858,7 @@ _dir_pad_loop:
 _dir_pad_done:
         ; One trailing separator space
         lda #$20
-        jmp P4Host_PutChar
+        jmp C128Host_PutChar
 
 
 _dir_ndig:      .byte 0
@@ -1894,14 +1894,14 @@ _dir_sub_done_nl:
         lda _dir_ndig
         beq _dir_emit_digit_nl_rts
         lda #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         inc _dir_ndig
         rts
 _dir_print_digit_nl:
         tya
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         inc _dir_ndig
 _dir_emit_digit_nl_rts:
         rts
@@ -1932,7 +1932,7 @@ _dir_sub_done_1c:
         tya
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         inc _dir_ndig
         rts
 
@@ -1942,15 +1942,15 @@ _dir_div:
         .byte $00, $00
 
 _dir_done:
-        jsr P4_CLRCHN
+        jsr C128_CLRCHN
         lda #$02
-        jsr P4_CLOSE
+        jsr C128_CLOSE
 
         ; Re-unlock VIC-IV after file operations (don't reset video mode)
-        jsr P4HOOK_UnlockVIC
+        jsr C128Hook_UnlockVIC
         
         ; Return to BASIC via RTS
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 _tmplinectr:
@@ -1958,23 +1958,23 @@ _tmplinectr:
 
 _dir_open_fail:
         ; Couldn't open directory channel. Just return to BASIC.
-        jsr P4HOOK_UnlockVIC
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_UnlockVIC
+        jsr C128Hook_RTS_Guest
         rts
 
 
  .byte 0
-p4dir_end_hi: .byte 0
-p4dir_end_lo: .byte 0
-p4dir_len_lo: .byte 0
-p4dir_len_hi: .byte 0
+c128dir_end_hi: .byte 0
+c128dir_end_lo: .byte 0
+c128dir_len_lo: .byte 0
+c128dir_len_hi: .byte 0
 
 
 ; Zero page pointer for directory parsing
 DIR_PTR         = $FB           ; 2 bytes (shared with GC_PTR when not printing)
 
 ; ============================================================
-; P4HOOK_PrintDirectory - Parse and print CBM directory format
+; C128Hook_PrintDirectory - Parse and print CBM directory format
 ; 
 ; CBM directory format in memory:
 ;   First line: load address (2 bytes), link (2 bytes), line# (2 bytes), 
@@ -1983,11 +1983,11 @@ DIR_PTR         = $FB           ; 2 bytes (shared with GC_PTR when not printing)
 ;               filename in quotes, type
 ;   Last line: "BLOCKS FREE"
 ; ============================================================
-P4HOOK_PrintDirectory:
+C128Hook_PrintDirectory:
         ; Set up pointer to start of directory data
-        lda #<P4_DIR_BUF
+        lda #<C128_DIR_BUF
         sta DIR_PTR
-        lda #>P4_DIR_BUF
+        lda #>C128_DIR_BUF
         sta DIR_PTR+1
         
         ; Skip load address (2 bytes)
@@ -1996,11 +1996,11 @@ P4HOOK_PrintDirectory:
 _dir_next_line:
         ; Check if we've reached end of data
         lda DIR_PTR+1
-        cmp p4dir_end_hi
+        cmp c128dir_end_hi
         bcc _dir_process_line
         bne _dir_done
         lda DIR_PTR
-        cmp p4dir_end_lo
+        cmp c128dir_end_lo
         bcs _dir_done
         
 _dir_process_line:
@@ -2026,19 +2026,19 @@ _dir_process_line:
         
         ; Print space
         lda #' '
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         
         ; Print rest of line until null
 _dir_print_chars:
         jsr _dir_read_byte
         beq _dir_line_done              ; Null = end of line
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         jmp _dir_print_chars
         
 _dir_line_done:
         ; Print newline
         lda #$0d
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         
         ; Next line
         jmp _dir_next_line
@@ -2094,7 +2094,7 @@ _print_10000:
 _print_10000_digit:
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         ldy #1                          ; No longer leading
 _skip_10000:
 
@@ -2121,7 +2121,7 @@ _print_1000:
 _print_1000_digit:
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         ldy #1
 _skip_1000:
 
@@ -2144,7 +2144,7 @@ _print_100:
 _print_100_digit:
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         ldy #1
 _skip_100:
 
@@ -2167,14 +2167,14 @@ _print_10:
 _print_10_digit:
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
 _skip_10:
 
         ; 1s place - always print
         lda _dir_blocks_lo
         clc
         adc #'0'
-        jsr P4Host_PutChar
+        jsr C128Host_PutChar
         
         rts
 
@@ -2188,36 +2188,36 @@ _dir_digit:     .byte 0
 
 
 
-P4HOOK_RTS_Guest:
-        ldy p4_sp
+C128Hook_RTS_Guest:
+        ldy c128_sp
         iny
-        sty p4_sp
+        sty c128_sp
         lda #$01
-        sta p4_addr_hi
+        sta c128_addr_hi
         tya
-        sta p4_addr_lo
-        jsr P4MEM_Read
+        sta c128_addr_lo
+        jsr C128_Read
         sta tmp_lo
 
-        ldy p4_sp
+        ldy c128_sp
         iny
-        sty p4_sp
+        sty c128_sp
         lda #$01
-        sta p4_addr_hi
+        sta c128_addr_hi
         tya
-        sta p4_addr_lo
-        jsr P4MEM_Read
+        sta c128_addr_lo
+        jsr C128_Read
         sta tmp_hi
 
         clc
         lda tmp_lo
         adc #$01
-        sta p4_pc_lo
+        sta c128_pc_lo
         lda tmp_hi
         adc #$00
-        sta p4_pc_hi
+        sta c128_pc_hi
         lda #1
-        sta p4_hook_pc_changed    ; Signal to threaded interpreter
+        sta c128_hook_pc_changed    ; Signal to threaded interpreter
         rts
 
 
@@ -2229,7 +2229,7 @@ P4HOOK_RTS_Guest:
 ; SD card through the host MEGA65 KERNAL.
 ;
 ; Only device 8 (disk) is intercepted. Other devices (keyboard,
-; screen, serial, etc.) are passed through to the Plus/4 ROM.
+; screen, serial, etc.) are passed through to the C128 ROM.
 ; ============================================================
 
 
@@ -2239,17 +2239,17 @@ P4HOOK_RTS_Guest:
 ; The MEGA65 host KERNAL can change VIC-IV registers during file
 ; operations. We just re-unlock VIC-IV after each call.
 
-P4HOOK_SaveVIC:
+C128Hook_SaveVIC:
         rts
 
-P4HOOK_RestoreVIC:
+C128Hook_RestoreVIC:
         ; Just re-unlock VIC-IV, don't reinitialize entire video
-        jsr P4HOOK_UnlockVIC
+        jsr C128Hook_UnlockVIC
         rts
 
 ; Lighter version - just re-unlock VIC-IV without changing mode
 ; Use this when we want to preserve graphics mode
-P4HOOK_UnlockVIC:
+C128Hook_UnlockVIC:
         ; Re-unlock VIC-III
         lda #$A5
         sta $D02F
@@ -2271,7 +2271,7 @@ P4HOOK_UnlockVIC:
 
 
 ; ============================================================
-; P4HOOK_OnOPEN - Handle OPEN command
+; C128Hook_OnOPEN - Handle OPEN command
 ; 
 ; Guest state on entry:
 ;   SETLFS has set: $AC=LFN, $AD=SA, $AE=device
@@ -2279,7 +2279,7 @@ P4HOOK_UnlockVIC:
 ;
 ; We intercept device 8 only. Other devices fall through to ROM.
 ; ============================================================
-P4HOOK_OnOPEN:
+C128Hook_OnOPEN:
         ; Check if this is device 8
         lda LOW_RAM_BUFFER + $AE        ; Device number
         cmp #$08
@@ -2290,7 +2290,7 @@ P4HOOK_OnOPEN:
 _open_disk:
         ; Reset stale graphics flags before file operations
         lda #0
-        sta p4_gfx_dirty
+        sta c128_gfx_dirty
         
         ; Check filename length
         ; Empty filename (length 0) is allowed for command channel reads
@@ -2358,13 +2358,13 @@ _open_copy_low:
 _open_copy_bank5:
         ; Filename is in bank 5 (RAM under ROM or higher RAM)
         lda LOW_RAM_BUFFER + $AF
-        sta P4_MEM_PTR
+        sta C128_MEM_PTR
         lda LOW_RAM_BUFFER + $B0
-        sta P4_MEM_PTR+1
+        sta C128_MEM_PTR+1
         lda #BANK_RAM
-        sta P4_MEM_PTR+2
+        sta C128_MEM_PTR+2
         lda #$00
-        sta P4_MEM_PTR+3
+        sta C128_MEM_PTR+3
         
         ldy #0
 _open_copy_b5_loop:
@@ -2372,7 +2372,7 @@ _open_copy_b5_loop:
         beq _open_copy_done
         tya
         taz
-        lda [P4_MEM_PTR],z
+        lda [C128_MEM_PTR],z
         sta seq_filename,y
         iny
         cpy #17
@@ -2406,14 +2406,14 @@ _open_copy_done:
         jsr SETLFS
         
         ; Save VIC state before host KERNAL call
-        jsr P4HOOK_SaveVIC
+        jsr C128Hook_SaveVIC
         
         ; Call host OPEN
         jsr OPEN
         php                             ; Save carry (error flag)
         
         ; Restore VIC state after host call
-        jsr P4HOOK_RestoreVIC
+        jsr C128Hook_RestoreVIC
         
         plp                             ; Restore carry
         bcs _open_error_host
@@ -2432,11 +2432,11 @@ _open_copy_done:
         sta seq_slot_open,x
         
         ; ============================================================
-        ; IMPORTANT: Update Plus/4 KERNAL file tables so ROM knows
+        ; IMPORTANT: Update C128 KERNAL file tables so ROM knows
         ; the file is open. Without this, CLOSE will fail with
         ; "FILE NOT OPEN" error.
         ;
-        ; Plus/4 file table locations:
+        ; C128 file table locations:
         ;   $97 = LDTND (number of open files, index for next entry)
         ;   $0509-$0512 = LAT (Logical file numbers) - 10 entries
         ;   $0513-$051C = FAT (Device numbers) - 10 entries
@@ -2446,7 +2446,7 @@ _open_copy_done:
         cpx #10
         bcs _open_table_full            ; Max 10 files
         
-        ; Store in Plus/4 tables (these are in low RAM, not ZP)
+        ; Store in C128 tables (these are in low RAM, not ZP)
         lda _open_guest_lfn
         sta LOW_RAM_BUFFER + $0509,x    ; LAT[x] = LFN
         lda #$08
@@ -2463,12 +2463,12 @@ _open_table_full:
         ; Set success status in guest
         lda #$00
         sta LOW_RAM_BUFFER + $90        ; Clear status
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)             ; Clear carry
-        sta p4_p
+        sta c128_p
         
         ; Return via RTS to guest
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 _open_error_host:
@@ -2485,12 +2485,12 @@ _open_error_no_file:
         lda #$04                        ; FILE NOT FOUND
         
 _open_set_error:
-        sta p4_a
+        sta c128_a
         sta LOW_RAM_BUFFER + $90        ; Set status
-        lda p4_p
+        lda c128_p
         ora #P_C                        ; Set carry
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _open_guest_lfn: .byte 0
@@ -2499,13 +2499,13 @@ _open_slot:      .byte 0
 
 
 ; ============================================================
-; P4HOOK_OnCLOSE - Handle CLOSE command
+; C128Hook_OnCLOSE - Handle CLOSE command
 ;
 ; Guest A register contains LFN to close
 ; ============================================================
-P4HOOK_OnCLOSE:
+C128Hook_OnCLOSE:
         ; Get LFN from guest A
-        lda p4_a
+        lda c128_a
         sta _close_lfn
         
         ; Find slot with this LFN
@@ -2528,7 +2528,7 @@ _close_found:
         beq _close_not_open
         
         ; Save VIC state before host KERNAL call
-        jsr P4HOOK_SaveVIC
+        jsr C128Hook_SaveVIC
         
         ; Clear host channels before closing
         jsr CLRCHN
@@ -2540,7 +2540,7 @@ _close_found:
         jsr CLOSE
         
         ; Restore VIC state after host call
-        jsr P4HOOK_RestoreVIC
+        jsr C128Hook_RestoreVIC
         
         ; Clear slot
         ldx _close_slot
@@ -2561,11 +2561,11 @@ _close_found:
         sta seq_output_slot
 +
         ; ============================================================
-        ; Remove entry from Plus/4 KERNAL file tables
+        ; Remove entry from C128 KERNAL file tables
         ; We need to find the entry with matching LFN and remove it
         ; by shifting all subsequent entries down
         ;
-        ; Plus/4 file table locations:
+        ; C128 file table locations:
         ;   $97 = LDTND (file count)
         ;   $0509-$0512 = LAT (Logical file numbers)
         ;   $0513-$051C = FAT (Device numbers)
@@ -2616,10 +2616,10 @@ _close_copy_last:
 _close_table_done:
 _close_not_open:
         ; Success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _close_lfn:  .byte 0
@@ -2627,13 +2627,13 @@ _close_slot: .byte 0
 
 
 ; ============================================================
-; P4HOOK_OnCHKIN - Set input channel
+; C128Hook_OnCHKIN - Set input channel
 ;
 ; Guest X register contains LFN
 ; ============================================================
-P4HOOK_OnCHKIN:
+C128Hook_OnCHKIN:
         ; Get LFN from guest X
-        lda p4_x
+        lda c128_x
         sta _chkin_lfn
         
         ; Find slot with this LFN
@@ -2664,34 +2664,34 @@ _chkin_found:
         jsr CHKIN
         
         ; Success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _chkin_not_open:
         ; File not open error
         lda #$03
-        sta p4_a
+        sta c128_a
         sta LOW_RAM_BUFFER + $90
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _chkin_lfn: .byte 0
 
 
 ; ============================================================
-; P4HOOK_OnCHKOUT - Set output channel
+; C128Hook_OnCHKOUT - Set output channel
 ;
 ; Guest X register contains LFN
 ; ============================================================
-P4HOOK_OnCHKOUT:
+C128Hook_OnCHKOUT:
         ; Get LFN from guest X
-        lda p4_x
+        lda c128_x
         sta _chkout_lfn
         
         ; LFN 0 = screen (let ROM handle)
@@ -2726,30 +2726,30 @@ _chkout_found:
         jsr CHKOUT
         
         ; Success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _chkout_not_open:
         ; File not open error
         lda #$03
-        sta p4_a
+        sta c128_a
         sta LOW_RAM_BUFFER + $90
-        lda p4_p
+        lda c128_p
         ora #P_C
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _chkout_lfn: .byte 0
 
 
 ; ============================================================
-; P4HOOK_OnCLRCHN - Clear channels (reset to keyboard/screen)
+; C128Hook_OnCLRCHN - Clear channels (reset to keyboard/screen)
 ; ============================================================
-P4HOOK_OnCLRCHN:
+C128Hook_OnCLRCHN:
         ; Check if we have any active channels
         lda seq_input_slot
         cmp #$FF
@@ -2768,7 +2768,7 @@ _clrchn_check_out:
 
 
 ; ============================================================
-; P4HOOK_OnPRIMM - Handle PRIMM (print immediate string)
+; C128Hook_OnPRIMM - Handle PRIMM (print immediate string)
 ;
 ; PRIMM is called via JSR $FA17 (or JMP $FA17 from $FF7D).
 ; The string follows inline after the JSR. The return address
@@ -2781,25 +2781,25 @@ _clrchn_check_out:
 ; 4. Update return address to point past null terminator
 ; 5. Simulate RTS
 ; ============================================================
-P4HOOK_OnPRIMM:
+C128Hook_OnPRIMM:
         ; Get return address from guest stack
         ; SP points below the return address
         ; But PRIMM pushes A, X, Y first: 3 bytes
         ; Actually - we catch at $FA17 BEFORE any pushes happen
         ; So the stack has the JSR return address at SP+1/SP+2
-        lda p4_sp
+        lda c128_sp
         clc
         adc #1
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$01
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_ReadFast       ; return addr lo
         sta _primm_ptr_lo
 
-        lda p4_sp
+        lda c128_sp
         clc
         adc #2
-        sta p4_addr_lo
+        sta c128_addr_lo
         jsr C128_ReadFast       ; return addr hi
         sta _primm_ptr_hi
 
@@ -2811,9 +2811,9 @@ P4HOOK_OnPRIMM:
 _primm_loop:
         ; Read next string byte
         lda _primm_ptr_lo
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda _primm_ptr_hi
-        sta p4_addr_hi
+        sta c128_addr_hi
         jsr C128_ReadFast
         
         ; Null terminator?
@@ -2821,7 +2821,7 @@ _primm_loop:
 
         ; Output character via screen write to guest screen RAM
         ; Store char in guest A and call the screen editor output
-        sta p4_a
+        sta c128_a
         
         ; Write to C128 screen RAM directly
         ; Use the guest's cursor position from ZP $EB (row) and $EC (col)
@@ -2839,26 +2839,26 @@ _primm_end:
         ; _primm_ptr now points to the null terminator
         ; Set return address to null terminator address
         ; (RTS will add 1, so execution continues after the null)
-        lda p4_sp
+        lda c128_sp
         clc
         adc #1
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda #$01
-        sta p4_addr_hi
+        sta c128_addr_hi
         lda _primm_ptr_lo
-        sta p4_data
+        sta c128_data
         jsr C128_Write          ; update return addr lo
 
-        lda p4_sp
+        lda c128_sp
         clc
         adc #2
-        sta p4_addr_lo
+        sta c128_addr_lo
         lda _primm_ptr_hi
-        sta p4_data
+        sta c128_data
         jsr C128_Write          ; update return addr hi
 
         ; Now simulate RTS - pop return address and jump there+1
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 _primm_ptr_lo: .byte 0
@@ -2866,16 +2866,16 @@ _primm_ptr_hi: .byte 0
 
 
 ; ============================================================
-; P4HOOK_OnCHRIN - Character input
+; C128Hook_OnCHRIN - Character input
 ;
 ; If input is from a file we manage, read from host.
 ; Otherwise let ROM handle (keyboard input).
 ; ============================================================
-P4HOOK_OnCHRIN:
+C128Hook_OnCHRIN:
 
         ; Reset stale graphics flags before file operations
         lda #0
-        sta p4_gfx_dirty
+        sta c128_gfx_dirty
         
         ; We're reading from a file
         ldx seq_input_slot
@@ -2886,14 +2886,14 @@ P4HOOK_OnCHRIN:
         bne _chrin_eof
         
         ; Save VIC state before host KERNAL call
-        jsr P4HOOK_SaveVIC
+        jsr C128Hook_SaveVIC
         
         ; Read from host
         jsr CHRIN
         sta _chrin_byte
         
         ; Restore VIC state after host KERNAL call
-        jsr P4HOOK_RestoreVIC
+        jsr C128Hook_RestoreVIC
         
         ; Check host status
         jsr READST
@@ -2909,26 +2909,26 @@ P4HOOK_OnCHRIN:
         
         ; Return the byte in guest A
         lda _chrin_byte
-        sta p4_a
+        sta c128_a
         
         ; Clear carry for success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
+        sta c128_p
         
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 _chrin_eof:
         ; Already at EOF - return 0 with status
         lda #$00
-        sta p4_a
+        sta c128_a
         lda #$40
         sta LOW_RAM_BUFFER + $90
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 _chrin_byte:   .byte 0
@@ -2936,29 +2936,29 @@ _chrin_status: .byte 0
 
 
 ; ============================================================
-; P4HOOK_OnCHROUT - Character output
+; C128Hook_OnCHROUT - Character output
 ;
 ; If output is to a file we manage, write to host.
 ; Otherwise let ROM handle (screen output).
 ; ============================================================
-P4HOOK_OnCHROUT:
+C128Hook_OnCHROUT:
         ; We're writing to a file (dispatcher already verified seq_output_slot != $FF)
         
         ; Reset stale graphics flags before file operations
         lda #0
-        sta p4_gfx_dirty
+        sta c128_gfx_dirty
         
         ; Save VIC state before host KERNAL call
-        jsr P4HOOK_SaveVIC
+        jsr C128Hook_SaveVIC
         
         ; Get byte from guest A
-        lda p4_a
+        lda c128_a
         
         ; Write to host
         jsr CHROUT
         
         ; Restore VIC state after host call
-        jsr P4HOOK_RestoreVIC
+        jsr C128Hook_RestoreVIC
         
         ; Check status
         jsr READST
@@ -2968,16 +2968,16 @@ P4HOOK_OnCHROUT:
         sta LOW_RAM_BUFFER + $90
         
         ; Clear carry for success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
+        sta c128_p
         
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 
 ; ============================================================
-; P4HOOK_OnGETIN - Get character input (used by GET#)
+; C128Hook_OnGETIN - Get character input (used by GET#)
 ;
 ; If input is from a file we manage, read from host.
 ; Otherwise let ROM handle (keyboard input).
@@ -2985,11 +2985,11 @@ P4HOOK_OnCHROUT:
 ; GETIN differs from CHRIN in that it's non-blocking for keyboard
 ; and returns 0 if no key is pressed. For files, it works the same.
 ; ============================================================
-P4HOOK_OnGETIN:
+C128Hook_OnGETIN:
 
         ; Reset stale graphics flags before file operations
         lda #0
-        sta p4_gfx_dirty
+        sta c128_gfx_dirty
         
         ; We're reading from a file - same as CHRIN
         ldx seq_input_slot
@@ -3000,14 +3000,14 @@ P4HOOK_OnGETIN:
         bne _getin_eof
         
         ; Save VIC state before host KERNAL call
-        jsr P4HOOK_SaveVIC
+        jsr C128Hook_SaveVIC
         
         ; Read from host using CHRIN (GETIN uses same mechanism for files)
         jsr CHRIN
         sta _getin_byte
         
         ; Restore VIC state after host KERNAL call
-        jsr P4HOOK_RestoreVIC
+        jsr C128Hook_RestoreVIC
         
         ; Check host status
         jsr READST
@@ -3023,26 +3023,26 @@ P4HOOK_OnGETIN:
         
         ; Return the byte in guest A
         lda _getin_byte
-        sta p4_a
+        sta c128_a
         
         ; Clear carry for success
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
+        sta c128_p
         
-        jsr P4HOOK_RTS_Guest
+        jsr C128Hook_RTS_Guest
         rts
 
 _getin_eof:
         ; Already at EOF - return 0 with status
         lda #$00
-        sta p4_a
+        sta c128_a
         lda #$40
         sta LOW_RAM_BUFFER + $90
-        lda p4_p
+        lda c128_p
         and #((~P_C) & $FF)
-        sta p4_p
-        jsr P4HOOK_RTS_Guest
+        sta c128_p
+        jsr C128Hook_RTS_Guest
         rts
 
 
@@ -3050,52 +3050,52 @@ _getin_byte:   .byte 0
 _getin_status: .byte 0
 
 ; ============================================================
-; P4HOOK_PostFileOpVideoFix
-; If the last host file operation set Carry in p4_p (error),
+; C128Hook_PostFileOpVideoFix
+; If the last host file operation set Carry in c128_p (error),
 ; force emulator back to text mode. On success, do nothing.
 ; This specifically fixes host KERNAL error-path leaving VIC-IV
 ; in a different mode after ?FILE NOT FOUND, etc.
 ; ============================================================
-P4HOOK_PostFileOpVideoFix:
-        lda p4_p
+C128Hook_PostFileOpVideoFix:
+        lda c128_p
         and #P_C
         beq _pfov_done
 
         ; Error: force text mode
         lda #0
-        sta p4_video_mode
-        jsr P4VID_DisableHostBitmap
-        jsr P4MEM_InitVideo
+        sta c128_video_mode
+        jsr C128Vid_DisableHostBitmap
+        jsr C128_VideoInit
 
 _pfov_done:
         rts
 
 ; ============================================================
-; P4HOOK_SyncLowRAMFromBank5 - Sync LOW_RAM_BUFFER from bank 5
+; C128Hook_SyncLowRAMFromBank5 - Sync LOW_RAM_BUFFER from bank 5
 ; Called after loading directly to bank 5 to update the cached
 ; copy of $0000-$0FFF in LOW_RAM_BUFFER
 ; ============================================================
-P4HOOK_SyncLowRAMFromBank5:
+C128Hook_SyncLowRAMFromBank5:
         ; Check if load touched low RAM area ($0000-$0FFF)
         ; If dest >= $1000, no need to sync
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         cmp #$10
         bcs _sync_b5_done               ; dest >= $1000, nothing to sync
         
         ; Calculate the range to sync
         ; Start = dest address (clamped to $0000)
-        lda p4_dir_dest_lo
+        lda c128_dir_dest_lo
         sta _sync_b5_start_lo
-        lda p4_dir_dest_hi
+        lda c128_dir_dest_hi
         sta _sync_b5_start_hi
         
         ; End = min(dest + len, $1000)
         clc
-        lda p4_dir_dest_lo
-        adc p4_dir_len_lo
+        lda c128_dir_dest_lo
+        adc c128_dir_len_lo
         sta _sync_b5_end_lo
-        lda p4_dir_dest_hi
-        adc p4_dir_len_hi
+        lda c128_dir_dest_hi
+        adc c128_dir_len_hi
         sta _sync_b5_end_hi
         
         ; Clamp end to $1000
@@ -3167,7 +3167,7 @@ _sync_b5_dma_count:
         .word $0000                     ; Count (filled in)
 _sync_b5_dma_src:
         .word $0000                     ; Source address (filled in)
-        .byte P4_BANK_RAM               ; Source bank 5
+        .byte C128_BANK_RAM               ; Source bank 5
 _sync_b5_dma_dst:
         .word $0000                     ; Dest address (filled in = LOW_RAM_BUFFER + offset)
         .byte $00                       ; Dest bank 0

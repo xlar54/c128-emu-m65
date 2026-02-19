@@ -242,17 +242,17 @@ start:
 
 main_loop:
         ; --- Check if print requested ---
-        lda p4h_print_pending
+        lda c128h_print_pending
         beq _no_print_start
-        jsr P4Host_StartPrint
+        jsr C128Host_StartPrint
 
 _no_print_start:
         jsr C128_CPUStepMultiple  ; Execute batch of 8502 instructions
 
         ; --- If printing, check if done ---
-        lda p4h_print_active
+        lda c128h_print_active
         beq _no_print_check
-        jsr P4Host_CheckPrintDone
+        jsr C128Host_CheckPrintDone
 
 _no_print_check:
         jmp main_loop
@@ -318,8 +318,8 @@ rom_fail_msg:
         ;.include "c128_monitor.asm"  ; DISABLED - writes to bank 1, corrupts ROMs
 
 ; Stub out monitor entry points
-P4MON_Check:
+C128Mon_Check:
         clc             ; carry clear = no monitor
         rts
-P4MON_Enter:
+C128Mon_Enter:
         rts
