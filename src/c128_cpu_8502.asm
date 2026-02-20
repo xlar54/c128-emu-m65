@@ -859,8 +859,11 @@ _vic_next_line:
 ; VIC_FrameTasks - Called once per frame (at raster line 0)
 ; ============================================================
 VIC_FrameTasks:
-        ; TODO: Video frame update (charset sync, bitmap render, etc.)
-        ; jsr C128_VID_Frame
+        ; VDC 80-column rendering (only when in 80-col mode)
+        lda vdc_mode_active
+        beq _skip_vdc_render
+        jsr VDC_RenderFrame
+_skip_vdc_render:
 
         ; Cursor blink (text mode only)
         lda c128_video_mode
@@ -886,14 +889,54 @@ _frame_done:
 ; ============================================================
 
 ; hook_vdc_screen_clear - Skip $CE0C VDC RAM clear loop
-; Sets VDC shadow regs and advances PC to the RTS at $CE4B
+; In 80-col mode, we must actually clear VDC screen and attribute RAM.
+; The KERNAL clears screen ($0000-$07CF) with spaces ($20) and
+; attributes ($0800-$09CF) with the default attribute byte.
+; We do this via DMA fill to bank 3 VDC RAM at $32000, then set VDC regs as the
+; KERNAL would have after the loop, and skip to the RTS at $CE4B.
 hook_vdc_screen_clear:
+        ; Clear VDC screen RAM ($0000-$07CF) with $20 (space)
+        ; VDC RAM is at $32000: screen at $32000, attrs at $32800
+        lda #$00
+        sta $D707               ; Enhanced DMA job
+        .byte $80, $00          ; src MB = $00 (don't care for fill)
+        .byte $81, $00          ; dst MB = $00 (chip RAM)
+        .byte $00               ; end options
+        .byte $03               ; fill command
+        .word 2000              ; count = 2000 bytes
+        .word $0020             ; fill value = $20 (space char)
+        .byte $00               ; src bank (ignored for fill)
+        .word $2000             ; dst addr = $2000 ($32000 = VDC screen)
+        .byte $03               ; dst bank = 3
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+
+        ; Clear VDC attribute RAM ($0800-$09CF) with default attr
+        ; Default: $07 = light cyan foreground, no flags
+        lda #$00
+        sta $D707               ; Enhanced DMA job
+        .byte $80, $00          ; src MB = $00 (don't care for fill)
+        .byte $81, $00          ; dst MB = $00 (chip RAM)
+        .byte $00               ; end options
+        .byte $03               ; fill command
+        .word 2000              ; count = 2000 bytes
+        .word $0007             ; fill value = $07 (cyan, no flags)
+        .byte $00               ; src bank (ignored for fill)
+        .word $2800             ; dst addr = $2800 ($32800 = VDC attrs)
+        .byte $03               ; dst bank = 3
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+
+        ; Update VDC shadow registers as KERNAL would after clear
+        ; R18:R19 = address after last write
         lda #$20
         ldx #18
         sta vdc_regs,x
         lda #$00
         ldx #19
         sta vdc_regs,x
+
+        ; Update guest ZP $DA/$DB (used by KERNAL screen editor)
         #setup_bank4_zp
         ldz #$DA
         lda #$00
@@ -901,6 +944,8 @@ hook_vdc_screen_clear:
         ldz #$DB
         lda #$E0
         sta [C128_MEM_PTR],z
+
+        ; Skip to RTS at $CE4B
         lda #$4B
         sta c128_pc_lo
         lda #$CE
@@ -1017,16 +1062,23 @@ cpu_take_irq:
         lda c128_p
         ora #P_I
         sta c128_p
-        ; Load IRQ vector from $FFFE/$FFFF
+        ; Load IRQ vector from $FFFE/$FFFF - ALWAYS from ROM
+        ; On real C128, vectors bypass MMU and always read from KERNAL ROM
+        ; $FFFE is in $F800+ range, so read from relocation area at $12000
+        ; $FFFE -> $12000 + ($FFFE - $F800) = $127FE
         lda #$FE
-        sta c128_addr_lo
-        lda #$FF
-        sta c128_addr_hi
-        jsr C128_ReadFast
+        sta C128_MEM_PTR+0
+        lda #$27                ; $F8->$20, $FF->$27
+        sta C128_MEM_PTR+1
+        lda #BANK_ROM           ; bank 1
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; read $127FE = lo byte
         sta c128_pc_lo
-        lda #$FF
-        sta c128_addr_lo
-        jsr C128_ReadFast
+        inz
+        lda [C128_MEM_PTR],z    ; read $127FF = hi byte
         sta c128_pc_hi
         rts
 
@@ -1053,16 +1105,21 @@ cpu_take_nmi:
         lda c128_p
         ora #P_I
         sta c128_p
-        ; Load NMI vector from $FFFA/$FFFB
+        ; Load NMI vector from $FFFA/$FFFB - ALWAYS from ROM
+        ; $FFFA -> $12000 + ($FFFA - $F800) = $127FA
         lda #$FA
-        sta c128_addr_lo
-        lda #$FF
-        sta c128_addr_hi
-        jsr C128_ReadFast
+        sta C128_MEM_PTR+0
+        lda #$27                ; $FF->$27
+        sta C128_MEM_PTR+1
+        lda #BANK_ROM           ; bank 1
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; read $127FA = lo byte
         sta c128_pc_lo
-        lda #$FB
-        sta c128_addr_lo
-        jsr C128_ReadFast
+        inz
+        lda [C128_MEM_PTR],z    ; read $127FB = hi byte
         sta c128_pc_hi
         rts
 
@@ -1120,8 +1177,98 @@ C128_CPUReset:
         sta c128_sp
         lda #(P_I|P_U)
         sta c128_p
-        
+
         ; Get reset vector from ROM ($FFFC/$FFFD)
+        lda #$fc
+        sta c128_addr_lo
+        lda #$ff
+        sta c128_addr_hi
+        jsr C128_ReadFast
+        sta c128_pc_lo
+        lda #$fd
+        sta c128_addr_lo
+        jsr C128_ReadFast
+        sta c128_pc_hi
+        lda #0
+        sta c128_code_valid
+        rts
+
+; VDC test program data removed (test passed - VDC pipeline works)
+; To re-enable, uncomment and change C128_CPUReset to inject at $3000
+
+; ============================================================
+; fix_80col_zp_vars - Write correct 80-col screen editor ZP values
+; Called once when BASIC starts ($B000) in 80-col mode.
+; CINT's screen clear corrupts $E0-$FA with $20 (spaces).
+; We restore them to the correct values from VICE.
+; Also fix $D5 (LNMX) and $DA/$DB (screen line ptr).
+; ============================================================
+fix_80col_zp_vars:
+        ; Write $E0-$FA from table
+        ldx #0
+_fix_zp_loop:
+        lda vice_80col_zp,x
+        sta c128_data
+        txa
+        clc
+        adc #$E0
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        phx
+        jsr C128_Write
+        plx
+        inx
+        cpx #27                 ; 27 bytes: $E0-$FA
+        bcc _fix_zp_loop
+
+        ; Fix $D5 (LNMX) = $4F (79 = 80 columns - 1)
+        lda #$4F
+        sta c128_data
+        lda #$D5
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Write
+
+        ; Fix $D7 (MODE) = $80 (80-col flag)
+        lda #$80
+        sta c128_data
+        lda #$D7
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; Fix $DA (screen line ptr lo) = $00
+        lda #$00
+        sta c128_data
+        lda #$DA
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; Fix $DB (screen line ptr hi) = $04
+        lda #$04
+        sta c128_data
+        lda #$DB
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; Fix $0A03 = $50 (Z80 boot signature)
+        lda #$50
+        sta c128_data
+        lda #$03
+        sta c128_addr_lo
+        lda #$0A
+        sta c128_addr_hi
+        jsr C128_Write
+
+        rts
+
+; 80-col screen editor ZP values ($E0-$FA) from VICE
+vice_80col_zp:
+        .byte $30, $02, $30, $0A, $18, $00, $00, $4F
+        .byte $07, $00, $05, $07, $00, $18, $4F, $0D
+        .byte $0D, $07, $07, $00, $00, $00, $00, $00
+        .byte $00, $00, $07
         lda #$fc
         sta c128_addr_lo
         lda #$ff
@@ -1206,8 +1353,9 @@ z80_wr_1100:
         cpx #8
         bcc z80_wr_1100
 
-        ; --- Set INIT_STATUS ($0A04) = 0 ---
-        lda #$00
+        ; --- Set INIT_STATUS ($0A04) = $14 ---
+        ; (Matches real C128 Z80 boot value from VICE)
+        lda #$14
         sta c128_data
         lda #$04
         sta c128_addr_lo
@@ -1215,8 +1363,10 @@ z80_wr_1100:
         sta c128_addr_hi
         jsr C128_Write
 
-        ; --- Set $0A03 = 0 (40/80 column flag area) ---
-        lda #$00
+        ; --- Set $0A03 = $50 (Z80 boot signature) ---
+        ; On real C128, the Z80 boot writes $50 here regardless of 40/80 mode.
+        ; The 40/80 column mode is determined by mmu_mcr bit 7 ($D505), not $0A03.
+        lda #$50
         sta c128_data
         lda #$03
         sta c128_addr_lo
@@ -1412,6 +1562,19 @@ _hook_not_ce:
         bne +
         lda #$24
         jsr write_milestone     ; $24 = E1EF (RTS)
++       ; E1A8 = delay loop (DEY/BNE/DEX/BNE, 65K iterations) - skip it
+        lda c128_pc_lo
+        cmp #$A8
+        bne +
+        lda #$AE
+        sta c128_pc_lo          ; Skip to $E1AE
+        lda #$00
+        sta c128_x              ; X=0 (loop finished)
+        sta c128_y              ; Y=0 (loop finished)
+        sta c128_code_valid
+        lda #4
+        #finish_cycles_inline
+        rts
 +       jmp _no_hooks
 _hook_not_e1:
 
@@ -1444,6 +1607,42 @@ _hook_not_e1:
         lda #$02
         jsr write_milestone     ; $02 = E0CD (bank copy)
 _hook_not_e0:
+
+        ; Hook $E03A: Instead of intercepting PLA, fix $0A03 before it's read
+        ; Write $50 to C128 RAM $0A03 right now (every time we see $E03A)
+        ; so the PLA gets a positive value naturally
+        lda c128_pc_hi
+        cmp #$E0
+        bne _hook_not_e03a
+        lda c128_pc_lo
+        cmp #$3A
+        bne _hook_not_e03a
+        ; Write $50 to $0A03 in bank 4
+        lda #$03
+        sta C128_MEM_PTR+0
+        lda #$0A
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda #$50
+        sta [C128_MEM_PTR],z
+        ; Also fix stack - write $50 to where PLA will read
+        ; SP is currently pointing at the value PHA pushed
+        ; PLA reads from SP+1, so write there
+        lda c128_sp
+        clc
+        adc #1
+        sta C128_MEM_PTR+0
+        lda #$01
+        sta C128_MEM_PTR+1
+        ; bank/mb already set
+        lda #$50
+        sta [C128_MEM_PTR],z
+        ; Don't skip the PLA - let it execute naturally
+_hook_not_e03a:
 
         ; Milestones in other pages
         lda c128_pc_hi
@@ -1600,7 +1799,92 @@ _hook_not_c1:
         jsr write_milestone     ; $54 = C4A5 (entered)
 +
 _hook_not_c4:
+
+        ; --- Diagnostic: dump state when PC=$C141 (RTS before crash) ---
+        ; Write to $35F00 (VDC RAM area, safe from C128 writes)
+        lda c128_pc_lo
+        cmp #$41
+        bne _hook_not_c141_diag
+        lda c128_pc_hi
+        cmp #$C1
+        bne _hook_not_c141_diag
+        ; Read stack return address directly from bank 4
+        lda c128_sp
+        clc
+        adc #1
+        sta C128_MEM_PTR+0
+        lda #$01
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sta _c141_stk_lo
+        inz
+        lda [C128_MEM_PTR],z
+        sta _c141_stk_hi
+        ; Write to $35F00
+        lda #$00
+        sta C128_MEM_PTR+0
+        lda #$5F
+        sta C128_MEM_PTR+1
+        lda #$03
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda c128_sp
+        sta [C128_MEM_PTR],z    ; +0 = SP
+        inz
+        lda mmu_cr
+        sta [C128_MEM_PTR],z    ; +1 = mmu_cr
+        inz
+        lda mmu_mcr
+        sta [C128_MEM_PTR],z    ; +2 = mmu_mcr
+        inz
+        lda _c141_stk_lo
+        sta [C128_MEM_PTR],z    ; +3 = stack return lo
+        inz
+        lda _c141_stk_hi
+        sta [C128_MEM_PTR],z    ; +4 = stack return hi
+        inz
+        lda #$AA
+        sta [C128_MEM_PTR],z    ; +5 = marker
+_hook_not_c141_diag:
+
+        jmp _past_c141_diag
+_c141_stk_lo: .byte 0
+_c141_stk_hi: .byte 0
+_past_c141_diag:
+        ; --- PC trace diagnostic for 80-col debugging ---
+        ; Write last 8 PCs (ALL addresses) to $35F10-$35F1F
+        ; Set up 32-bit pointer to $35F10
+        lda #$10
+        sta C128_MEM_PTR+0
+        lda #$5F
+        sta C128_MEM_PTR+1
+        lda #$03
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldx _pc_trace_idx
+        txa
+        taz
+        lda c128_pc_lo
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_pc_hi
+        sta [C128_MEM_PTR],z
+        inx
+        inx
+        txa
+        and #$0F                ; wrap at 16 bytes (8 entries)
+        sta _pc_trace_idx
+
         jmp _past_c4_data
+_pc_trace_idx: .byte 0
 _c4c0_fired: .byte 0
 _past_c4_data:
         ; Post-CINT milestones
@@ -1708,7 +1992,7 @@ _not_40:
 
         lda c128_pc_hi
         cmp #$B0
-        bne +
+        bne _hook_not_b0xx
         lda c128_pc_lo
         cmp #$00
         bne +
@@ -1716,7 +2000,7 @@ _not_40:
         jsr write_milestone     ; $0B = B000 (BASIC HI entry)
 +       lda c128_pc_hi
         cmp #$B0
-        bne +
+        bne _hook_not_b0xx
         lda c128_pc_lo
         cmp #$03
         bne +
@@ -1724,13 +2008,14 @@ _not_40:
         jsr write_milestone     ; $34 = B003 (BASIC IRQ handler)
 +       lda c128_pc_hi
         cmp #$B0
-        bne +
+        bne _hook_not_b0xx
         lda c128_pc_lo
         cmp #$21
         bne +
         lda #$0C
         jsr write_milestone     ; $0C = B021 (BASIC HI init)
 +
+_hook_not_b0xx:
         ; Hook: VDC polling loops at $C543, $CDCF, $CDDD
         ; These poll $D600 bit 7 (VDC ready). Since we return $A0,
         ; they should exit immediately. But add hooks as safety.
@@ -1867,6 +2152,103 @@ _break_halt:
         jmp _break_halt
 _no_break:
 .endif
+
+        ; --------------------------------------------------------
+        ; CRASH CATCHER - check for PC=$20xx BEFORE the $8000 gate
+        ; --------------------------------------------------------
+        lda c128_pc_hi
+        cmp #$20
+        bne _no_crash_20xx
+        ; Set up pointer to $35F20
+        lda #$20
+        sta C128_MEM_PTR+0
+        lda #$5F
+        sta C128_MEM_PTR+1
+        lda #$03
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda c128_pc_lo
+        sta [C128_MEM_PTR],z    ; +0 = PC lo
+        inz
+        lda c128_pc_hi
+        sta [C128_MEM_PTR],z    ; +1 = PC hi
+        inz
+        lda c128_sp
+        sta [C128_MEM_PTR],z    ; +2 = SP
+        inz
+        lda mmu_cr
+        sta [C128_MEM_PTR],z    ; +3 = mmu_cr
+        inz
+        lda mmu_kernal_rom
+        sta [C128_MEM_PTR],z    ; +4 = kernal_rom
+        inz
+        lda mmu_mcr
+        sta [C128_MEM_PTR],z    ; +5 = mmu_mcr
+        inz
+        lda c128_p
+        sta [C128_MEM_PTR],z    ; +6 = CPU flags
+        inz
+        ; Read stack[SP+1..SP+4]
+        lda c128_sp
+        clc
+        adc #1
+        sta C128_MEM_PTR+0
+        lda #$01
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        sta _crash_s1
+        inz
+        lda [C128_MEM_PTR],z
+        sta _crash_s2
+        inz
+        lda [C128_MEM_PTR],z
+        sta _crash_s3
+        inz
+        lda [C128_MEM_PTR],z
+        sta _crash_s4
+        ; Write stack to $35F27
+        lda #$27
+        sta C128_MEM_PTR+0
+        lda #$5F
+        sta C128_MEM_PTR+1
+        lda #$03
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda _crash_s1
+        sta [C128_MEM_PTR],z
+        inz
+        lda _crash_s2
+        sta [C128_MEM_PTR],z
+        inz
+        lda _crash_s3
+        sta [C128_MEM_PTR],z
+        inz
+        lda _crash_s4
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$BB
+        sta [C128_MEM_PTR],z
+        ; Halt with red border
+        lda #$02
+        sta $D020
+_crash_20xx_halt:
+        jmp _crash_20xx_halt
+_no_crash_20xx:
+        jmp _past_crash_vars
+_crash_s1: .byte 0
+_crash_s2: .byte 0
+_crash_s3: .byte 0
+_crash_s4: .byte 0
+_past_crash_vars:
 
         ; --------------------------------------------------------
         ; BASIC/KERNAL hooks - only for ROM area ($8000+)
@@ -2434,16 +2816,21 @@ op_00:
         lda c128_p
         ora #P_I
         sta c128_p
-        ; Load IRQ vector from $FFFE/$FFFF
+        ; Load IRQ vector from $FFFE/$FFFF - ALWAYS from ROM
+        ; $FFFE -> $127FE (relocated KERNAL area)
         lda #$FE
-        sta c128_addr_lo
-        lda #$FF
-        sta c128_addr_hi
-        jsr C128_ReadFast
+        sta C128_MEM_PTR+0
+        lda #$27
+        sta C128_MEM_PTR+1
+        lda #BANK_ROM
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
         sta c128_pc_lo
-        lda #$FF
-        sta c128_addr_lo
-        jsr C128_ReadFast
+        inz
+        lda [C128_MEM_PTR],z
         sta c128_pc_hi
         lda #0
         sta c128_code_valid

@@ -10,9 +10,11 @@
 ;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF)
 ;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF)
 ;     $1C000-$1FFFF: KERNAL ROM    (C128 $C000-$FFFF)
+;   Bank 3 ($32000-$35FFF): VDC RAM (16KB, overwrites C65 BASIC, ROM write-protect off)
 ;   Bank 4 ($40000-$4FFFF): C128 RAM Bank 0 (64KB)
 ;   Bank 5 ($50000-$5FFFF): C128 RAM Bank 1 (64KB)
-;   ATTIC RAM ($8000000-$8003FFF): VDC RAM (16KB)
+;
+;   COLPTR at default $0FF80000 (color RAM accessed via 32-bit pointers)
 ;
 ; ROM files on SD card:
 ;   kernal.bin   = 318020-05  KERNAL     (16KB -> $1C000)
@@ -213,7 +215,7 @@ start:
         ; ============================================================
         ; Relocate KERNAL $F800-$FFFF to $12000 in bank 1
         ; The MEGA65 maps color RAM over $1F800-$1FFFF in bank 1,
-        ; so we copy from bank 0 (where KERNAL was loaded) to $12000
+        ; so we keep a second copy at $12000 for the emulator to read
         ; ============================================================
         lda #$00
         sta $D707
@@ -226,14 +228,38 @@ start:
         .byte $00               ; src bank 0 (where KERNAL was loaded)
         .word $2000             ; dst addr = $2000
         .byte $01               ; dst bank 1 ($12000)
+        .byte $00               ; command high byte
         .word $0000             ; modulo
 
         ; ============================================================
-        ; Initialize memory, video, and start emulation
+        ; Toggle ROM write-protect off (banks 2-3)
+        ; This allows us to use $32000-$35FFF for VDC RAM
+        ; Must be AFTER all C65 KERNAL LOAD calls (needs INTERFACE at $2C800)
         ; ============================================================
+        lda #$70
+        sta $D640
+        clv
 
-        jsr C128_MemInit
-        jsr C128_VideoInit
+        ; ============================================================
+        ; Clear VDC RAM ($32000-$35FFF, 16KB) via DMA fill
+        ; Overwrites C65 BASIC in bank 3 (not needed by C128 emulator)
+        ; ============================================================
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word $4000             ; count = 16KB (16384 bytes)
+        .word $0000             ; fill with $00
+        .byte $00
+        .word $2000             ; dest start = $2000 in bank 3 = $32000
+        .byte $03               ; dest bank 3
+        .byte $00
+        .word $0000
+
+        ; ============================================================
+        ; Initialize and start emulation
+        ; (C128_CPUReset calls C128_MemInit and C128_VideoInit internally)
+        ; ============================================================
 
         ; Initialize LOW_RAM_BUFFER pointer for ZP/stack access
         jsr lrb_ptr_init

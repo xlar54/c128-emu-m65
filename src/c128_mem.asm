@@ -75,11 +75,13 @@ CHARGEN_BASE = $08000                   ; MEGA65 flat address of chargen ROM
 LOW_RAM_BUFFER  = $A000                 ; 4KB - C128 low RAM $0000-$0FFF mirror
 
 ; Screen base in low RAM buffer
-C128_SCREEN_BASE = LOW_RAM_BUFFER + $0400  ; Default C128 screen at $0400
+C128_SCREEN_BASE = $020400  ; MEGA65 screen at bank 2 (avoids C128 RAM bank 4 overlap)
 
 ; 32-bit pointer for direct memory access
 C128_MEM_PTR    = $F0                   ; 4 bytes at $F0-$F3
 c128_saved_data = $F4                   ; Saved data byte at write entry
+
+INITIAL_VIDEO_MODE = $36                ; initial mode - $B6 = 40 col / $36 = 80 col
 
 ; ============================================================
 ; MMU Register State
@@ -90,8 +92,8 @@ mmu_pcr_a:       .byte $00     ; Pre-configuration Register A ($D501/$FF01)
 mmu_pcr_b:       .byte $00     ; Pre-configuration Register B ($D502/$FF02)
 mmu_pcr_c:       .byte $00     ; Pre-configuration Register C ($D503/$FF03)
 mmu_pcr_d:       .byte $00     ; Pre-configuration Register D ($D504/$FF04)
-mmu_mcr:         .byte $B6     ; Mode Configuration Register ($D505)
-                               ; Bit 7: 40/80 key (1=released = 40 col mode)
+mmu_mcr:         .byte INITIAL_VIDEO_MODE     ; Mode Configuration Register ($D505)
+                               ; Bit 7: 40/80 key (0=pressed = 80 col mode)
                                ; Bit 6: C64 mode (0=C128)
                                ; Bit 5: EXROM (1=C128 mode)
                                ; Bit 4: GAME (1=C128 mode)
@@ -141,10 +143,29 @@ cia2_regs:       .fill 16, 0      ; CIA2 $DD00-$DD0F
 ; VDC registers (8563 - 80 column controller)
 ; Accessed through index/data at $D600/$D601
 vdc_index:       .byte 0          ; Current VDC register index
-vdc_regs:        .fill 38, 0      ; VDC internal registers (R0-R37)
-; VDC 16KB RAM stored in ATTIC RAM at $8000000
-VDC_RAM_BANK = $00              ; low bank byte for ATTIC RAM
-VDC_RAM_ATTIC_HI = $08          ; high byte ($08xxxxxx = ATTIC RAM)
+vdc_regs:        .fill 12, 0     ; R0-R11
+                 .byte $00, $00  ; R12:R13 = screen start ($0000)
+                 .byte $00, $00  ; R14:R15 = cursor position
+                 .fill 4, 0     ; R16-R19
+                 .byte $08, $00  ; R20:R21 = attribute start ($0800)
+                 .byte 80        ; R22 = chars per line (80)
+                 .byte $08       ; R23 = char height (8 scan lines)
+                 .byte $20       ; R24 = block mode (bit 5 = fill)
+                 .byte $07       ; R25 = attr mode flags
+                 .byte $F0       ; R26 = color: white fg ($F), black bg ($0)
+                 .byte 0         ; R27 = row increment
+                 .byte $00       ; R28 = charset addr / RAM type
+                 .fill 9, 0     ; R29-R37
+; VDC 16KB RAM stored in chip RAM at $32000-$35FFF
+; (Overwrites C65 BASIC area in bank 3 - not needed by C128 emulator)
+; 28-bit address: $32000
+;   For DMA: MB = $00, bank = $03, addr = $2000 + offset
+;   For 32-bit ZP ptr: +3=$00, +2=$03, +1=addr_hi+$20, +0=addr_lo
+; Max VDC addr $3FFF + $2000 = $5FFF -> $35FFF, stays in bank 3.
+; Bank 2-3 ROM write-protect must be toggled before use.
+VDC_RAM_BANK = $03              ; bank byte (bank 3 = $3xxxx)
+VDC_RAM_MB   = $00              ; megabyte byte for 32-bit ptr
+VDC_RAM_BASE = $2000            ; base offset within bank ($32000)
 
 ; SID registers are passed through to real hardware
 
@@ -154,6 +175,7 @@ VDC_RAM_ATTIC_HI = $08          ; high byte ($08xxxxxx = ATTIC RAM)
 c128_charset_dirty: .byte 0
 c128_video_mode:    .byte 0       ; 0=text, 1=bitmap
 c128_file_op_active: .byte 0
+vdc_mode_active:    .byte 0       ; 0=40-col (no VDC render), 1=80-col (VDC active)
 
 ; ============================================================
 ; C128_MemInit - Initialize memory system
@@ -166,7 +188,7 @@ C128_MemInit:
         sta mmu_pcr_b
         sta mmu_pcr_c
         sta mmu_pcr_d
-        lda #$B6                ; 40-col, C128 mode, EXROM=1, GAME=1, bits 2-1 set
+        lda #INITIAL_VIDEO_MODE                ; 80-col, C128 mode, EXROM=1, GAME=1, bits 2-1 set
         sta mmu_mcr
         lda #$00
         sta mmu_rcr             ; VIC bank 0, no shared RAM
@@ -231,85 +253,41 @@ C128_VideoInit:
         and #$7F                ; Clear bit 7 (HOTREG disable)
         sta $D05D
 
+        ; --- Common setup for both modes ---
 
-        
-        ; Switch to 40-column mode (H640 off, VIC-III attributes off)
-        ; Clear all: H640=0 (bit 7), ATTR=0 (bit 5)
-        lda #$00
-        sta $D031               
+        ; Disable VIC-IV hot registers so C128 KERNAL writes to
+        ; $D018/$D011/$D016/$D031 don't reset our VIC-IV register settings
+        ; (SCRNPTR, CHARPTR, COLPTR, display geometry, etc.)
+        lda #$80
+        trb $D05D               ; Clear bit 7 of $D05D = disable HOTREG
 
-        ; Standard VIC-II setup
-        ;lda #$1B
-        ;sta $D011               ; 25-row text mode
-        ;lda #$14
-        ;sta $D018               ; default charset layout
-
-        ; Point screen at C128 RAM bank 4 + $0400 = $040400
-        ; $040400 is within VIC-IV's 384KB range
+        ; Point screen at bank 2 + $0400 = $020400
+        ; (NOT bank 4, which is C128 RAM - DMA render would corrupt $0A00-$0BCF)
         lda #$00
         sta $D060               ; SCRNPTR[7:0]   = $00
-        ;sta $D063               ; SCRNPTR[31:24] = $00
         lda #$04
         sta $D061               ; SCRNPTR[15:8]  = $04
-        lda #BANK_RAM0
-        sta $D062               ; SCRNPTR[23:16] = $04 -> $040400
+        lda #$02
+        sta $D062               ; SCRNPTR[23:16] = $02
+        lda #$00
+        sta $D063               ; SCRNPTR[31:24] = $00 -> $020400
 
-
-        ; Point charset at C128 character ROM in bank 1
-        ; C128 charset is in second 4KB half: $0000-$0FFF
-        ; Default is uppercase/graphics
+        ; Point charset at C128 character ROM
         lda #$00
         sta $D068               ; CHARPTR LSB
-        lda #$90 ;00
+        lda #$90
         sta $D069               ; CHARPTR byte 1
-        lda #$00 ;01
-        sta $D06A               ; CHARPTR byte 2 -> $010000
-
-        ; Standard 40-column, virtual row width = 40
-        ; Necesssary!
-        lda #40
-        sta $D058
-        lda #0
-        sta $D059
+        lda #$00
+        sta $D06A               ; CHARPTR byte 2 -> $009000
 
         ; CHR16 OFF (standard 1-byte screen codes)
-        ;lda $D054
-        ;and #$FC                ; Clear bits 0-1 (CHR16, FCM)
-        ;sta $D054
-        lda #$d7                ; same thing?
+        lda #$d7
         trb $d054
 
-        ; MCM off
-        ; unnecessary
-        ;lda $D016
-        ;and #$EF
-        ;;lda #$08
-        ;sta $D016               ; 40 columns, no scroll, MCM off
-
-        ; Default C128 colors
-        lda #13
-        sta $D020               ; border = light green
-        lda #11
-        sta $D021               ; background = dark grey
-
-
-        ; Clear color RAM to light green (13)
-;        ldx #0
-;        lda #$0D
-;_clr_color:
-;        sta $D800,x
-;        sta $D900,x
-;        sta $DA00,x
-;        sta $DB00,x
-;        inx
-;        bne _clr_color
-
-
-
-        ; Color RAM pointer - set FIRST before anything else
-        ; MEGA65 color RAM is at fixed $FF80000
-        ; Set COLPTR to physical color RAM at $FF8(0000)
-        ; so writes to $D800 go to actual color RAM, not ROM
+        ; Color RAM pointer at default $0FF80000
+        ; We access color RAM via 32-bit pointers (not $D800 window),
+        ; so the window at $1F800-$1FFFF doesn't matter to us.
+        ; KERNAL $F800-$FFFF must be relocated to $12000 to avoid it.
         lda #$00
         sta $D064               ; COLPTR byte 0
         lda #$00
@@ -317,10 +295,52 @@ C128_VideoInit:
         lda #$F8
         sta $D066               ; COLPTR[23:16] = $F8
         lda #$0F
-        sta $D067               ; COLPTR[31:24] = $0F  -> $0FF80800
+        sta $D067               ; COLPTR[31:24] = $0F  -> $0FF80000
 
+        ; --- Check 40/80 column mode ---
+        lda mmu_mcr
+        bmi _vi_40col           ; Bit 7 set = 40-column mode
 
+        ; === 80-column mode ===
+        ; H640 on for 80-column display
+        lda #$80
+        sta $D031
 
+        ; Virtual row width = 80
+        lda #80
+        sta $D058
+        lda #0
+        sta $D059
+
+        ; 80-column colors: black border and background
+        lda #0
+        sta $D020               ; border = black
+        sta $D021               ; background = black
+
+        lda #1
+        sta vdc_mode_active     ; Flag: VDC rendering active
+        rts
+
+_vi_40col:
+        ; === 40-column mode ===
+        ; H640 off, VIC-III attributes off
+        lda #$00
+        sta $D031
+
+        ; Virtual row width = 40
+        lda #40
+        sta $D058
+        lda #0
+        sta $D059
+
+        ; 40-column colors: light green border, dark grey background
+        lda #13
+        sta $D020               ; border = light green
+        lda #11
+        sta $D021               ; background = dark grey
+
+        lda #0
+        sta vdc_mode_active     ; Flag: VDC rendering inactive
         rts
 
 ; ============================================================
@@ -679,17 +699,21 @@ _rd_io_other:
 
 _rd_color_ram:
         ; Color RAM at $D800-$DBFF
-        ; Read from MEGA65's actual color RAM
+        ; Read via 32-bit pointer to $0FF80000 + offset
+        ; C128 $D800 = color RAM offset $000, $DBFF = offset $3FF
+        lda c128_addr_lo
+        sta C128_MEM_PTR+0
         lda c128_addr_hi
         sec
-        sbc #$D8
-        clc
-        adc #$D8                ; Map to real $D800
-        sta _rd_col+2
-        ldx c128_addr_lo
-_rd_col:
-        lda $D800,x
-        and #$0F               ; Color RAM is 4 bits
+        sbc #$D8                ; $D8->$00, $D9->$01, $DA->$02, $DB->$03
+        sta C128_MEM_PTR+1
+        lda #$F8
+        sta C128_MEM_PTR+2      ; -> $xF80xxx
+        lda #$0F
+        sta C128_MEM_PTR+3      ; -> $0FF80xxx
+        ldz #0
+        lda [C128_MEM_PTR],z
+        and #$0F                ; Color RAM is 4 bits
         rts
 
 _rd_cia1:
@@ -1078,15 +1102,17 @@ _rv_vdc_open:
 
 _rv_vdc_data:
         ; R31: Read byte from VDC RAM at address R18:R19, auto-increment
-        ; VDC RAM is in ATTIC RAM at $8000000
+        ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
         lda vdc_regs+18         ; address hi
         and #$3F                ; mask to 16KB
+        clc
+        adc #>VDC_RAM_BASE      ; add $20
         sta C128_MEM_PTR+1
-        lda #VDC_RAM_BANK
-        sta C128_MEM_PTR+2
-        lda #VDC_RAM_ATTIC_HI
+        lda #VDC_RAM_BANK       ; $03
+        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
+        lda #VDC_RAM_MB         ; $00
         sta C128_MEM_PTR+3
         ldz #0
         lda [C128_MEM_PTR],z
@@ -1176,18 +1202,21 @@ _wr_vdc:
 
 _wr_color_ram:
         ; Color RAM $D800-$DBFF
-        ; Write to MEGA65's real color RAM
+        ; Write via 32-bit pointer to $0FF80000 + offset
+        lda c128_addr_lo
+        sta C128_MEM_PTR+0
         lda c128_addr_hi
         sec
-        sbc #$D8
-        clc
-        adc #$D8
-        sta _wr_col+2
-        ldx c128_addr_lo
+        sbc #$D8                ; $D8->$00, $D9->$01, $DA->$02, $DB->$03
+        sta C128_MEM_PTR+1
+        lda #$F8
+        sta C128_MEM_PTR+2
+        lda #$0F
+        sta C128_MEM_PTR+3      ; -> $0FF80xxx
+        ldz #0
         lda c128_saved_data
-        and #$0F               ; Color RAM is 4 bits
-_wr_col:
-        sta $D800,x
+        and #$0F                ; Color RAM is 4 bits
+        sta [C128_MEM_PTR],z
         rts
 
 _wr_cia1:
@@ -1355,7 +1384,13 @@ wmmu_d504:
         sta mmu_pcr_d
         rts
 wmmu_d505:
+        ; D505 write: bit 7 is READ-ONLY (40/80 key), preserve it
+        lda mmu_mcr
+        and #$80                ; keep current bit 7
+        sta c128_tmp
         lda c128_saved_data
+        and #$7F                ; mask off bit 7 from written value
+        ora c128_tmp            ; combine with preserved bit 7
         sta mmu_mcr
         ; Check for C64 mode switch
         and #$40
@@ -1431,8 +1466,11 @@ _wv_ignore:
 _wv_d011:
         ; $D011: screen control
         lda c128_saved_data
+        sta vic_regs+$11        ; Always update shadow
+        ldx vdc_mode_active
+        bne +                   ; In 80-col mode, don't touch real VIC-IV
         sta $D011
-        rts
++       rts
 
 _wv_d016:
         ; $D016: screen control 2
@@ -1444,6 +1482,11 @@ _wv_d018:
         ; $D018: VIC-II memory control register
         ; Bits 4-7: Screen base offset (x $0400)
         ; Bits 1-3: Charset base offset (x $0800)
+        ;
+        ; In 80-col mode, save to shadow only - don't update SCRNPTR/CHARPTR
+        ; since VDC_RenderFrame handles the display
+        lda vdc_mode_active
+        bne _d018_shadow_only
         ;
         ; VIC-II CHARACTER ROM SHADOW:
         ; In VIC bank 0 ($0000-$3FFF) or bank 2 ($8000-$BFFF),
@@ -1521,6 +1564,10 @@ _d018_screen:
         lda _d018_char_hi
         sta $7752               ; computed char hi byte
 
+        rts
+
+_d018_shadow_only:
+        ; 80-col mode: just save to shadow, don't touch VIC-IV
         rts
 
 _d018_char_hi: .byte 0
@@ -1700,15 +1747,17 @@ _wvdc_index:
 
 _wvdc_data:
         ; R31: Write byte to VDC RAM at address R18:R19, auto-increment
-        ; VDC RAM is in ATTIC RAM at $8000000
+        ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
         lda vdc_regs+18         ; address hi
         and #$3F                ; mask to 16KB
+        clc
+        adc #>VDC_RAM_BASE      ; add $20
         sta C128_MEM_PTR+1
-        lda #VDC_RAM_BANK
-        sta C128_MEM_PTR+2
-        lda #VDC_RAM_ATTIC_HI
+        lda #VDC_RAM_BANK       ; $03
+        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
+        lda #VDC_RAM_MB         ; $00
         sta C128_MEM_PTR+3
         ldz #0
         lda c128_saved_data
@@ -1772,10 +1821,12 @@ _vdc_fill_loop:
         sta C128_MEM_PTR+0
         lda vdc_regs+18
         and #$3F
+        clc
+        adc #>VDC_RAM_BASE      ; add $20
         sta C128_MEM_PTR+1
-        lda #VDC_RAM_BANK
-        sta C128_MEM_PTR+2
-        lda #VDC_RAM_ATTIC_HI
+        lda #VDC_RAM_BANK       ; $03
+        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
+        lda #VDC_RAM_MB         ; $00
         sta C128_MEM_PTR+3
         ldz #0
         lda _vdc_fill_byte
@@ -1847,3 +1898,154 @@ c128_gfx_dirty:     .byte 0
 ; Stub routines (bitmap/graphics not yet implemented for C128)
 C128Vid_DisableHostBitmap:
         rts
+
+; ============================================================
+; VDC_RenderFrame - Copy VDC screen/attributes to MEGA65 display
+;
+; Called once per frame from VIC_FrameTasks.
+; Copies VDC screen RAM ($0000-$07CF in bank 3 at $32000) to MEGA65 screen
+; at $040400, then translates VDC attribute RAM ($0800-$09CF in
+; and translates VDC attributes to MEGA65 color RAM at $FF80000, converting VDC RGBI
+; color codes to VIC-II color indices via lookup table.
+;
+; VDC RAM is in chip RAM bank 3 at $32000.
+; Screen: VDC $0000-$07CF = $20000-$207CF (2000 bytes)
+; Attrs:  VDC $0800-$09CF = $20800-$209CF (2000 bytes)
+; ============================================================
+VDC_RenderFrame:
+        ; Force 80-col border/background colors
+        lda #$00
+        sta $D020               ; black border
+        sta $D021               ; black background
+
+        ; --- Step 1: DMA copy VDC screen RAM to MEGA65 screen ---
+        ; VDC RAM is at $32000: real_addr = $32000 + VDC_addr
+        ; Source: bank 3, addr = VDC R12:R13 + $2000
+        ; Dest:   $040400 (MEGA65 screen pointer target)
+        ; Count:  2000 bytes (80 x 25)
+
+        ; Build the DMA source addr = VDC R12:R13 + $2000
+        lda vdc_regs+13         ; R13 = screen start low
+        clc
+        adc #<VDC_RAM_BASE      ; + $00
+        sta _vdc_dma_scr_src
+        lda vdc_regs+12         ; R12 = screen start high
+        and #$3F                ; mask to 16KB
+        adc #>VDC_RAM_BASE      ; + $20
+        sta _vdc_dma_scr_src+1
+        ; Compute bank: always bank 3
+        lda #VDC_RAM_BANK       ; $03
+        sta _vdc_dma_scr_bank
+
+        lda #$00
+        sta $D707               ; Enhanced DMA job
+        .byte $80, $00          ; src MB = $00 (chip RAM)
+        .byte $81, $00          ; dst MB = $00
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word 2000              ; count = 2000 bytes
+_vdc_dma_scr_src:
+        .word $0000             ; src addr (filled: VDC addr + $2000)
+_vdc_dma_scr_bank:
+        .byte $03               ; src bank 3 (VDC RAM)
+        .word $0400             ; dst addr = $0400
+        .byte $02               ; dst bank = 2 ($020400)
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+
+        ; --- Step 2: Translate VDC attribute RAM -> MEGA65 color RAM ---
+        ; Read each attribute byte from VDC RAM, extract low nibble
+        ; (VDC RGBI color), convert via lookup table, write to color RAM.
+
+        ; Source pointer: $32000 + VDC R20:R21
+        lda vdc_regs+21         ; R21 = attribute start low
+        sta C128_MEM_PTR+0
+        lda vdc_regs+20         ; R20 = attribute start high
+        and #$3F                ; mask to 16KB
+        clc
+        adc #>VDC_RAM_BASE      ; + $20
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK       ; $03
+        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
+        lda #VDC_RAM_MB         ; $00
+        sta C128_MEM_PTR+3      ; -> $328xx
+
+        ; Dest pointer: color RAM at $0FF80000
+        lda #$00
+        sta vdc_color_ptr+0
+        lda #$00
+        sta vdc_color_ptr+1
+        lda #$F8
+        sta vdc_color_ptr+2
+        lda #$0F
+        sta vdc_color_ptr+3     ; -> $0FF80000
+
+        ; 16-bit counter: 2000 = $07D0
+        lda #<2000
+        sta _vdc_count_lo
+        lda #>2000
+        sta _vdc_count_hi
+
+        ldz #0                  ; Always use Z=0 for 32-bit indexed access
+
+_vdc_attr_loop:
+        lda [C128_MEM_PTR],z    ; Read VDC attribute byte from VDC RAM
+        and #$0F                ; Extract VDC foreground RGBI color (bits 3-0)
+        tax
+        lda vdc_to_vic_color,x  ; Convert to VIC-II color
+        sta [vdc_color_ptr],z   ; Write to color RAM
+
+        ; Increment source pointer
+        inc C128_MEM_PTR+0
+        bne +
+        inc C128_MEM_PTR+1
++
+        ; Increment dest pointer
+        inc vdc_color_ptr+0
+        bne +
+        inc vdc_color_ptr+1
++
+        ; Decrement 16-bit counter
+        lda _vdc_count_lo
+        bne +
+        dec _vdc_count_hi
++       dec _vdc_count_lo
+        lda _vdc_count_lo
+        ora _vdc_count_hi
+        bne _vdc_attr_loop
+
+        rts
+
+_vdc_count_lo: .byte 0
+_vdc_count_hi: .byte 0
+_vdc_render_count: .byte 0
+
+; VDC RGBI -> VIC-II color lookup table
+; VDC RGBI encoding:  R G B I  (4 bits)
+; Index: 0=black 1=dgray 2=dblue 3=lblue 4=dgreen 5=lgreen
+;        6=dcyan 7=lcyan 8=dred 9=lred 10=dpurple 11=purple
+;        12=dyellow 13=yellow 14=lgray 15=white
+;
+; Mapping to closest VIC-II colors:
+; VDC $0 (0000 black)    -> VIC 0  (black)
+; VDC $1 (0001 dk gray)  -> VIC 11 (dark grey)
+; VDC $2 (0010 dk blue)  -> VIC 6  (blue)
+; VDC $3 (0011 lt blue)  -> VIC 14 (light blue)
+; VDC $4 (0100 dk green) -> VIC 5  (green)
+; VDC $5 (0101 lt green) -> VIC 13 (light green)
+; VDC $6 (0110 dk cyan)  -> VIC 11 (dark grey - closest)
+; VDC $7 (0111 lt cyan)  -> VIC 3  (cyan)
+; VDC $8 (1000 dk red)   -> VIC 2  (red)
+; VDC $9 (1001 lt red)   -> VIC 10 (light red)
+; VDC $A (1010 dk purple)-> VIC 4  (purple)
+; VDC $B (1011 lt purple)-> VIC 4  (purple)
+; VDC $C (1100 dk yellow)-> VIC 9  (brown)
+; VDC $D (1101 lt yellow)-> VIC 7  (yellow)
+; VDC $E (1110 lt gray)  -> VIC 15 (light grey)
+; VDC $F (1111 white)    -> VIC 1  (white)
+vdc_to_vic_color:
+        .byte 0, 11, 6, 14, 5, 13, 11, 3
+        .byte 2, 10, 4, 4, 9, 7, 15, 1
+
+; 32-bit pointer for VDC color RAM writes (must be in zero page for [ptr],z)
+vdc_color_ptr = $EC                     ; 4 bytes at $EC-$EF
