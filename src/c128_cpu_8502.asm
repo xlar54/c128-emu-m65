@@ -1374,6 +1374,23 @@ z80_wr_1100:
         sta c128_addr_hi
         jsr C128_Write
 
+        ; --- Set warm start vector $0A00-$0A01 = $4000 (BASIC LO cold start) ---
+        ; The Z80 boot sets this so MONITOR's X command (JMP ($0A00)) enters
+        ; BASIC LO cold start, which initializes $0300-$0313 vectors and
+        ; then changes $0A00 to $03 (warm start entry $4003) for subsequent use.
+        lda #$00
+        sta c128_data
+        lda #$00
+        sta c128_addr_lo
+        lda #$0A
+        sta c128_addr_hi
+        jsr C128_Write
+        lda #$40
+        sta c128_data
+        lda #$01
+        sta c128_addr_lo
+        jsr C128_Write
+
         rts
 
 ; 8502->Z80 switchover routine (written to RAM $FFD0-$FFDF)
@@ -1608,40 +1625,35 @@ _hook_not_e1:
         jsr write_milestone     ; $02 = E0CD (bank copy)
 _hook_not_e0:
 
-        ; Hook $E03A: Instead of intercepting PLA, fix $0A03 before it's read
-        ; Write $50 to C128 RAM $0A03 right now (every time we see $E03A)
-        ; so the PLA gets a positive value naturally
+        ; Hook $E03A: PLA reads cold/warm start flag
+        ; Real C128: Z80 pushes $80 before 8502 boot
+        ; PLA result: negative = normal boot (BMI taken -> JMP ($0A00) -> BASIC)
+        ;             positive = enter MONITOR (JMP $B000)
+        ;             $DF = auto-boot from disk
+        ; We intercept PLA and set A=$80 for normal BASIC boot
         lda c128_pc_hi
         cmp #$E0
         bne _hook_not_e03a
         lda c128_pc_lo
         cmp #$3A
         bne _hook_not_e03a
-        ; Write $50 to $0A03 in bank 4
-        lda #$03
-        sta C128_MEM_PTR+0
-        lda #$0A
-        sta C128_MEM_PTR+1
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda #$50
-        sta [C128_MEM_PTR],z
-        ; Also fix stack - write $50 to where PLA will read
-        ; SP is currently pointing at the value PHA pushed
-        ; PLA reads from SP+1, so write there
-        lda c128_sp
-        clc
-        adc #1
-        sta C128_MEM_PTR+0
-        lda #$01
-        sta C128_MEM_PTR+1
-        ; bank/mb already set
-        lda #$50
-        sta [C128_MEM_PTR],z
-        ; Don't skip the PLA - let it execute naturally
+
+        ; Set A = $80 (negative - BMI will be taken for normal boot)
+        lda #$80
+        sta c128_a
+        ; Set N flag, clear Z flag for the value $80
+        lda c128_p
+        ora #P_N                ; set N (negative)
+        and #<~(P_Z)            ; clear Z (not zero)
+        sta c128_p
+        ; Skip PLA instruction (1 byte)
+        inc c128_pc_lo
+        bne +
+        inc c128_pc_hi
++       ; Increment SP as PLA would
+        inc c128_sp
+        lda #0
+        sta c128_code_valid
 _hook_not_e03a:
 
         ; Milestones in other pages
@@ -1654,6 +1666,27 @@ _hook_not_e03a:
         lda #$04
         jsr write_milestone     ; $04 = E242 (C128 mode check)
 +
+        ; Capture E03E milestone
+        lda c128_pc_hi
+        cmp #$E0
+        bne _skip_e03x_diag
+        lda c128_pc_lo
+        cmp #$3E
+        bne +
+        lda #$32
+        jsr write_milestone     ; $32 = E03E (JMP $B000)
++       lda c128_pc_lo
+        cmp #$41
+        bne +
+        lda #$35
+        jsr write_milestone     ; $35 = E041 (BMI target - warm start!)
++       lda c128_pc_lo
+        cmp #$45
+        bne +
+        lda #$36
+        jsr write_milestone     ; $36 = E045 (JMP ($0A00) - MONITOR entry)
++
+_skip_e03x_diag:
         lda c128_pc_hi
         cmp #$E1
         bne +
