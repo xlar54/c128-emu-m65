@@ -176,17 +176,18 @@ C128Hook_Reset:
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
 C128Hook_CheckAndRun:
-        pha
-        txa
-        pha
-        tya
-        pha
-
         lda c128_pc_hi
 
         ; ----- Check for $FFxx addresses (KERNAL calls) -----
         cmp #$FF
         bne _not_ff
+
+        ; Save registers only when we have a potential match
+        pha
+        txa
+        pha
+        tya
+        pha
         
         lda c128_pc_lo
         cmp #$BD                        ; SETNAM = $FFBD
@@ -214,7 +215,7 @@ C128Hook_CheckAndRun:
         beq _do_chrout
         cmp #$E4                        ; GETIN = $FFE4
         beq _do_getin
-        jmp _check_other
+        jmp _done                       ; No match in $FF page
 
 _do_setnam:
         jsr C128Hook_OnSETNAM
@@ -309,73 +310,65 @@ _not_ff:
         cmp #$F8
         bne _check_f9
         lda c128_pc_lo
-        cmp #$67                        ; $F867 = IOINIT entry (serial init + auto-boot)
-        bne _f8_done
+        cmp #$67                        ; $F867 = IOINIT entry
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
         ; Skip IOINIT entirely - no serial bus or disk drive
         ; But we must initialize CIA1 Timer A for keyboard scanning IRQ
-        ; C128 KERNAL sets Timer A to $4025 (~60Hz on PAL)
         lda #$25
         sta cia1_timer_a_latch_lo
         sta cia1_timer_a_lo
         lda #$40
         sta cia1_timer_a_latch_hi
         sta cia1_timer_a_hi
-        ; Enable Timer A IRQ (bit 0 of ICR mask)
-        lda #$81                        ; Set bit 0 (Timer A)
+        lda #$81
         sta cia1_icr_mask
-        ; Start Timer A: continuous mode
-        lda #$01                        ; bit 0 = start
+        lda #$01
         sta cia1_timer_a_ctrl
-        ; Write keyboard column select to $DC00 (all columns = $FF)
         lda #$FF
         sta $DC00
-        ; Simulate RTS to return to caller (who did JSR $FF56)
         jsr C128Hook_RTS_Guest
-_f8_done:
         jmp _done
 
 _check_f9:
-        cmp #$F9
-        bne _check_fa
-        jmp _done
-
-_check_fa:
-        cmp #$FA
-        bne _check_c4_rom
-        jmp _done
-
-_check_c4_rom:
-_check_c4_done:
-        ; Reload c128_pc_hi for next check
-        lda c128_pc_hi
-
         ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
-_check_c8:
         cmp #$C8
         bne _check_a8
         lda c128_pc_lo
-        cmp #$BC                        ; DIRECTORY = $C8BC
-        bne _done
+        cmp #$BC
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr C128Hook_OnDIRECTORY
         jmp _done
 
 _check_a8:
         ; ----- Check for LOAD hook at $A800 -----
         cmp #$A8
-        bne _done
+        bne _done_fast
         lda c128_pc_lo
-        cmp #$00
-        bne _done
-
-_check_other:
-        lda c128_pc_hi
-        cmp #$A8
-        bne _done
-        lda c128_pc_lo
-        bne _done
-        
-        ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr C128Hook_OnLOAD
+        jmp _done
+
+; Fast exit - no registers were saved, just return
+_done_fast:
+        rts
 
 _done:
         pla

@@ -70,6 +70,75 @@ set_zna .macro
         txa
 .endmacro
 
+; Same as set_zna but doesn't restore A (saves 2 cycles)
+; Use when A is immediately overwritten after (e.g., lda #cycles)
+set_zn_fast .macro
+        tax
+        lda c128_p
+        and #(~(P_Z|P_N)) & $ff
+        ora zn_table,x
+        sta c128_p
+.endmacro
+
+; -----------------------------------------------------------------
+; read_data_fast: Inline read from c128_addr_hi:c128_addr_lo
+; For addr < $40 page, sets up C128_MEM_PTR for bank 4 and reads directly.
+; For addr >= $4000, falls back to jsr C128_ReadFast.
+; Result in A. Clobbers Z.
+; -----------------------------------------------------------------
+read_data_fast .macro
+        lda c128_addr_hi
+        cmp #$40
+        bcs _rdf_slow\@
+        ; Fast inline: set up C128_MEM_PTR for bank 4 read
+        sta C128_MEM_PTR+1
+        lda c128_addr_lo
+        sta C128_MEM_PTR
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        bra _rdf_done\@
+_rdf_slow\@:
+        jsr C128_ReadFast
+_rdf_done\@:
+.endmacro
+
+; -----------------------------------------------------------------
+; write_data_fast: Inline write c128_data to c128_addr_hi:lo
+; For addr < $D0 page, writes directly to RAM0 via C128_MEM_PTR.
+; For addr >= $D000, falls back to jsr C128_Write (I/O dispatch).
+; c128_data must be set before using this macro.
+; -----------------------------------------------------------------
+write_data_fast .macro
+        lda c128_addr_hi
+        cmp #$D0
+        bcs _wdf_slow\@
+        ; Invalidate code cache if writing to current code page
+        cmp c128_code_page_hi
+        bne _wdf_no_inv\@
+        lda #0
+        sta c128_code_valid
+        lda c128_addr_hi
+_wdf_no_inv\@:
+        sta C128_MEM_PTR+1
+        lda c128_addr_lo
+        sta C128_MEM_PTR
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda c128_data
+        sta [C128_MEM_PTR],z
+        bra _wdf_done\@
+_wdf_slow\@:
+        jsr C128_Write
+_wdf_done\@:
+.endmacro
+
 ; ------------------------------------------------------------
 ; finish_cycles_inline - Inlined cycle accounting macro
 ; A = base cycle count on entry
@@ -83,6 +152,20 @@ finish_cycles_inline .macro
         cmp #VIC_CYCLES_PER_LINE
         bcc _fc_skip\@
         jsr finish_do_scanline  ; Only call if we crossed scanline boundary
+_fc_skip\@:
+.endmacro
+
+; ------------------------------------------------------------
+; finish_cycles_no_xtra - For opcodes that never page-cross
+; Skips the c128_xtra add. A = cycle count on entry.
+; ------------------------------------------------------------
+finish_cycles_no_xtra .macro
+        clc
+        adc vic_cycle_accum
+        sta vic_cycle_accum
+        cmp #VIC_CYCLES_PER_LINE
+        bcc _fc_skip\@
+        jsr finish_do_scanline
 _fc_skip\@:
 .endmacro
 
@@ -118,12 +201,34 @@ c128_code_page_hi   = $E4   ; cached c128_pc_hi (guest)
 c128_code_valid     = $E5   ; 0=invalid, !=0 valid
 c128_code_romvis    = $E6   ; cached mmu_cr snapshot (for ROM visibility change detection)
 c128_hook_pc_changed = $E7  ; Set by hooks when they modify PC
+c128_stack_ptr      = $E8   ; 4 bytes: dedicated stack pointer (lo=SP, hi=$01, bank, $00)
+c128_zp_ptr         = $14   ; 4 bytes: dedicated ZP pointer (lo=addr, hi=$00, bank4, $00)
 
 ; Call this when you want to force cache rebuild (optional helper)
 invalidate_code_cache:
         lda #$00
         sta c128_code_valid
         rts
+
+; -----------------------------------------------------------------
+; fetch8_operand: Inline operand fetch when cache is likely valid.
+; Must check code_valid since I/O pages ($D0-$DF, $FF) are never cached.
+; Also checks for page boundary (pc_lo == 0).
+; Result in A. Clobbers Z.
+; -----------------------------------------------------------------
+fetch8_operand .macro
+        lda c128_code_valid
+        beq _f8op_slow\@        ; Cache invalid (I/O page, etc.)
+        lda c128_pc_lo
+        beq _f8op_slow\@        ; Page wrapped - need full fetch8
+        taz
+        lda [c128_code_ptr],z
+        inw c128_pc_lo
+        bra _f8op_done\@
+_f8op_slow\@:
+        jsr fetch8
+_f8op_done\@:
+.endmacro
 
 ; -----------------------------------------------------------------
 ; fetch8_fast: A = mem[PC], PC++
@@ -144,24 +249,9 @@ fetch8:
         cmp c128_code_page_hi
         bne _f8_rebuild
 
-        ; If we are in >=$40, ROM visibility affects whether we read ROM or RAM
-        lda c128_pc_hi
-        cmp #$40
-        bcc _f8_do_read
-
-        ; Conservative: never fast-fetch from $D0-$DF (I/O) or $FF (MMU regs)
-        cmp #$FF
-        beq _f8_slow
-        cmp #$D0
-        bcc _f8_check_romvis
-        cmp #$E0
-        bcc _f8_slow            ; $D000-$DFFF = I/O area
-
-_f8_check_romvis:
-        ; MMU config changed since cache built?
-        lda mmu_cr
-        cmp c128_code_romvis
-        bne _f8_rebuild
+        ; Cache valid + page matches = safe to read
+        ; (I/O pages $D0-$DF and $FF are marked invalid during rebuild,
+        ;  so they always go through _f8_rebuild -> _f8_build_slow)
 
 _f8_do_read:
         ldz c128_pc_lo
@@ -294,7 +384,7 @@ _f8_slow:
         sta c128_addr_lo
         lda c128_pc_hi
         sta c128_addr_hi
-        jsr C128_ReadFast
+        #read_data_fast
         inw c128_pc_lo
         rts
 
@@ -305,6 +395,44 @@ _f8_slow:
 
 ; --- fetch16_to_addr ---
 fetch16_to_addr:
+        ; Fast path: if code cache is valid and both bytes on same page,
+        ; read both directly without re-validating for second byte.
+        lda c128_code_valid
+        beq _f16_slow
+        lda c128_pc_hi
+        cmp c128_code_page_hi
+        bne _f16_slow
+
+        ; I/O pages never have cache valid (set in _f8_build_slow),
+        ; so no I/O exclusion check needed here.
+
+_f16_fast:
+        ; Both bytes on same page? (PC lo must be < $FF)
+        lda c128_pc_lo
+        cmp #$FF
+        beq _f16_slow           ; Page split - use safe path
+
+        ; Read both bytes directly from code pointer
+        taz
+        lda [c128_code_ptr],z   ; First byte (lo)
+        sta c128_addr_lo
+        inz
+        lda [c128_code_ptr],z   ; Second byte (hi)
+        sta c128_addr_hi
+        ; Advance PC by 2
+        lda c128_pc_lo
+        clc
+        adc #2
+        sta c128_pc_lo
+        bcs _f16_pc_carry
+        rts
+_f16_pc_carry:
+        inc c128_pc_hi
+        rts
+
+_f16_slow:
+        ; Safe path: two fetch8 calls (handles page crossings, cache rebuilds)
+        ; Must use c128_tmp because fetch8 slow path clobbers c128_addr_lo
         jsr fetch8
         sta c128_tmp
         jsr fetch8
@@ -314,39 +442,40 @@ fetch16_to_addr:
         rts
 
 ; Cached bank for stack page ($0100-$01FF)
-; Updated by mmu_update_derived whenever MMU config changes.
-; This avoids calling get_physical_bank on every push/pull.
+; Stack page is always in shared bottom region -> always BANK_RAM0.
 cached_stack_bank: .byte BANK_RAM0
+
+; --- init_stack_ptr ---
+; Call once at startup to initialize the dedicated c128_stack_ptr
+; After this, only c128_stack_ptr+0 (low byte = SP) needs updating
+init_stack_ptr:
+        lda #$00
+        sta c128_stack_ptr+0    ; Will be set to SP before each use
+        lda #$01
+        sta c128_stack_ptr+1    ; Page $01 (stack page)
+        lda #BANK_RAM0
+        sta c128_stack_ptr+2    ; Always bank 4
+        lda #$00
+        sta c128_stack_ptr+3    ; Megabyte 0
+        rts
 
 ; --- push_data ---
 push_data:
-        lda cached_stack_bank
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
         lda c128_sp
-        sta C128_MEM_PTR+0
-        lda #$01
-        sta C128_MEM_PTR+1
+        sta c128_stack_ptr+0
         ldz #0
         lda c128_data
-        sta [C128_MEM_PTR],z
+        sta [c128_stack_ptr],z
         dec c128_sp
         rts
 
 ; --- pull_to_a ---
 pull_to_a:
         inc c128_sp
-        lda cached_stack_bank
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
         lda c128_sp
-        sta C128_MEM_PTR+0
-        lda #$01
-        sta C128_MEM_PTR+1
+        sta c128_stack_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_stack_ptr],z
         rts
 
 ; ============================================================
@@ -363,75 +492,66 @@ cpu_port_ddr:   .byte $2F       ; Data Direction Register (default: bits 0-3,5 o
 cpu_port_data:  .byte $07       ; Port data register (default: LORAM+HIRAM+CHAREN on)
 cpu_port_ext:   .byte $FF       ; External input lines (active low, no cart = all high)
 
-; Initialize - nothing needed now
+; Initialize pointers - set up dedicated stack and ZP pointers
 lrb_ptr_init:
+        jsr init_stack_ptr
+        ; Initialize dedicated ZP pointer: $04:$00:$00:XX
+        lda #$00
+        sta c128_zp_ptr+0       ; Will be set before each use
+        sta c128_zp_ptr+1       ; Page $00
+        sta c128_zp_ptr+3       ; Megabyte 0
+        lda #BANK_RAM0
+        sta c128_zp_ptr+2       ; Bank 4
         rts
 
-; Helper: read LOW_RAM_BUFFER[X] -> A  (preserves X)
-; Now reads from bank 4 directly
+; Helper: read ZP[X] -> A  (preserves X)
 lrb_read_x:
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         rts
 
 ; Helper: write A -> ZP[X]  (preserves A, X)
-; Writes to both LOW_RAM_BUFFER and bank 4
 lrb_write_x:
-        pha
-        ; Write to bank 4 ($04:$00:$00:XX)
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+1
-        sta C128_MEM_PTR+3
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        pla
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         rts
 
-; Helper: read LOW_RAM_BUFFER[Y] -> A  (preserves Y)
-; Now reads from bank 4 directly
+; Helper: read ZP[Y] -> A  (preserves Y)
 lrb_read_y:
-        #setup_bank4_zp
-        sty C128_MEM_PTR+0
+        sty c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         rts
 
 ; Helper: ASL ZP[X]  (preserves X, sets flags from result)
 lrb_asl_x:
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         asl a
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         rts
 
 ; Helper: DEC ZP[X]  (preserves X, sets flags from result)
 lrb_dec_x:
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         sec
         sbc #1
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         rts
 
 ; Helper: INC ZP[X]  (preserves X, sets flags from result)
 lrb_inc_x:
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         clc
         adc #1
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         rts
 
 ; Helper: set C128_MEM_PTR to LOW_RAM_BUFFER base (call before [C128_MEM_PTR],z access)
@@ -469,10 +589,9 @@ setup_bank4_zp .macro
 read_zp_x:
         cpx #$02
         bcc _rzpx_port
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         rts
 _rzpx_port:
         cpx #$00
@@ -496,10 +615,9 @@ read_zp:
         ldx c128_addr_lo
         cpx #$02
         bcc _rzp_port
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         rts
 _rzp_port:
         cpx #$00
@@ -522,12 +640,9 @@ _rzp_tmp: .byte 0
 write_zp_x:
         cpx #$02
         bcc _wzpx_port
-        pha
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
-        pla
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         rts
 _wzpx_port:
         cpx #$00
@@ -535,22 +650,22 @@ _wzpx_port:
         sta cpu_port_data
         ; Also write to bank 4
         pha
-        #setup_bank4_zp
         lda #$01
-        sta C128_MEM_PTR+0
+        sta c128_zp_ptr+0
         ldz #0
         lda cpu_port_data
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         pla
         rts
 _wzpx_ddr:
         sta cpu_port_ddr
         ; Also write to bank 4
         pha
-        #setup_bank4_zp
+        lda #$00
+        sta c128_zp_ptr+0
         ldz #0
         lda cpu_port_ddr
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         pla
         rts
 
@@ -559,11 +674,10 @@ write_zp:
         ldx c128_addr_lo
         cpx #$02
         bcc _wzp_port
-        #setup_bank4_zp
-        stx C128_MEM_PTR+0
+        stx c128_zp_ptr+0
         ldz #0
         lda c128_data
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         rts
 _wzp_port:
         lda c128_data
@@ -572,35 +686,34 @@ _wzp_port:
         sta cpu_port_data
         ; Also write to bank 4
         pha
-        #setup_bank4_zp
         lda #$01
-        sta C128_MEM_PTR+0
+        sta c128_zp_ptr+0
         ldz #0
         lda cpu_port_data
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         pla
         rts
 _wzp_ddr:
         sta cpu_port_ddr
         ; Also write to bank 4
         pha
-        #setup_bank4_zp
+        lda #$00
+        sta c128_zp_ptr+0
         ldz #0
         lda cpu_port_ddr
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
         pla
         rts
 
 ; Read 16-bit pointer from ZP address Y, result in c128_addr_lo/hi
 ; (Used for indirect addressing modes)
 read_zp_ptr_y:
-        #setup_bank4_zp
-        sty C128_MEM_PTR+0
+        sty c128_zp_ptr+0
         ldz #0
-        lda [C128_MEM_PTR],z
+        lda [c128_zp_ptr],z
         sta c128_addr_lo
-        inc C128_MEM_PTR+0
-        lda [C128_MEM_PTR],z
+        inc c128_zp_ptr+0
+        lda [c128_zp_ptr],z
         sta c128_addr_hi
         rts
 
@@ -667,12 +780,13 @@ addr_indx:
         jsr fetch8
         clc
         adc c128_x
-        tay                             ; Y = ZP address
-        ; Read 16-bit pointer directly from ZP
-        jsr lrb_read_y
+        ; Read 16-bit pointer directly from ZP (inlined lrb_read)
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z             ; ptr lo
         sta c128_addr_lo
-        iny
-        jsr lrb_read_y
+        inc c128_zp_ptr+0               ; wraps within ZP page
+        lda [c128_zp_ptr],z             ; ptr hi
         sta c128_addr_hi
         rts
 
@@ -681,28 +795,25 @@ addr_indy:
         tay                             ; Y = ZP address
         lda #$00
         sta c128_xtra
-        ; Read 16-bit pointer directly from ZP
-        jsr lrb_read_y
+        ; Read 16-bit pointer directly from ZP (inlined lrb_read)
+        sty c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z             ; ptr lo
         sta c128_tmp
         iny
-        jsr lrb_read_y
-        sta c128_tmp2
+        sty c128_zp_ptr+0
+        lda [c128_zp_ptr],z             ; ptr hi
         ; Add Y register to form final address
+        sta c128_addr_hi                ; tentative high byte
         lda c128_tmp
         clc
         adc c128_y
         sta c128_addr_lo
-        lda c128_tmp2
-        adc #$00
-        sta c128_addr_hi
-        ; Check for page crossing
-        lda c128_tmp
-        clc
-        adc c128_y
-        bcc _indy_nc
+        bcc _indy_no_carry
+        inc c128_addr_hi                ; page crossed: increment high
         lda #$01
         sta c128_xtra
-_indy_nc:
+_indy_no_carry:
         rts
 
 addr_ind_jmp:
@@ -716,10 +827,10 @@ addr_ind_jmp:
         sta c128_vec_hi
 ;
 
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         inc c128_addr_lo
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp2
 
         lda c128_tmp
@@ -859,6 +970,10 @@ _vic_next_line:
 ; VIC_FrameTasks - Called once per frame (at raster line 0)
 ; ============================================================
 VIC_FrameTasks:
+        ; Keyboard injection - read MEGA65 hardware keyboard and inject
+        ; into C128 keyboard buffer (replaces emulated CIA matrix scan)
+        jsr C128_KeyboardInject
+
         ; VDC 80-column rendering (only when in 80-col mode)
         lda vdc_mode_active
         beq _skip_vdc_render
@@ -883,6 +998,82 @@ _skip_vdc_render:
 
 _frame_done:
         rts
+
+; ============================================================
+; C128_KeyboardInject - Read MEGA65 keyboard and inject into
+; C128 keyboard buffer. Called once per frame from VIC_FrameTasks.
+;
+; MEGA65 $D619: PETSCII keycode (read dequeues, 0 = empty)
+;
+; C128 keyboard buffer:
+;   $034A-$0353 = KEYD (10 bytes)
+;   $D0 (ZP)    = NDX (number of chars in buffer)
+; ============================================================
+C128_KEYD_OFFSET = $034A        ; Keyboard buffer start in C128 RAM
+C128_KEYD_MAX    = 10           ; Max buffer size
+C128_NDX_ZP      = $D0          ; ZP address of buffer count
+
+C128_KeyboardInject:
+        ; Read MEGA65 hardware keyboard buffer (PETSCII)
+        lda $D619
+        beq _ki_done            ; $00 = no key pending
+        cmp #$FF
+        beq _ki_done            ; $FF = no key pending
+
+        ; Dequeue the key by writing 1 to $D610
+        pha
+        lda #$01
+        sta $D610
+        pla
+
+        ; A = PETSCII code, ready to inject
+        ; Check if buffer has room
+        pha                     ; Save PETSCII code
+        lda #C128_NDX_ZP
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; A = current buffer count
+        cmp #C128_KEYD_MAX
+        bcs _ki_full            ; Buffer full
+
+        ; Store key at KEYD[NDX]
+        ; Write to bank4:$034A+NDX
+        tax                     ; X = NDX (buffer index)
+        pla                     ; A = PETSCII code
+
+        ; Set up pointer to bank4:$034A+X
+        pha                     ; Save code again
+        txa
+        clc
+        adc #<C128_KEYD_OFFSET
+        sta C128_MEM_PTR+0
+        lda #>C128_KEYD_OFFSET
+        adc #0
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        pla                     ; Get code back
+        sta [C128_MEM_PTR],z    ; Write to keyboard buffer
+
+        ; Increment NDX
+        lda #C128_NDX_ZP
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        clc
+        adc #1
+        sta [c128_zp_ptr],z
+
+_ki_done:
+        rts
+
+_ki_full:
+        pla                     ; Discard key code
+        rts
+
 
 ; ============================================================
 ; Hook routines for init code that hangs in emulation
@@ -937,15 +1128,19 @@ hook_vdc_screen_clear:
         sta vdc_regs,x
 
         ; Update guest ZP $DA/$DB (used by KERNAL screen editor)
-        #setup_bank4_zp
-        ldz #$DA
+        lda #$DA
+        sta c128_zp_ptr+0
+        ldz #0
         lda #$00
-        sta [C128_MEM_PTR],z
-        ldz #$DB
+        sta [c128_zp_ptr],z
+        inc c128_zp_ptr+0       ; $DB
         lda #$E0
-        sta [C128_MEM_PTR],z
+        sta [c128_zp_ptr],z
 
         ; Skip to RTS at $CE4B
+        lda #1
+        sta vdc_screen_dirty    ; DMA filled screen RAM
+        sta vdc_attr_dirty      ; DMA filled attribute RAM
         lda #$4B
         sta c128_pc_lo
         lda #$CE
@@ -978,6 +1173,34 @@ hook_raster_wait_2:
         sta c128_code_valid
         lda #4
         #finish_cycles_inline
+        rts
+
+; _hook_check_keybuf - Read C128 ZP $D0 (keybuf count) and $D1 (prog key count)
+; Returns: Z flag set if both are zero (empty), Z clear if key waiting
+hook_check_keybuf:
+        lda #$D0
+        sta C128_MEM_PTR+0
+        lda #$00
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0          ; Bank 4 = C128 RAM bank 0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; Read $D0 (keyboard buffer count)
+        bne +                   ; Key waiting - return NZ
+        inz
+        lda [C128_MEM_PTR],z    ; Read $D1 (prog key string count)
++       rts
+
+; hook_keyboard_idle - Skip one iteration of the $C25E idle loop
+; The tight loop (LDA $D0 / ORA $D1 / BEQ $C25E) is 9 cycles.
+; We skip the instruction decode overhead by just adding 9 cycles.
+; This saves the ~25 MEGA65 cycles of instruction decode per iteration
+; while keeping the C128 timing identical.
+hook_keyboard_idle:
+        lda #63
+        #finish_cycles_no_xtra
         rts
 
 ; write_milestone - Write progress byte A to $0FE0F
@@ -1183,11 +1406,11 @@ C128_CPUReset:
         sta c128_addr_lo
         lda #$ff
         sta c128_addr_hi
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_pc_lo
         lda #$fd
         sta c128_addr_lo
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_pc_hi
         lda #0
         sta c128_code_valid
@@ -1216,7 +1439,7 @@ _fix_zp_loop:
         lda #$00
         sta c128_addr_hi
         phx
-        jsr C128_Write
+        #write_data_fast
         plx
         inx
         cpx #27                 ; 27 bytes: $E0-$FA
@@ -1229,28 +1452,28 @@ _fix_zp_loop:
         sta c128_addr_lo
         lda #$00
         sta c128_addr_hi
-        jsr C128_Write
+        #write_data_fast
 
         ; Fix $D7 (MODE) = $80 (80-col flag)
         lda #$80
         sta c128_data
         lda #$D7
         sta c128_addr_lo
-        jsr C128_Write
+        #write_data_fast
 
         ; Fix $DA (screen line ptr lo) = $00
         lda #$00
         sta c128_data
         lda #$DA
         sta c128_addr_lo
-        jsr C128_Write
+        #write_data_fast
 
         ; Fix $DB (screen line ptr hi) = $04
         lda #$04
         sta c128_data
         lda #$DB
         sta c128_addr_lo
-        jsr C128_Write
+        #write_data_fast
 
         ; Fix $0A03 = $50 (Z80 boot signature)
         lda #$50
@@ -1259,7 +1482,7 @@ _fix_zp_loop:
         sta c128_addr_lo
         lda #$0A
         sta c128_addr_hi
-        jsr C128_Write
+        #write_data_fast
 
         rts
 
@@ -1273,11 +1496,11 @@ vice_80col_zp:
         sta c128_addr_lo
         lda #$ff
         sta c128_addr_hi
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_pc_lo
         lda #$fd
         sta c128_addr_lo
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_pc_hi
         rts
 
@@ -1309,7 +1532,7 @@ z80_wr_ffd0:
         lda #$FF
         sta c128_addr_hi
         phx
-        jsr C128_Write
+        #write_data_fast
         plx
         inx
         cpx #16
@@ -1328,7 +1551,7 @@ z80_wr_ffe0:
         lda #$FF
         sta c128_addr_hi
         phx
-        jsr C128_Write
+        #write_data_fast
         plx
         inx
         cpx #16
@@ -1347,7 +1570,7 @@ z80_wr_1100:
         lda #$11
         sta c128_addr_hi
         phx
-        jsr C128_Write
+        #write_data_fast
         plx
         inx
         cpx #8
@@ -1361,7 +1584,7 @@ z80_wr_1100:
         sta c128_addr_lo
         lda #$0A
         sta c128_addr_hi
-        jsr C128_Write
+        #write_data_fast
 
         ; --- Set $0A03 = $50 (Z80 boot signature) ---
         ; On real C128, the Z80 boot writes $50 here regardless of 40/80 mode.
@@ -1372,7 +1595,7 @@ z80_wr_1100:
         sta c128_addr_lo
         lda #$0A
         sta c128_addr_hi
-        jsr C128_Write
+        #write_data_fast
 
         ; --- Set warm start vector $0A00-$0A01 = $4000 (BASIC LO cold start) ---
         ; The Z80 boot sets this so MONITOR's X command (JMP ($0A00)) enters
@@ -1384,12 +1607,12 @@ z80_wr_1100:
         sta c128_addr_lo
         lda #$0A
         sta c128_addr_hi
-        jsr C128_Write
+        #write_data_fast
         lda #$40
         sta c128_data
         lda #$01
         sta c128_addr_lo
-        jsr C128_Write
+        #write_data_fast
 
         rts
 
@@ -1425,7 +1648,7 @@ z80_1100_data:
 ; ============================================================
 ; Trace/breakpoint for debugging
 ; ============================================================
-TRACE_ENABLED = 1       ; Set to 0 to disable breakpoint
+TRACE_ENABLED = 0       ; Disabled - no breakpoint checking
 
 ; Breakpoint address - halt when PC hits this
 BREAK_ADDR_LO = $00
@@ -1433,7 +1656,7 @@ BREAK_ADDR_HI = $FD     ; Break at $FD00
 
 ; ============================================================
 ; C128CPU_StepMultiple - Execute multiple instructions
-; Simple batch version - calls C128CPU_Step repeatedly
+; Interrupt checks inlined into batch loop to reduce overhead
 ; ============================================================
 BATCH_SIZE = 64         ; Number of instructions per batch
 
@@ -1443,44 +1666,138 @@ C128_CPUStepMultiple:
         jsr C128Mon_Check
         bcs _sm_monitor_active  ; Monitor took over, skip batch
         
-        ldx #BATCH_SIZE
+        lda #BATCH_SIZE
+        sta _sm_counter
+
 _sm_batch_loop:
-        phx                     ; Save counter
-        jsr C128CPU_Step
-        plx                     ; Restore counter
-        dex
+        ; --- Interrupt check (inlined from C128CPU_Step) ---
+        lda c128_nmi_pending
+        bne _sm_do_nmi
+        lda c128_irq_pending
+        beq _sm_dispatch
+        lda c128_p
+        and #P_I
+        beq _sm_do_irq
+
+_sm_dispatch:
+        jsr C128CPU_StepDecode  ; Fetch/decode/execute one instruction
+        dec _sm_counter
         bne _sm_batch_loop
 _sm_monitor_active:
         rts
 
+_sm_do_nmi:
+        lda #0
+        sta c128_nmi_pending
+        jsr cpu_take_nmi
+        lda #7
+        #finish_cycles_inline
+        jmp _sm_next
+
+_sm_do_irq:
+        lda #0
+        sta c128_irq_pending
+        jsr cpu_take_irq
+        lda #7
+        #finish_cycles_inline
+
+_sm_next:
+        dec _sm_counter
+        bne _sm_batch_loop
+        rts
+
+_sm_counter: .byte 0
+
 ; ============================================================
-; C128CPU_Step - Single instruction execution
+; C128CPU_Step - Entry point for single instruction (for external callers)
 ; ============================================================
 C128CPU_Step:
-        ; --- Boot milestone & hook checks ---
-        ; Milestones write progress byte to $0FE0F via 32-bit store.
-        ; Check $0FE0F in the monitor to see how far boot got.
-        ;
-        ; Values:  $01=E000  $02=E0CD  $03=E1F0  $04=E242
-        ;          $05=E109  $06=E147(past raster1)  $07=E024
-        ;          $08=E093  $09=E056  $0A=C07B  $0B=B000
-        ;          $0C=B021  $0D=BASIC running
-        ;
+        lda c128_nmi_pending
+        bne _css_nmi
+        lda c128_irq_pending
+        beq C128CPU_StepDecode
+        lda c128_p
+        and #P_I
+        bne C128CPU_StepDecode
+        lda #0
+        sta c128_irq_pending
+        jsr cpu_take_irq
+        lda #7
+        #finish_cycles_inline
+        rts
+_css_nmi:
+        lda #0
+        sta c128_nmi_pending
+        jsr cpu_take_nmi
+        lda #7
+        #finish_cycles_inline
+        rts
+
+; ============================================================
+; C128CPU_StepDecode - Fetch, decode, and execute one instruction
+; (No interrupt check - caller handles that)
+; ============================================================
+C128CPU_StepDecode:
+        ; (c128_xtra is initialized by addressing mode helpers that need it)
+
+        ; --------------------------------------------------------
+        ; Hooks - only check for ROM area ($8000+)
+        ; First check inline hooks (fast), then call hooks file
+        ; --------------------------------------------------------
         lda c128_pc_hi
+        bpl _step_fetch         ; Skip all hooks if PC < $8000
+
+        ; --- Inline hooks for busy-wait loops ---
+        ; A = c128_pc_hi throughout this chain (reloaded only when clobbered)
+
+        ; Most common KERNAL pages are $C0-$CF, $E0-$FF, $F8-$FF
+        ; Order checks by frequency to minimize comparisons
+
+        ; Hook VDC polling loops at $CDCF, $CDDD
+        cmp #$CD
+        bne _hook_not_cdxx
+        lda c128_pc_lo
+        cmp #$CF
+        beq _hook_vdc_poll_skip
+        cmp #$DD
+        beq _hook_vdc_poll_skip
+        jmp _hook_chain_kernal
+_hook_not_cdxx:
 
         ; Hook $CE0C: VDC screen clear (skip the polling loop)
         cmp #$CE
         bne _hook_not_ce
         lda c128_pc_lo
         cmp #$0C
-        bne _hook_not_ce
+        bne _hook_chain_kernal_reload
         jsr hook_vdc_screen_clear
         lda #4
         #finish_cycles_inline
         rts
 _hook_not_ce:
 
-        ; Hook $E142/$E14E: raster wait loops (skip busy waits)
+        ; Hook $C543: VDC poll
+        cmp #$C5
+        bne _hook_not_c5xx
+        lda c128_pc_lo
+        cmp #$43
+        beq _hook_c543_vdc_poll
+        ; NOTE: $C55D SCNKEY hook disabled - skipping it broke the
+        ; KERNAL IRQ handler flow (screen editor, cursor blink, scroll).
+        ; Keyboard injection via $D619 in VIC_FrameTasks works without
+        ; this hook since injected keys go directly into the buffer.
+        jmp _hook_chain_kernal_reload
+_hook_c543_vdc_poll:
+        lda #$48
+        sta c128_pc_lo
+        lda #0
+        sta c128_code_valid
+        lda #4
+        #finish_cycles_inline
+        rts
+_hook_not_c5xx:
+
+        ; Hook $E1xx: raster waits and delay loop
         cmp #$E1
         bne _hook_not_e1
         lda c128_pc_lo
@@ -1488,101 +1805,9 @@ _hook_not_ce:
         beq hook_raster_wait_1
         cmp #$4E
         beq hook_raster_wait_2
-        ; Fine-grained milestones inside E109-E154
-        cmp #$09
-        bne +
-        lda #$05
-        jsr write_milestone     ; $05 = E109 entered
-+       lda c128_pc_lo
-        cmp #$14
-        bne +
-        lda #$15
-        jsr write_milestone     ; $15 = E114 (STA $DC0E)
-+       lda c128_pc_lo
-        cmp #$2E
-        bne +
-        lda #$16
-        jsr write_milestone     ; $16 = E12E (LDA #$07 STA $DD00)
-+       lda c128_pc_lo
-        cmp #$38
-        bne +
-        lda #$17
-        jsr write_milestone     ; $17 = E138 (STA $01 cpu port)
-+       lda c128_pc_lo
-        cmp #$40
-        bne +
-        lda #$18
-        jsr write_milestone     ; $18 = E140 (LDX #$FF before raster)
-+       lda c128_pc_lo
-        cmp #$47
-        bne +
-        lda #$19
-        jsr write_milestone     ; $19 = E147 (past raster wait 1)
-+       lda c128_pc_lo
-        cmp #$53
-        bne +
-        lda #$1A
-        jsr write_milestone     ; $1A = E153 (INX past raster wait 2)
-+       lda c128_pc_lo
-        cmp #$54
-        bne +
-        lda #$10
-        jsr write_milestone     ; $10 = E154
-+       lda c128_pc_lo
-        cmp #$5C
-        bne +
-        lda #$11
-        jsr write_milestone     ; $11 = E15C
-+       lda c128_pc_lo
-        cmp #$6E
-        bne +
-        lda #$12
-        jsr write_milestone     ; $12 = E16E
-+       lda c128_pc_lo
-        cmp #$79
-        bne +
-        lda #$13
-        jsr write_milestone     ; $13 = E179 (JSR E1DC)
-+       lda c128_pc_lo
-        cmp #$7E
-        bne +
-        lda #$14
-        jsr write_milestone     ; $14 = E17E (after JSR E1DC returns)
-+       ; E1DC = VDC init loop entry
-        lda c128_pc_lo
-        cmp #$DC
-        bne +
-        lda #$20
-        jsr write_milestone     ; $20 = E1DC (VDC loop entry/iteration)
-        jsr write_loop_counter  ; increment counter at $0FE0E
-+       ; E1E6 = STY $D600 inside VDC loop
-        lda c128_pc_lo
-        cmp #$E6
-        bne +
-        lda #$21
-        jsr write_milestone     ; $21 = E1E6 (STY $D600 in loop)
-+       ; E1EC = BPL at end of VDC loop
-        lda c128_pc_lo
-        cmp #$EC
-        bne +
-        lda #$22
-        jsr write_milestone     ; $22 = E1EC (BPL loop-back)
-+       ; E1EE = loop exit (end marker hit)
-        lda c128_pc_lo
-        cmp #$EE
-        bne +
-        lda #$23
-        jsr write_milestone     ; $23 = E1EE (loop done, about to RTS)
-+       ; E1EF = RTS from E1DC
-        lda c128_pc_lo
-        cmp #$EF
-        bne +
-        lda #$24
-        jsr write_milestone     ; $24 = E1EF (RTS)
-+       ; E1A8 = delay loop (DEY/BNE/DEX/BNE, 65K iterations) - skip it
-        lda c128_pc_lo
+        ; E1A8 = delay loop (DEY/BNE/DEX/BNE, 65K iterations) - skip it
         cmp #$A8
-        bne +
+        bne _hook_chain_kernal_reload
         lda #$AE
         sta c128_pc_lo          ; Skip to $E1AE
         lda #$00
@@ -1592,478 +1817,31 @@ _hook_not_ce:
         lda #4
         #finish_cycles_inline
         rts
-+       jmp _no_hooks
 _hook_not_e1:
 
-        ; Milestones in $E0xx page
+        ; Hook $E03A: PLA reads cold/warm start flag (boot only)
         cmp #$E0
-        bne _hook_not_e0
-        lda c128_pc_lo
-        cmp #$00
-        bne +
-        lda #$01
-        jsr write_milestone     ; $01 = E000
-+       lda c128_pc_lo
-        cmp #$24
-        bne +
-        lda #$07
-        jsr write_milestone     ; $07 = E024 (post-E109)
-+       lda c128_pc_lo
-        cmp #$93
-        bne +
-        lda #$08
-        jsr write_milestone     ; $08 = E093 (IOINIT)
-+       lda c128_pc_lo
-        cmp #$56
-        bne +
-        lda #$09
-        jsr write_milestone     ; $09 = E056 (RAMTAS)
-+       lda c128_pc_lo
-        cmp #$CD
-        bne _hook_not_e0
-        lda #$02
-        jsr write_milestone     ; $02 = E0CD (bank copy)
-_hook_not_e0:
-
-        ; Hook $E03A: PLA reads cold/warm start flag
-        ; Real C128: Z80 pushes $80 before 8502 boot
-        ; PLA result: negative = normal boot (BMI taken -> JMP ($0A00) -> BASIC)
-        ;             positive = enter MONITOR (JMP $B000)
-        ;             $DF = auto-boot from disk
-        ; We intercept PLA and set A=$80 for normal BASIC boot
-        lda c128_pc_hi
-        cmp #$E0
-        bne _hook_not_e03a
+        bne _hook_chain_kernal
         lda c128_pc_lo
         cmp #$3A
-        bne _hook_not_e03a
-
-        ; Set A = $80 (negative - BMI will be taken for normal boot)
+        bne _hook_chain_kernal_reload
         lda #$80
         sta c128_a
-        ; Set N flag, clear Z flag for the value $80
         lda c128_p
-        ora #P_N                ; set N (negative)
-        and #<~(P_Z)            ; clear Z (not zero)
+        ora #P_N
+        and #<~(P_Z)
         sta c128_p
-        ; Skip PLA instruction (1 byte)
         inc c128_pc_lo
         bne +
         inc c128_pc_hi
-+       ; Increment SP as PLA would
-        inc c128_sp
++       inc c128_sp
         lda #0
         sta c128_code_valid
-_hook_not_e03a:
+        lda #4
+        #finish_cycles_inline
+        rts
 
-        ; Milestones in other pages
-        lda c128_pc_hi
-        cmp #$E2
-        bne +
-        lda c128_pc_lo
-        cmp #$42
-        bne +
-        lda #$04
-        jsr write_milestone     ; $04 = E242 (C128 mode check)
-+
-        ; Capture E03E milestone
-        lda c128_pc_hi
-        cmp #$E0
-        bne _skip_e03x_diag
-        lda c128_pc_lo
-        cmp #$3E
-        bne +
-        lda #$32
-        jsr write_milestone     ; $32 = E03E (JMP $B000)
-+       lda c128_pc_lo
-        cmp #$41
-        bne +
-        lda #$35
-        jsr write_milestone     ; $35 = E041 (BMI target - warm start!)
-+       lda c128_pc_lo
-        cmp #$45
-        bne +
-        lda #$36
-        jsr write_milestone     ; $36 = E045 (JMP ($0A00) - MONITOR entry)
-+
-_skip_e03x_diag:
-        lda c128_pc_hi
-        cmp #$E1
-        bne +
-        lda c128_pc_lo
-        cmp #$F0
-        bne +
-        lda #$03
-        jsr write_milestone     ; $03 = E1F0 (auto-boot check)
-+
-        ; CINT screen editor init
-        lda c128_pc_hi
-        cmp #$C0
-        bne _hook_not_c0
-        lda c128_pc_lo
-        cmp #$7B
-        bne +
-        lda #$0A
-        jsr write_milestone     ; $0A = C07B (CINT entered)
-+       lda c128_pc_lo
-        cmp #$8B
-        bne +
-        lda #$40
-        jsr write_milestone     ; $40 = C08B (JSR $FFCC / CLRCHN)
-+       lda c128_pc_lo
-        cmp #$8E
-        bne +
-        lda #$41
-        jsr write_milestone     ; $41 = C08E (past CLRCHN)
-+       lda c128_pc_lo
-        cmp #$D0
-        bne +
-        lda #$42
-        jsr write_milestone     ; $42 = C0D0 (JSR $C983)
-+       lda c128_pc_lo
-        cmp #$D3
-        bne +
-        lda #$43
-        jsr write_milestone     ; $43 = C0D3 (past C983)
-+       lda c128_pc_lo
-        cmp #$F6
-        bne +
-        lda #$44
-        jsr write_milestone     ; $44 = C0F6 (copy loop done)
-+
-_hook_not_c0:
-
-        ; Deeper CINT milestones (page $C1)
-        lda c128_pc_hi
-        cmp #$C1
-        bne _hook_not_c1
-        lda c128_pc_lo
-        cmp #$01
-        bne +
-        lda #$45
-        jsr write_milestone     ; $45 = C101 (BIT $0A04)
-+       lda c128_pc_lo
-        cmp #$11
-        bne +
-        lda #$46
-        jsr write_milestone     ; $46 = C111 (copy CEA8 to $1000)
-+       lda c128_pc_lo
-        cmp #$24
-        bne +
-        lda #$47
-        jsr write_milestone     ; $47 = C124 (JSR $CD2E)
-+       lda c128_pc_lo
-        cmp #$2A
-        bne +
-        lda #$48
-        jsr write_milestone     ; $48 = C12A (JSR $CA24)
-+       lda c128_pc_lo
-        cmp #$2D
-        bne +
-        lda #$49
-        jsr write_milestone     ; $49 = C12D (JSR $C142)
-+       lda c128_pc_lo
-        cmp #$30
-        bne +
-        lda #$4A
-        jsr write_milestone     ; $4A = C130 (JSR $CD2E again)
-+       lda c128_pc_lo
-        cmp #$39
-        bne +
-        lda #$4B
-        jsr write_milestone     ; $4B = C139 (BIT $D505)
-+       lda c128_pc_lo
-        cmp #$41
-        bne +
-        lda #$4C
-        jsr write_milestone     ; $4C = C141 (RTS from CINT)
-+       ; Inside C142
-        lda c128_pc_lo
-        cmp #$42
-        bne +
-        lda #$50
-        jsr write_milestone     ; $50 = C142 (entered)
-+       lda c128_pc_lo
-        cmp #$45
-        bne +
-        lda #$51
-        jsr write_milestone     ; $51 = C145 (JSR $C15E)
-+       lda c128_pc_lo
-        cmp #$48
-        bne +
-        lda #$52
-        jsr write_milestone     ; $52 = C148 (JSR $C4A5)
-+       lda c128_pc_lo
-        cmp #$4B
-        bne +
-        lda #$53
-        jsr write_milestone     ; $53 = C14B (CPX loop check)
-+       lda c128_pc_lo
-        cmp #$5C
-        bne +
-        lda #$55
-        jsr write_milestone     ; $55 = C15C (after CPX loop)
-+       lda c128_pc_lo
-        cmp #$7A
-        bne +
-        lda #$56
-        jsr write_milestone     ; $56 = C17A
-+       lda c128_pc_lo
-        cmp #$91
-        bne +
-        lda #$57
-        jsr write_milestone     ; $57 = C191
-+       lda c128_pc_lo
-        cmp #$93
-        bne +
-        lda #$58
-        jsr write_milestone     ; $58 = C193 (CINT RTS!)
-+
-_hook_not_c1:
-
-        ; C4A5 screen clear milestones
-        lda c128_pc_hi
-        cmp #$C4
-        bne _hook_not_c4
-        lda c128_pc_lo
-        cmp #$A5
-        bne +
-        lda #$54
-        jsr write_milestone     ; $54 = C4A5 (entered)
-+
-_hook_not_c4:
-
-        ; --- Diagnostic: dump state when PC=$C141 (RTS before crash) ---
-        ; Write to $35F00 (VDC RAM area, safe from C128 writes)
-        lda c128_pc_lo
-        cmp #$41
-        bne _hook_not_c141_diag
-        lda c128_pc_hi
-        cmp #$C1
-        bne _hook_not_c141_diag
-        ; Read stack return address directly from bank 4
-        lda c128_sp
-        clc
-        adc #1
-        sta C128_MEM_PTR+0
-        lda #$01
-        sta C128_MEM_PTR+1
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta _c141_stk_lo
-        inz
-        lda [C128_MEM_PTR],z
-        sta _c141_stk_hi
-        ; Write to $35F00
-        lda #$00
-        sta C128_MEM_PTR+0
-        lda #$5F
-        sta C128_MEM_PTR+1
-        lda #$03
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda c128_sp
-        sta [C128_MEM_PTR],z    ; +0 = SP
-        inz
-        lda mmu_cr
-        sta [C128_MEM_PTR],z    ; +1 = mmu_cr
-        inz
-        lda mmu_mcr
-        sta [C128_MEM_PTR],z    ; +2 = mmu_mcr
-        inz
-        lda _c141_stk_lo
-        sta [C128_MEM_PTR],z    ; +3 = stack return lo
-        inz
-        lda _c141_stk_hi
-        sta [C128_MEM_PTR],z    ; +4 = stack return hi
-        inz
-        lda #$AA
-        sta [C128_MEM_PTR],z    ; +5 = marker
-_hook_not_c141_diag:
-
-        jmp _past_c141_diag
-_c141_stk_lo: .byte 0
-_c141_stk_hi: .byte 0
-_past_c141_diag:
-        ; --- PC trace diagnostic for 80-col debugging ---
-        ; Write last 8 PCs (ALL addresses) to $35F10-$35F1F
-        ; Set up 32-bit pointer to $35F10
-        lda #$10
-        sta C128_MEM_PTR+0
-        lda #$5F
-        sta C128_MEM_PTR+1
-        lda #$03
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldx _pc_trace_idx
-        txa
-        taz
-        lda c128_pc_lo
-        sta [C128_MEM_PTR],z
-        inz
-        lda c128_pc_hi
-        sta [C128_MEM_PTR],z
-        inx
-        inx
-        txa
-        and #$0F                ; wrap at 16 bytes (8 entries)
-        sta _pc_trace_idx
-
-        jmp _past_c4_data
-_pc_trace_idx: .byte 0
-_c4c0_fired: .byte 0
-_past_c4_data:
-        ; Post-CINT milestones
-        lda c128_pc_hi
-        cmp #$E0
-        bne _hook_not_e0_post
-        lda c128_pc_lo
-        cmp #$3A
-        bne +
-        lda #$30
-        jsr write_milestone     ; $30 = E03A (PLA after CINT returned)
-+       lda c128_pc_lo
-        cmp #$3B
-        bne +
-        lda #$31
-        jsr write_milestone     ; $31 = E03B (CLI - enables interrupts!)
-+       lda c128_pc_lo
-        cmp #$3E
-        bne +
-        lda #$32
-        jsr write_milestone     ; $32 = E03E (JMP $B000)
-+       lda c128_pc_lo
-        cmp #$3C
-        bne +
-        lda #$33
-        jsr write_milestone     ; $33 = E03C (instruction after CLI)
-+
-_hook_not_e0_post:
-
-        ; BASIC cold start paths
-        lda c128_pc_hi
-        cmp #$E0
-        bne _not_e0_alt
-        lda c128_pc_lo
-        cmp #$41
-        bne +
-        lda #$35
-        jsr write_milestone     ; $35 = E041 (BMI target - alt boot)
-+       lda c128_pc_lo
-        cmp #$45
-        bne +
-        lda #$36
-        jsr write_milestone     ; $36 = E045 JMP ($0A00)
-+
-_not_e0_alt:
-
-        lda c128_pc_hi
-        cmp #$40
-        bne _not_40
-        lda c128_pc_lo
-        cmp #$00
-        bne +
-        lda #$37
-        jsr write_milestone     ; $37 = 4000 (BASIC LO entry!)
-+       lda c128_pc_lo
-        cmp #$23
-        bne +
-        lda #$38
-        jsr write_milestone     ; $38 = 4023 (BASIC LO cold start)
-+       lda c128_pc_lo
-        cmp #$45
-        bne +
-        lda #$39
-        jsr write_milestone     ; $39 = 4045
-+       lda c128_pc_lo
-        cmp #$1C
-        bne +
-        lda #$3A
-        jsr write_milestone     ; $3A = 401C (CLI before main loop)
-+
-        ; Check for $4Dxx range
-        lda c128_pc_hi
-        cmp #$4D
-        bne _not_4d
-        lda c128_pc_lo
-        cmp #$37
-        bne +
-        lda #$3B
-        jsr write_milestone     ; $3B = 4D37 (BASIC main loop entry)
-+       lda c128_pc_lo
-        cmp #$B7
-        bne +
-        lda #$3C
-        jsr write_milestone     ; $3C = 4DB7 (after JMP ($0300))
-+       lda c128_pc_lo
-        cmp #$C6
-        bne +
-        lda #$3D
-        jsr write_milestone     ; $3D = 4DC6 (input loop)
-+
-_not_4d:
-        ; Check for $4Fxx (input routine)
-        lda c128_pc_hi
-        cmp #$4F
-        bne _not_4f
-        lda c128_pc_lo
-        cmp #$93
-        bne +
-        lda #$3E
-        jsr write_milestone     ; $3E = 4F93 (line input)
-+
-_not_4f:
-
-_not_40:
-
-        lda c128_pc_hi
-        cmp #$B0
-        bne _hook_not_b0xx
-        lda c128_pc_lo
-        cmp #$00
-        bne +
-        lda #$0B
-        jsr write_milestone     ; $0B = B000 (BASIC HI entry)
-+       lda c128_pc_hi
-        cmp #$B0
-        bne _hook_not_b0xx
-        lda c128_pc_lo
-        cmp #$03
-        bne +
-        lda #$34
-        jsr write_milestone     ; $34 = B003 (BASIC IRQ handler)
-+       lda c128_pc_hi
-        cmp #$B0
-        bne _hook_not_b0xx
-        lda c128_pc_lo
-        cmp #$21
-        bne +
-        lda #$0C
-        jsr write_milestone     ; $0C = B021 (BASIC HI init)
-+
-_hook_not_b0xx:
-        ; Hook: VDC polling loops at $C543, $CDCF, $CDDD
-        ; These poll $D600 bit 7 (VDC ready). Since we return $A0,
-        ; they should exit immediately. But add hooks as safety.
-        lda c128_pc_hi
-        cmp #$CD
-        bne _hook_not_cdxx
-        lda c128_pc_lo
-        cmp #$CF
-        beq _hook_vdc_poll_skip
-        cmp #$DD
-        beq _hook_vdc_poll_skip
-        jmp _hook_not_cdxx
 _hook_vdc_poll_skip:
-        ; Skip the BIT/BPL loop: advance PC past BPL
-        ; BIT $D600 = 3 bytes, BPL = 2 bytes, total 5
         lda c128_pc_lo
         clc
         adc #$05
@@ -2073,316 +1851,55 @@ _hook_vdc_poll_skip:
         lda #4
         #finish_cycles_inline
         rts
-_hook_not_cdxx:
 
+_hook_chain_kernal_reload:
         lda c128_pc_hi
-        cmp #$C5
-        bne _no_hooks
-        lda c128_pc_lo
-        cmp #$43
-        bne _no_hooks
-        ; $C543 VDC poll - skip it
-        lda #$48                ; $C543 + 5 = $C548
-        sta c128_pc_lo
-        lda #0
-        sta c128_code_valid
-        lda #4
-        #finish_cycles_inline
-        rts
+_hook_chain_kernal:
+        ; --- KERNAL call hooks (LOAD, SAVE, OPEN, etc.) ---
+        ; Only call if PC is in hook-relevant pages ($A8, $C8, $F8, $FF)
+        cmp #$FF
+        beq _hook_do_check
+        cmp #$F8
+        beq _hook_do_check
+        cmp #$C8
+        beq _hook_do_check
+        cmp #$A8
+        beq _hook_do_check
+        jmp _step_fetch         ; No hooks for this page
 
-_no_hooks:
-        ; DEBUG TRACE DISABLED
-        ; lda c128_trace_enabled
-        ; beq _skip_trace
-        ; ... trace code ...
-        
-_skip_trace_old:
-        ; Diagnostic: check if mmu_ram_bank is correct
-        lda mmu_ram_bank
-        sta $7700
-        lda mmu_io_visible
-        sta $7701
-        lda mmu_kernal_rom
-        sta $7702
-        lda c128_pc_lo
-        sta $7710
-        lda c128_pc_hi
-        sta $7711
-        ; --------------------------------------------------------
-        ; Check for pending interrupts (NMI first, then IRQ)
-        ; --------------------------------------------------------
-        lda c128_nmi_pending
-        beq _step_chk_irq
-        lda #0
-        sta c128_nmi_pending
-        jsr cpu_take_nmi
-        lda #7
-        #finish_cycles_inline
-        rts
-        
-_step_chk_irq:
-        lda c128_irq_pending
-        beq _step_execute
-        lda c128_p
-        and #P_I
-        bne _step_execute       ; I=1, IRQ masked
-        
-        lda #0
-        sta c128_irq_pending
-        jsr cpu_take_irq
-        lda #7
-        #finish_cycles_inline
-        rts
-
-_step_execute:
-        lda #$00
-        sta c128_xtra
-        
-        ; Save instruction PC for debugging
-        lda c128_pc_lo
-        sta c128_inst_pc_lo
-        lda c128_pc_hi
-        sta c128_inst_pc_hi
-
-        ; Record PC and SP in trace ring buffer (only on page change or branch)
-        ldx pc_trace_idx
-        dex
-        txa
-        and #$7F
-        tax
-        lda c128_pc_hi
-        cmp pc_trace_hi,x       ; Same page as last entry?
-        beq _skip_trace2
-        ; Different page - record it
-        ldx pc_trace_idx
-        sta pc_trace_hi,x
-        lda c128_pc_lo
-        sta pc_trace_lo,x
-        lda c128_sp
-        sta pc_trace_sp,x
-        inx
-        txa
-        and #$7F
-        sta pc_trace_idx
-_skip_trace2:
-
-        ; LIVE TRACE - DISABLED
-live_trace_done:
-
-
-        ; Check breakpoint BEFORE we fetch/execute
-.if TRACE_ENABLED
-        lda c128_inst_pc_hi
-        cmp #BREAK_ADDR_HI
-        bne _no_break
-        lda c128_inst_pc_lo
-        cmp #BREAK_ADDR_LO
-        bne _no_break
-        ; Hit breakpoint! Halt with red border
-        lda #$02
-        sta $d020
-_break_halt:
-        jmp _break_halt
-_no_break:
-.endif
-
-        ; --------------------------------------------------------
-        ; CRASH CATCHER - check for PC=$20xx BEFORE the $8000 gate
-        ; --------------------------------------------------------
-        lda c128_pc_hi
-        cmp #$20
-        bne _no_crash_20xx
-        ; Set up pointer to $35F20
-        lda #$20
-        sta C128_MEM_PTR+0
-        lda #$5F
-        sta C128_MEM_PTR+1
-        lda #$03
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda c128_pc_lo
-        sta [C128_MEM_PTR],z    ; +0 = PC lo
-        inz
-        lda c128_pc_hi
-        sta [C128_MEM_PTR],z    ; +1 = PC hi
-        inz
-        lda c128_sp
-        sta [C128_MEM_PTR],z    ; +2 = SP
-        inz
-        lda mmu_cr
-        sta [C128_MEM_PTR],z    ; +3 = mmu_cr
-        inz
-        lda mmu_kernal_rom
-        sta [C128_MEM_PTR],z    ; +4 = kernal_rom
-        inz
-        lda mmu_mcr
-        sta [C128_MEM_PTR],z    ; +5 = mmu_mcr
-        inz
-        lda c128_p
-        sta [C128_MEM_PTR],z    ; +6 = CPU flags
-        inz
-        ; Read stack[SP+1..SP+4]
-        lda c128_sp
-        clc
-        adc #1
-        sta C128_MEM_PTR+0
-        lda #$01
-        sta C128_MEM_PTR+1
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta _crash_s1
-        inz
-        lda [C128_MEM_PTR],z
-        sta _crash_s2
-        inz
-        lda [C128_MEM_PTR],z
-        sta _crash_s3
-        inz
-        lda [C128_MEM_PTR],z
-        sta _crash_s4
-        ; Write stack to $35F27
-        lda #$27
-        sta C128_MEM_PTR+0
-        lda #$5F
-        sta C128_MEM_PTR+1
-        lda #$03
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda _crash_s1
-        sta [C128_MEM_PTR],z
-        inz
-        lda _crash_s2
-        sta [C128_MEM_PTR],z
-        inz
-        lda _crash_s3
-        sta [C128_MEM_PTR],z
-        inz
-        lda _crash_s4
-        sta [C128_MEM_PTR],z
-        inz
-        lda #$BB
-        sta [C128_MEM_PTR],z
-        ; Halt with red border
-        lda #$02
-        sta $D020
-_crash_20xx_halt:
-        jmp _crash_20xx_halt
-_no_crash_20xx:
-        jmp _past_crash_vars
-_crash_s1: .byte 0
-_crash_s2: .byte 0
-_crash_s3: .byte 0
-_crash_s4: .byte 0
-_past_crash_vars:
-
-        ; --------------------------------------------------------
-        ; BASIC/KERNAL hooks - only for ROM area ($8000+)
-        ; --------------------------------------------------------
-        lda c128_pc_hi
-        bpl _step_fetch         ; Skip hooks if PC < $8000
-        
-        ; Clear hook PC changed flag before calling hooks
+_hook_do_check:
         lda #0
         sta c128_hook_pc_changed
-        
         jsr C128Hook_CheckAndRun
-        
-        ; Check if hook modified PC - if so, invalidate code cache
         lda c128_hook_pc_changed
         beq _step_fetch
         lda #0
-        sta c128_code_valid       ; Force code cache rebuild
-        jmp _step_fetch
-
-_trap_fb:
-        ; Breakpoint hit at $FBEA - dump 128-entry trace to $7000
-        ldx pc_trace_idx
-        ldy #0
-        sty _trap_sp_idx
-_trap_trace:
-        lda pc_trace_hi,x
-        sta $7000,y
-        iny
-        lda pc_trace_lo,x
-        sta $7000,y
-        iny
-        ; SP trace stored sequentially at $7100
-        phy
-        ldy _trap_sp_idx
-        lda pc_trace_sp,x
-        sta $7100,y
-        iny
-        sty _trap_sp_idx
-        ply
-        inx
-        txa
-        and #$7F
-        tax
-        cpy #0                  ; 256 bytes = 128 entries * 2
-        bne _trap_trace
-        lda c128_pc_hi
-        sta $7200
-        lda c128_pc_lo
-        sta $7201
-        lda c128_sp
-        sta $7202
-        lda mmu_cr
-        sta $7203
-        lda #$CC               ; trap marker
-        sta $7204
-        ; Check ROM byte at $1FF7F (should be $FA)
-        lda #$7F
-        sta C128_MEM_PTR+0
-        lda #$FF
-        sta C128_MEM_PTR+1
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        sta $7205              ; actual byte at $1FF7F
-        ; Dump shared RAM state
-        lda shared_bottom_on
-        sta $7206
-        lda shared_bottom_mask
-        sta $7207
-        lda mmu_ram_bank
-        sta $7208
-        lda mmu_rcr
-        sta $7209
-        lda mmu_cr
-        sta $720A
-        lda c128_sp
-        sta $720B
-        ; Halt with white border
-        lda #$01
-        sta $d020
-_trap_halt:
-        jmp _trap_halt
-
-_trap_sp_idx: .byte 0
-_trap_prev_hi: .byte 0
+        sta c128_code_valid
         
 _step_fetch:
         ; --------------------------------------------------------
-        ; Fetch opcode and dispatch
+        ; Fetch opcode and dispatch (inlined fast path)
         ; --------------------------------------------------------
-        jsr fetch8
+        lda c128_code_valid
+        beq _step_fetch_slow
+        lda c128_pc_hi
+        cmp c128_code_page_hi
+        bne _step_fetch_slow
+        ; Cache hit - read directly
+        ldz c128_pc_lo
+        lda [c128_code_ptr],z
+        inw c128_pc_lo
+_step_dispatch:
         asl                     ; opcode * 2, carry set if opcode >= $80
         tax
         bcc _step_dispatch_lo
         jmp (op_table_hi,x)     ; opcodes $80-$FF
 _step_dispatch_lo:
         jmp (op_table_lo,x)     ; opcodes $00-$7F
+
+_step_fetch_slow:
+        jsr fetch8
+        jmp _step_dispatch
 
 ; ============================================================
 ; finish_cycles - Handles cycle accounting, returns with RTS
@@ -2710,90 +2227,52 @@ _sbc_nov2:
 ; --- do_cmp ---
 do_cmp:
         sta c128_tmp
-        lda c128_p
-        and #(~(P_C|P_Z|P_N)) & $ff
-        sta c128_p
-        lda c128_a
-        cmp c128_tmp
-        bcc _cmp_noc
-        lda c128_p
-        ora #P_C
-        sta c128_p
-_cmp_noc:
         lda c128_a
         sec
-        sbc c128_tmp
-        beq _cmp_z
-        bmi _cmp_n
-        rts
-_cmp_z:
+        sbc c128_tmp            ; A-M, sets native C/Z/N
+        ; Now extract flags from the native 65C02 result:
+        ; C = set if A >= M (no borrow)
+        ; Z = set if A == M
+        ; N = set if (A-M) bit 7 set
+        php                     ; Save native flags
+        pla                     ; A = native P register
+        and #(P_C|P_Z|P_N)     ; Keep only C, Z, N
+        sta c128_tmp
         lda c128_p
-        ora #P_Z
-        sta c128_p
-        rts
-_cmp_n:
-        lda c128_p
-        ora #P_N
+        and #(~(P_C|P_Z|P_N)) & $ff
+        ora c128_tmp
         sta c128_p
         rts
 
 ; --- do_cpx ---
 do_cpx:
         sta c128_tmp
-        lda c128_p
-        and #(~(P_C|P_Z|P_N)) & $ff
-        sta c128_p
-        lda c128_x
-        cmp c128_tmp
-        bcc _cpx_noc
-        lda c128_p
-        ora #P_C
-        sta c128_p
-_cpx_noc:
         lda c128_x
         sec
         sbc c128_tmp
-        beq _cpx_z
-        bmi _cpx_n
-        rts
-_cpx_z:
+        php
+        pla
+        and #(P_C|P_Z|P_N)
+        sta c128_tmp
         lda c128_p
-        ora #P_Z
-        sta c128_p
-        rts
-_cpx_n:
-        lda c128_p
-        ora #P_N
+        and #(~(P_C|P_Z|P_N)) & $ff
+        ora c128_tmp
         sta c128_p
         rts
 
 ; --- do_cpy ---
 do_cpy:
         sta c128_tmp
-        lda c128_p
-        and #(~(P_C|P_Z|P_N)) & $ff
-        sta c128_p
-        lda c128_y
-        cmp c128_tmp
-        bcc _cpy_noc
-        lda c128_p
-        ora #P_C
-        sta c128_p
-_cpy_noc:
         lda c128_y
         sec
         sbc c128_tmp
-        beq _cpy_z
-        bmi _cpy_n
-        rts
-_cpy_z:
+        php
+        pla
+        and #(P_C|P_Z|P_N)
+        sta c128_tmp
         lda c128_p
-        ora #P_Z
-        sta c128_p
-        rts
-_cpy_n:
-        lda c128_p
-        ora #P_N
+        and #(~(P_C|P_Z|P_N)) & $ff
+        ora c128_tmp
         sta c128_p
         rts
 
@@ -2811,10 +2290,10 @@ op_00:
         sta $D020
 
         ; Dump BRK diagnostic info at $7050
-        lda c128_inst_pc_hi
-        sta $7050               ; PC hi where BRK was
-        lda c128_inst_pc_lo
-        sta $7051               ; PC lo where BRK was
+        lda c128_pc_hi
+        sta $7050               ; PC hi (points past BRK opcode)
+        lda c128_pc_lo
+        sta $7051               ; PC lo
         lda c128_sp
         sta $7052
         lda c128_a
@@ -2873,13 +2352,13 @@ op_00:
 ; $01 ORA (zp,X)
 op_01:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $05 ORA zp
@@ -2891,9 +2370,9 @@ op_05:
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $06 ASL zp
@@ -2911,7 +2390,7 @@ _op06_nc:
         sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -2923,17 +2402,17 @@ op_08:
         sta c128_data
         jsr push_data
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $09 ORA #imm
 op_09:
-        jsr fetch8
+        #fetch8_operand
         ora c128_a
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $0A ASL A
@@ -2953,7 +2432,7 @@ op_0a:
 _op0a_nc:
         lda c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #2
         #finish_cycles_inline
         rts
@@ -2961,23 +2440,23 @@ _op0a_nc:
 ; $0D ORA abs
 op_0d:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $0E ASL abs
 op_0e:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         asl
         php
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda c128_p
         and #(~P_C) & $ff
         sta c128_p
@@ -2989,14 +2468,15 @@ op_0e:
 _op0e_nc:
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
 
 ; $10 BPL
 op_10:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbs 7, c128_p,_op10_nt
         ;lda c128_p
         ;and #P_N
@@ -3006,20 +2486,18 @@ op_10:
         #finish_cycles_inline
         rts
 _op10_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $11 ORA (zp),Y
 op_11:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -3035,9 +2513,9 @@ op_15:
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $16 ASL zp,X
@@ -3058,7 +2536,7 @@ _op16_nc:
         sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
@@ -3069,17 +2547,17 @@ op_18:
         and #(~P_C) & $ff
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $19 ORA abs,Y
 op_19:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -3087,11 +2565,11 @@ op_19:
 ; $1D ORA abs,X
 op_1d:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         ora c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -3099,11 +2577,11 @@ op_1d:
 ; $1E ASL abs,X
 op_1e:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         asl
         php
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda c128_p
         and #(~P_C) & $ff
         sta c128_p
@@ -3115,7 +2593,7 @@ op_1e:
 _op1e_nc:
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #7
         #finish_cycles_inline
         rts
@@ -3143,19 +2621,19 @@ op_20:
         lda c128_vec_hi
         sta c128_pc_hi
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $21 AND (zp,X)
 op_21:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $24 BIT zp
@@ -3196,9 +2674,9 @@ op_25:
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $26 ROL zp
@@ -3228,7 +2706,7 @@ op_26:
 _op26_nc:
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -3240,17 +2718,17 @@ op_28:
         ora #P_U
         sta c128_p
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $29 AND #imm
 op_29:
-        jsr fetch8
+        #fetch8_operand
         and c128_a
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $2A ROL A
@@ -3275,7 +2753,7 @@ op_2a:
 _op2a_nc:
         lda c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #2
         #finish_cycles_inline
         rts
@@ -3283,7 +2761,7 @@ _op2a_nc:
 ; $2C BIT abs
 op_2c:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lda c128_p
         and #(~(P_N|P_V|P_Z)) & $ff
@@ -3310,19 +2788,19 @@ _op2c_nz:
 ; $2D AND abs
 op_2d:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $2E ROL abs
 op_2e:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lda c128_p
         and #P_C
@@ -3341,17 +2819,18 @@ op_2e:
         ora #P_C
         sta c128_p
 _op2e_nc:
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
 
 ; $30 BMI
 op_30:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbr 7, c128_p, _op30_nt
         ;lda c128_p
         ;and #P_N
@@ -3361,20 +2840,18 @@ op_30:
         #finish_cycles_inline
         rts
 _op30_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $31 AND (zp),Y
 op_31:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -3390,9 +2867,9 @@ op_35:
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $36 ROL zp,X
@@ -3425,7 +2902,7 @@ op_36:
 _op36_nc:
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
@@ -3436,17 +2913,17 @@ op_38:
         ora #P_C
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $39 AND abs,Y
 op_39:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -3454,11 +2931,11 @@ op_39:
 ; $3D AND abs,X
 op_3d:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         and c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -3466,7 +2943,7 @@ op_3d:
 ; $3E ROL abs,X
 op_3e:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lda c128_p
         and #P_C
@@ -3485,10 +2962,10 @@ op_3e:
         ora #P_C
         sta c128_p
 _op3e_nc:
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #7
         #finish_cycles_inline
         rts
@@ -3504,19 +2981,19 @@ op_40:
         jsr pull_to_a
         sta c128_pc_hi
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $41 EOR (zp,X)
 op_41:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $45 EOR zp
@@ -3528,9 +3005,9 @@ op_45:
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $46 LSR zp
@@ -3550,7 +3027,7 @@ _op46_nc:
         sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -3561,17 +3038,17 @@ op_48:
         sta c128_data
         jsr push_data
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $49 EOR #imm
 op_49:
-        jsr fetch8
+        #fetch8_operand
         eor c128_a
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $4A LSR A
@@ -3592,7 +3069,7 @@ op_4a:
 _op4a_nc:
         lda c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #2
         #finish_cycles_inline
         rts
@@ -3605,25 +3082,25 @@ op_4c:
         lda c128_addr_hi
         sta c128_pc_hi
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $4D EOR abs
 op_4d:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $4E LSR abs
 op_4e:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lsr
         sta c128_data
@@ -3637,17 +3114,18 @@ op_4e:
         ora #P_C
         sta c128_p
 _op4e_nc:
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
 
 ; $50 BVC
 op_50:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbs 6, c128_p, _op50_nt
         ;lda c128_p
         ;and #P_V
@@ -3657,20 +3135,18 @@ op_50:
         #finish_cycles_inline
         rts
 _op50_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $51 EOR (zp),Y
 op_51:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -3686,9 +3162,9 @@ op_55:
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $56 LSR zp,X
@@ -3711,7 +3187,7 @@ _op56_nc:
         sta c128_p
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
@@ -3722,17 +3198,17 @@ op_58:
         and #(~P_I) & $ff
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $59 EOR abs,Y
 op_59:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -3740,11 +3216,11 @@ op_59:
 ; $5D EOR abs,X
 op_5d:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         eor c128_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -3752,7 +3228,7 @@ op_5d:
 ; $5E LSR abs,X
 op_5e:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lsr
         sta c128_data
@@ -3766,10 +3242,10 @@ op_5e:
         ora #P_C
         sta c128_p
 _op5e_nc:
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #7
         #finish_cycles_inline
         rts
@@ -3782,16 +3258,16 @@ op_60:
         sta c128_pc_hi
         inw c128_pc_lo            ; 16-bit increment
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $61 ADC (zp,X)
 op_61:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_adc
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $65 ADC zp
@@ -3802,7 +3278,7 @@ op_65:
         jsr lrb_read_x
         jsr do_adc
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $66 ROR zp
@@ -3840,7 +3316,7 @@ _op66_do:
 _op66_nc:
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -3850,9 +3326,9 @@ op_68:
         jsr pull_to_a
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $69 ADC #imm
@@ -3860,7 +3336,7 @@ op_69:
         jsr fetch8
         jsr do_adc
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $6A ROR A
@@ -3892,7 +3368,7 @@ _op6a_do:
 _op6a_nc:
         lda c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #2
         #finish_cycles_inline
         rts
@@ -3906,22 +3382,22 @@ op_6c:
         lda c128_addr_hi
         sta c128_pc_hi
         lda #5
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $6D ADC abs
 op_6d:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_adc
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $6E ROR abs
 op_6e:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lda c128_p
         and #P_C
@@ -3947,17 +3423,18 @@ _op6e_do:
         ora #P_C
         sta c128_p
 _op6e_nc:
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
 
 ; $70 BVS
 op_70:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbr 6, c128_p, _op70_nt
         ;lda c128_p
         ;and #P_V
@@ -3967,16 +3444,14 @@ op_70:
         #finish_cycles_inline
         rts
 _op70_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $71 ADC (zp),Y
 op_71:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_adc
         lda #5
         #finish_cycles_inline
@@ -3992,7 +3467,7 @@ op_75:
         jsr lrb_read_x
         jsr do_adc
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $76 ROR zp,X
@@ -4033,7 +3508,7 @@ _op76_do:
 _op76_nc:
         ; Set N/Z from result
         jsr lrb_read_x
-        #set_zna
+        #set_zn_fast
         lda #6
         #finish_cycles_inline
         rts
@@ -4044,13 +3519,13 @@ op_78:
         ora #P_I
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $79 ADC abs,Y
 op_79:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_adc
         lda #4
         #finish_cycles_inline
@@ -4059,7 +3534,7 @@ op_79:
 ; $7D ADC abs,X
 op_7d:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_adc
         lda #4
         #finish_cycles_inline
@@ -4068,7 +3543,7 @@ op_7d:
 ; $7E ROR abs,X
 op_7e:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_tmp
         lda c128_p
         and #P_C
@@ -4094,10 +3569,10 @@ _op7e_do:
         ora #P_C
         sta c128_p
 _op7e_nc:
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #7
         #finish_cycles_inline
         rts
@@ -4107,59 +3582,61 @@ op_81:
         jsr addr_indx
         lda c128_a
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $84 STY zp
 op_84:
-        ; Optimized STY zp
-        jsr fetch8
-        tax
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
         lda c128_y
-        jsr lrb_write_x
+        sta [c128_zp_ptr],z
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 
 ; $85 STA zp
 op_85:
-        jsr fetch8
-        tax
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
         lda c128_a
-        jsr lrb_write_x
+        sta [c128_zp_ptr],z
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $86 STX zp  
 op_86:
-        jsr fetch8
-        tax
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
         lda c128_x
-        jsr lrb_write_x
+        sta [c128_zp_ptr],z
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $88 DEY
 op_88:
         dec c128_y
         lda c128_y
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $8A TXA
 op_8a:
         lda c128_x
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $8C STY abs
@@ -4167,21 +3644,19 @@ op_8c:
         jsr addr_abs
         lda c128_y
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $8D STA abs
 op_8d:
         jsr addr_abs
-        sei
         lda c128_a
         sta c128_data
-        cli
-        jsr C128_Write
+        #write_data_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $8E STX abs
@@ -4189,14 +3664,15 @@ op_8e:
         jsr addr_abs
         lda c128_x
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $90 BCC
 op_90:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
 
         ; P_C is Bit 0. If Bit 0 is Set, we do NOT take the branch (BCC).
         bbs 0, c128_p, _op90_nt 
@@ -4209,10 +3685,8 @@ op_90:
         #finish_cycles_inline
         rts
 _op90_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $91 STA (zp),Y
@@ -4220,7 +3694,7 @@ op_91:
         jsr addr_indy
         lda c128_a
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda #6
         #finish_cycles_inline
         rts
@@ -4235,7 +3709,7 @@ op_94:
         lda c128_y
         jsr lrb_write_x
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $95 STA zp,X
@@ -4248,7 +3722,7 @@ op_95:
         lda c128_a
         jsr lrb_write_x
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $96 STX zp,Y
@@ -4261,16 +3735,16 @@ op_96:
         lda c128_x
         jsr lrb_write_x
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $98 TYA
 op_98:
         lda c128_y
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $99 STA abs,Y
@@ -4278,7 +3752,7 @@ op_99:
         jsr addr_absy
         lda c128_a
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -4288,7 +3762,7 @@ op_9a:
         lda c128_x
         sta c128_sp
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $9D STA abs,X
@@ -4296,139 +3770,141 @@ op_9d:
         jsr addr_absx
         lda c128_a
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda #5
         #finish_cycles_inline
         rts
 
 ; $A0 LDY #imm
 op_a0:
-        jsr fetch8
+        #fetch8_operand
         sta c128_y
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A1 LDA (zp,X)
 op_a1:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A2 LDX #imm
 op_a2:
-        jsr fetch8
+        #fetch8_operand
         sta c128_x
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A4 LDY zp
 op_a4:
-        ; Optimized LDY zp
-        jsr fetch8
-        tax
-        jsr lrb_read_x
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
         sta c128_y
-        #set_zna
+        #set_zn_fast
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A5 LDA zp
 op_a5:
-        ; Optimized LDA zp - direct access to LOW_RAM_BUFFER
-        jsr fetch8              ; Get zero page address in A
-        tax
-        jsr lrb_read_x
+        ; Optimized LDA zp - inline operand + ZP read
+        #fetch8_operand         ; Get ZP address in A (inline fast path)
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; Read from bank 4 ZP
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A6 LDX zp
 op_a6:
-        ; Optimized LDX zp
-        jsr fetch8
-        tax
-        jsr lrb_read_x
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
         sta c128_x
-        #set_zna
+        #set_zn_fast
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A8 TAY
 op_a8:
         lda c128_a
         sta c128_y
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $A9 LDA #imm
 op_a9:
-        jsr fetch8
+        #fetch8_operand
         sta c128_a
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $AA TAX
 op_aa:
         lda c128_a
         sta c128_x
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $AC LDY abs
 op_ac:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_y
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $AD LDA abs
 op_ad:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $AE LDX abs
 op_ae:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_x
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $B0 BCS
 op_b0:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbr 0, c128_p, _opb0_nt
         ;lda c128_p
         ;and #P_C
@@ -4438,19 +3914,17 @@ op_b0:
         #finish_cycles_inline
         rts
 _opb0_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $B1 LDA (zp),Y
 op_b1:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #5
         #finish_cycles_inline
         rts
@@ -4465,9 +3939,9 @@ op_b4:
         jsr lrb_read_x
         sta c128_y
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $B5 LDA zp,X
@@ -4480,9 +3954,9 @@ op_b5:
         jsr lrb_read_x
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $B6 LDX zp,Y
@@ -4495,9 +3969,9 @@ op_b6:
         jsr lrb_read_x
         sta c128_x
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $B8 CLV
@@ -4506,16 +3980,16 @@ op_b8:
         and #(~P_V) & $ff
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $B9 LDA abs,Y
 op_b9:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -4524,18 +3998,18 @@ op_b9:
 op_ba:
         lda c128_sp
         sta c128_x
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $BC LDY abs,X
 op_bc:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_y
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -4543,10 +4017,10 @@ op_bc:
 ; $BD LDA abs,X
 op_bd:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_a
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -4554,10 +4028,10 @@ op_bd:
 ; $BE LDX abs,Y
 op_be:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         sta c128_x
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #4
         #finish_cycles_inline
         rts
@@ -4567,16 +4041,16 @@ op_c0:
         jsr fetch8
         jsr do_cpy
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $C1 CMP (zp,X)
 op_c1:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cmp
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $C4 CPY zp
@@ -4587,114 +4061,111 @@ op_c4:
         jsr lrb_read_x
         jsr do_cpy
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $C5 CMP zp
 op_c5:
-        ; Optimized CMP zp
-        jsr fetch8
-        tax
-        jsr lrb_read_x
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
         jsr do_cmp
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $C6 DEC zp
 op_c6:
-        ; Optimized DEC zp
-        jsr fetch8
-        tax
-        jsr lrb_dec_x
-        jsr lrb_read_x
-        ;jsr set_zn_a
-        #set_zna
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; Read
+        sec
+        sbc #1                  ; Decrement
+        sta [c128_zp_ptr],z     ; Write back
+        #set_zn_fast
         lda #5
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $C8 INY
 op_c8:
         inc c128_y
         lda c128_y
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $C9 CMP #imm
 op_c9:
-        jsr fetch8
+        #fetch8_operand
         jsr do_cmp
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $CA DEX
 op_ca:
         dec c128_x
         lda c128_x
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $CC CPY abs
 op_cc:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cpy
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $CD CMP abs
 op_cd:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cmp
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $CE DEC abs
 op_ce:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         sec
         sbc #1
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $D0 BNE
 op_d0:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbs 1, c128_p, _opd0_nt
-        ;lda c128_p
-        ;and #P_Z
-        ;bne _opd0_nt
         jsr branch_do
         lda #2
         #finish_cycles_inline
         rts
 _opd0_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $D1 CMP (zp),Y
 op_d1:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cmp
         lda #5
         #finish_cycles_inline
@@ -4710,7 +4181,7 @@ op_d5:
         jsr lrb_read_x
         jsr do_cmp
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $D6 DEC zp,X
@@ -4723,9 +4194,9 @@ op_d6:
         jsr lrb_dec_x
         jsr lrb_read_x
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $D8 CLD
@@ -4734,13 +4205,13 @@ op_d8:
         and #(~P_D) & $ff
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $D9 CMP abs,Y
 op_d9:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cmp
         lda #4
         #finish_cycles_inline
@@ -4749,7 +4220,7 @@ op_d9:
 ; $DD CMP abs,X
 op_dd:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cmp
         lda #4
         #finish_cycles_inline
@@ -4758,14 +4229,14 @@ op_dd:
 ; $DE DEC abs,X
 op_de:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         sec
         sbc #1
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #7
         #finish_cycles_inline
         rts
@@ -4775,16 +4246,16 @@ op_e0:
         jsr fetch8
         jsr do_cpx
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $E1 SBC (zp,X)
 op_e1:
         jsr addr_indx
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_sbc
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $E4 CPX zp
@@ -4795,7 +4266,7 @@ op_e4:
         jsr lrb_read_x
         jsr do_cpx
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $E5 SBC zp
@@ -4806,29 +4277,30 @@ op_e5:
         jsr lrb_read_x
         jsr do_sbc
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $E6 INC zp
 op_e6:
-        ; Optimized INC zp
-        jsr fetch8
-        tax
-        jsr lrb_inc_x
-        jsr lrb_read_x
-        ;jsr set_zn_a
-        #set_zna
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; Read
+        clc
+        adc #1                  ; Increment
+        sta [c128_zp_ptr],z     ; Write back
+        #set_zn_fast
         lda #5
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $E8 INX
 op_e8:
         inc c128_x
         lda c128_x
-        #set_zna
+        #set_zn_fast
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $E9 SBC #imm
@@ -4836,51 +4308,52 @@ op_e9:
         jsr fetch8
         jsr do_sbc
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $EA NOP
 op_ea:
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $EC CPX abs
 op_ec:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_cpx
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $ED SBC abs
 op_ed:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_sbc
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $EE INC abs
 op_ee:
         jsr addr_abs
-        jsr C128_ReadFast
+        #read_data_fast
         clc
         adc #1
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $F0 BEQ
 op_f0:
-        jsr fetch_rel
+        #fetch8_operand
+        sta c128_tmp
         bbr 1, c128_p, _opf0_nt
         ;lda c128_p
         ;and #P_Z
@@ -4890,16 +4363,14 @@ op_f0:
         #finish_cycles_inline
         rts
 _opf0_nt:
-        lda #0
-        sta c128_xtra
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $F1 SBC (zp),Y
 op_f1:
         jsr addr_indy
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_sbc
         lda #5
         #finish_cycles_inline
@@ -4915,7 +4386,7 @@ op_f5:
         jsr lrb_read_x
         jsr do_sbc
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $F6 INC zp,X
@@ -4928,9 +4399,9 @@ op_f6:
         jsr lrb_inc_x
         jsr lrb_read_x
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #6
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $F8 SED
@@ -4939,13 +4410,13 @@ op_f8:
         ora #P_D
         sta c128_p
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; $F9 SBC abs,Y
 op_f9:
         jsr addr_absy
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_sbc
         lda #4
         #finish_cycles_inline
@@ -4954,7 +4425,7 @@ op_f9:
 ; $FD SBC abs,X
 op_fd:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         jsr do_sbc
         lda #4
         #finish_cycles_inline
@@ -4963,14 +4434,14 @@ op_fd:
 ; $FE INC abs,X
 op_fe:
         jsr addr_absx
-        jsr C128_ReadFast
+        #read_data_fast
         clc
         adc #1
         sta c128_data
-        jsr C128_Write
+        #write_data_fast
         lda c128_data
         ;jsr set_zn_a
-        #set_zna
+        #set_zn_fast
         lda #7
         #finish_cycles_inline
         rts
@@ -4986,7 +4457,7 @@ op_44:
 op_64:
         jsr fetch8              ; Skip the ZP byte
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; NOP abs (3 bytes) - $0C
@@ -4994,7 +4465,7 @@ op_0c:
         jsr fetch8              ; Skip low byte
         jsr fetch8              ; Skip high byte
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; NOP abs,X (3 bytes) - $1C, $3C, $5C, $7C, $DC, $FC
@@ -5007,7 +4478,7 @@ op_fc:
         jsr fetch8              ; Skip low byte
         jsr fetch8              ; Skip high byte
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; NOP zp,X (2 bytes) - $14, $34, $54, $74, $D4, $F4
@@ -5019,7 +4490,7 @@ op_d4:
 op_f4:
         jsr fetch8              ; Skip the ZP byte
         lda #4
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; NOP implied (1 byte) - $1A, $3A, $5A, $7A, $DA, $FA
@@ -5030,7 +4501,7 @@ op_7a:
 op_da:
 op_fa:
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; NOP immediate (2 bytes) - $80, $82, $89, $C2, $E2
@@ -5041,7 +4512,7 @@ op_c2:
 op_e2:
         jsr fetch8              ; Skip immediate byte
         lda #2
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 
 ; JAM/KIL - halt CPU (these will crash if hit)
@@ -5102,7 +4573,7 @@ op_87:
         and c128_x
         jsr lrb_write_x
         lda #3
-        #finish_cycles_inline
+        #finish_cycles_no_xtra
         rts
 op_8b: jmp op_illegal
 op_8f: jmp op_illegal
