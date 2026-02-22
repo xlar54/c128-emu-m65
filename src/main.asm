@@ -336,7 +336,6 @@ rom_fail_msg:
 ; Include emulator components
 ; ============================================================
         .include "c128_cpu_8502.asm"
-        .include "c128_cpu_z80.asm"
         .include "c128_hooks.asm"
         .include "c128_mem.asm"
         .include "c128_sound.asm"
