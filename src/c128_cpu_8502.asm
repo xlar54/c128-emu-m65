@@ -1659,20 +1659,12 @@ BREAK_ADDR_HI = $FD     ; Break at $FD00
 ; ============================================================
 BATCH_SIZE = 64         ; Number of instructions per batch
 
-C128CPU_StepMultiple:
 C128_CPUStepMultiple:
-        ; Check monitor ONCE per batch, not per instruction
-        jsr C128Mon_Check
-        bcs sm_monitor_active  ; Monitor took over, skip batch
-        
         lda #BATCH_SIZE+1       ; +1 because finish_and_loop decrements first
         sta sm_counter
 
 sm_batch_loop:
         jmp finish_and_loop     ; Enter the main execute loop
-
-sm_monitor_active:
-        rts
 
 sm_counter: .byte 0
 

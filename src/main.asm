@@ -340,11 +340,3 @@ rom_fail_msg:
         .include "c128_mem.asm"
         .include "c128_sound.asm"
         .include "c128_host.asm"
-        ;.include "c128_monitor.asm"  ; DISABLED - writes to bank 1, corrupts ROMs
-
-; Stub out monitor entry points
-C128Mon_Check:
-        clc             ; carry clear = no monitor
-        rts
-C128Mon_Enter:
-        rts
