@@ -183,6 +183,15 @@ vdc_attr_dirty:     .byte 1       ; 1=attribute RAM changed, needs translation
 ; C128_MemInit - Initialize memory system
 ; ============================================================
 C128_MemInit:
+        ; Initialize C128_RAM_PTR ($F8-$FB) - dedicated fast path pointer
+        ; This pointer is ONLY used by read/write_data_fast macros
+        ; and is NEVER modified by anything else.
+        lda #$00
+        sta C128_RAM_PTR+0      ; Low byte always 0 (Z used as offset)
+        sta C128_RAM_PTR+3      ; Megabyte always 0
+        lda #BANK_RAM0
+        sta C128_RAM_PTR+2      ; Bank always 4 (C128 RAM bank 0)
+
         ; Set MMU to default power-on state
         lda #$00
         sta mmu_cr              ; All ROMs visible, bank 0, I/O
@@ -567,9 +576,6 @@ C128_ReadFast:
         bcs C128_Read           ; $4000+ needs full handler (ROM/IO possible)
 
         ; $0000-$3FFF: Almost always BANK_RAM0
-        ; Inline the common case: if mmu_ram_bank == BANK_RAM0, skip
-        ; get_physical_bank entirely (shared RAM check only matters
-        ; when bank 1 is selected, since shared always maps to bank 0)
         lda mmu_ram_bank
         cmp #BANK_RAM0
         bne _rf_need_bank_check

@@ -80,9 +80,17 @@ set_zn_fast .macro
         sta c128_p
 .endmacro
 
+; Dedicated RAM pointer for fast read/write - NEVER used by anything else
+; Bytes +0 and +2/+3 are set once at init and never changed.
+C128_RAM_PTR    = $F8           ; 4 bytes at $F8-$FB
+; +0 = $00 (always zero, Z register provides low byte offset)
+; +1 = page (set per access)
+; +2 = BANK_RAM0 ($04) (permanent)
+; +3 = $00 (permanent)
+
 ; -----------------------------------------------------------------
 ; read_data_fast: Inline read from c128_addr_hi:c128_addr_lo
-; For addr < $40 page, sets up C128_MEM_PTR for bank 4 and reads directly.
+; For addr < $40 page, reads via dedicated C128_RAM_PTR (bank 4).
 ; For addr >= $4000, falls back to jsr C128_ReadFast.
 ; Result in A. Clobbers Z.
 ; -----------------------------------------------------------------
@@ -90,16 +98,10 @@ read_data_fast .macro
         lda c128_addr_hi
         cmp #$40
         bcs _rdf_slow\@
-        ; Fast inline: set up C128_MEM_PTR for bank 4 read
-        sta C128_MEM_PTR+1
-        lda c128_addr_lo
-        sta C128_MEM_PTR
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
+        ; Fast path: only set page, use Z for low byte
+        sta C128_RAM_PTR+1
+        ldz c128_addr_lo
+        lda [C128_RAM_PTR],z
         bra _rdf_done\@
 _rdf_slow\@:
         jsr C128_ReadFast
@@ -108,7 +110,7 @@ _rdf_done\@:
 
 ; -----------------------------------------------------------------
 ; write_data_fast: Inline write c128_data to c128_addr_hi:lo
-; For addr < $D0 page, writes directly to RAM0 via C128_MEM_PTR.
+; For addr < $D0 page, writes via dedicated C128_RAM_PTR (bank 4).
 ; For addr >= $D000, falls back to jsr C128_Write (I/O dispatch).
 ; c128_data must be set before using this macro.
 ; -----------------------------------------------------------------
@@ -123,16 +125,11 @@ write_data_fast .macro
         sta c128_code_valid
         lda c128_addr_hi
 _wdf_no_inv\@:
-        sta C128_MEM_PTR+1
-        lda c128_addr_lo
-        sta C128_MEM_PTR
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
+        ; Fast path: only set page, use Z for low byte
+        sta C128_RAM_PTR+1
+        ldz c128_addr_lo
         lda c128_data
-        sta [C128_MEM_PTR],z
+        sta [C128_RAM_PTR],z
         bra _wdf_done\@
 _wdf_slow\@:
         jsr C128_Write
