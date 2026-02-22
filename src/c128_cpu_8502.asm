@@ -153,6 +153,7 @@ finish_cycles_inline .macro
         bcc _fc_skip\@
         jsr finish_do_scanline  ; Only call if we crossed scanline boundary
 _fc_skip\@:
+        jmp finish_and_loop     ; Decrement batch counter, loop or return
 .endmacro
 
 ; ------------------------------------------------------------
@@ -167,6 +168,7 @@ finish_cycles_no_xtra .macro
         bcc _fc_skip\@
         jsr finish_do_scanline
 _fc_skip\@:
+        jmp finish_and_loop     ; Decrement batch counter, loop or return
 .endmacro
 
 
@@ -1664,54 +1666,72 @@ C128CPU_StepMultiple:
 C128_CPUStepMultiple:
         ; Check monitor ONCE per batch, not per instruction
         jsr C128Mon_Check
-        bcs _sm_monitor_active  ; Monitor took over, skip batch
+        bcs sm_monitor_active  ; Monitor took over, skip batch
         
-        lda #BATCH_SIZE
-        sta _sm_counter
+        lda #BATCH_SIZE+1       ; +1 because finish_and_loop decrements first
+        sta sm_counter
 
-_sm_batch_loop:
-        ; --- Interrupt check (inlined from C128CPU_Step) ---
-        lda c128_nmi_pending
-        bne _sm_do_nmi
-        lda c128_irq_pending
-        beq _sm_dispatch
-        lda c128_p
-        and #P_I
-        beq _sm_do_irq
+sm_batch_loop:
+        jmp finish_and_loop     ; Enter the main execute loop
 
-_sm_dispatch:
-        jsr C128CPU_StepDecode  ; Fetch/decode/execute one instruction
-        dec _sm_counter
-        bne _sm_batch_loop
-_sm_monitor_active:
+sm_monitor_active:
         rts
 
-_sm_do_nmi:
+sm_counter: .byte 0
+
+; ============================================================
+; finish_and_loop - End of instruction trampoline
+; Called from finish macros via jmp. Handles batch counter,
+; interrupt check, hook check, fetch, and dispatch - all without
+; any JSR/RTS overhead back to the batch loop.
+; Saves ~15 cycles per instruction vs old jsr StepDecode path.
+; ============================================================
+finish_and_loop:
+        dec sm_counter
+        beq _fal_done           ; Batch complete
+
+        ; --- Interrupt check (inlined) ---
+        lda c128_nmi_pending
+        bne _fal_do_nmi
+        lda c128_irq_pending
+        beq _fal_dispatch
+        lda c128_p
+        and #P_I
+        beq _fal_do_irq
+
+_fal_dispatch:
+        ; --- Hook check + fetch ---
+        lda c128_pc_hi
+        bpl step_fetch          ; PC < $8000: skip hooks, go to fetch
+        jmp C128CPU_StepDecode_hooks
+
+_fal_do_nmi:
         lda #0
         sta c128_nmi_pending
         jsr cpu_take_nmi
         lda #7
         #finish_cycles_inline
-        jmp _sm_next
+        ; loops back via jmp finish_and_loop
 
-_sm_do_irq:
+_fal_do_irq:
         lda #0
         sta c128_irq_pending
         jsr cpu_take_irq
         lda #7
         #finish_cycles_inline
+        ; loops back via jmp finish_and_loop
 
-_sm_next:
-        dec _sm_counter
-        bne _sm_batch_loop
-        rts
-
-_sm_counter: .byte 0
+_fal_done:
+        rts                     ; Return to main loop
 
 ; ============================================================
 ; C128CPU_Step - Entry point for single instruction (for external callers)
 ; ============================================================
 C128CPU_Step:
+        ; Single instruction mode: set batch counter to 1
+        ; so the finish macros will rts after one instruction
+        lda #1
+        sta sm_counter
         lda c128_nmi_pending
         bne _css_nmi
         lda c128_irq_pending
@@ -1724,20 +1744,21 @@ C128CPU_Step:
         jsr cpu_take_irq
         lda #7
         #finish_cycles_inline
-        rts
+        ; finish_cycles_inline handles rts when counter reaches 0
 _css_nmi:
         lda #0
         sta c128_nmi_pending
         jsr cpu_take_nmi
         lda #7
         #finish_cycles_inline
-        rts
+        ; finish_cycles_inline handles rts when counter reaches 0
 
 ; ============================================================
 ; C128CPU_StepDecode - Fetch, decode, and execute one instruction
 ; (No interrupt check - caller handles that)
 ; ============================================================
 C128CPU_StepDecode:
+C128CPU_StepDecode_hooks:
         ; (c128_xtra is initialized by addressing mode helpers that need it)
 
         ; --------------------------------------------------------
@@ -1745,7 +1766,7 @@ C128CPU_StepDecode:
         ; First check inline hooks (fast), then call hooks file
         ; --------------------------------------------------------
         lda c128_pc_hi
-        bpl _step_fetch         ; Skip all hooks if PC < $8000
+        bpl step_fetch         ; Skip all hooks if PC < $8000
 
         ; --- Inline hooks for busy-wait loops ---
         ; A = c128_pc_hi throughout this chain (reloaded only when clobbered)
@@ -1865,18 +1886,18 @@ _hook_chain_kernal:
         beq _hook_do_check
         cmp #$A8
         beq _hook_do_check
-        jmp _step_fetch         ; No hooks for this page
+        jmp step_fetch         ; No hooks for this page
 
 _hook_do_check:
         lda #0
         sta c128_hook_pc_changed
         jsr C128Hook_CheckAndRun
         lda c128_hook_pc_changed
-        beq _step_fetch
+        beq step_fetch
         lda #0
         sta c128_code_valid
         
-_step_fetch:
+step_fetch:
         ; --------------------------------------------------------
         ; Fetch opcode and dispatch (inlined fast path)
         ; --------------------------------------------------------
