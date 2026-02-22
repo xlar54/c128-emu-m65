@@ -1070,7 +1070,11 @@ _rc1_port_a:
 
 _rc1_port_b:
         ; $DC01: Keyboard row read
-        lda $DC01              ; Read from real MEGA65 CIA
+        ; Return $FF (no keys pressed) - keyboard input is handled
+        ; by injecting MEGA65 $D619 PETSCII codes directly into the
+        ; C128 keyboard buffer. Passing real CIA through here causes
+        ; duplicate keypresses since both paths see the same key.
+        lda #$FF
         rts
 
 _rc1_icr:
@@ -2384,6 +2388,133 @@ _vdc_skip_attr:
         rts
 
 _vdc_page_count: .byte 0
+
+; ============================================================
+; VDC_UpdateCursor - Draw/erase cursor on MEGA65 screen
+;
+; Checks VDC R10 bits 6:5 for cursor mode:
+;   %01 = cursor disabled (CRSROFF writes $20)
+; Tracks previous cursor position. On each call:
+; 1. Erase old cursor (restore char from VDC RAM at old position)
+; 2. If cursor enabled and phase is ON, draw new cursor
+;
+; MEGA65 screen at $020400, VDC screen RAM at $32000 + R12:R13
+; ============================================================
+VDC_UpdateCursor:
+        ; Check VDC R10 bits 6:5 - if %01, cursor is disabled
+        lda vdc_regs+10
+        and #%01100000
+        cmp #%00100000          ; %01 = cursor off
+        bne _vdc_cur_enabled
+
+        ; Cursor disabled - erase if currently drawn, then exit
+        lda _vdc_cur_drawn
+        beq _vdc_cur_done       ; Not drawn, nothing to do
+        jmp _vdc_cur_do_erase   ; Erase and exit
+
+_vdc_cur_enabled:
+        ; --- Step 1: Erase old cursor at previous position ---
+        lda _vdc_cur_drawn
+        beq _vdc_cur_no_erase   ; Not drawn, nothing to erase
+
+_vdc_cur_do_erase:
+
+        ; Read original char from VDC screen RAM at old position
+        ; VDC RAM addr = R12:R13 + prev_offset, at $32000+
+        lda vdc_regs+13
+        clc
+        adc _vdc_cur_prev
+        sta C128_MEM_PTR
+        lda vdc_regs+12
+        and #$3F
+        adc _vdc_cur_prev+1
+        clc
+        adc #>VDC_RAM_BASE      ; + $20
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK       ; bank 3
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; original char
+        pha
+
+        ; Write to MEGA65 screen at old position
+        lda _vdc_cur_prev
+        clc
+        adc #<$0400
+        sta C128_MEM_PTR
+        lda _vdc_cur_prev+1
+        adc #>$0400
+        sta C128_MEM_PTR+1
+        lda #$02                ; bank 2
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        pla
+        ldz #0
+        sta [C128_MEM_PTR],z
+
+        lda #0
+        sta _vdc_cur_drawn      ; mark as erased
+
+_vdc_cur_no_erase:
+        ; --- Step 2: Compute new cursor offset ---
+        lda vdc_regs+15         ; R15 cursor pos low
+        sec
+        sbc vdc_regs+13         ; R13 screen start low
+        sta _vdc_cur_offset
+        lda vdc_regs+14         ; R14 cursor pos high
+        sbc vdc_regs+12         ; R12 screen start high
+        sta _vdc_cur_offset+1
+
+        ; Bounds check: offset must be 0-1999
+        bne _vdc_cur_check_hi
+        lda _vdc_cur_offset
+        cmp #<2000
+        bcc _vdc_cur_in_bounds
+        bra _vdc_cur_done
+_vdc_cur_check_hi:
+        cmp #>2000
+        bcs _vdc_cur_done
+
+_vdc_cur_in_bounds:
+        ; --- Step 3: If cursor phase ON, draw at new position ---
+        lda c128_cur_phase
+        beq _vdc_cur_save_prev  ; Phase OFF - just save position, don't draw
+
+        ; Write reverse space ($A0) to MEGA65 screen
+        lda _vdc_cur_offset
+        clc
+        adc #<$0400
+        sta C128_MEM_PTR
+        lda _vdc_cur_offset+1
+        adc #>$0400
+        sta C128_MEM_PTR+1
+        lda #$02
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        lda #$A0               ; reverse space
+        ldz #0
+        sta [C128_MEM_PTR],z
+
+        lda #1
+        sta _vdc_cur_drawn      ; mark as drawn
+
+_vdc_cur_save_prev:
+        ; Save current offset as previous for next call
+        lda _vdc_cur_offset
+        sta _vdc_cur_prev
+        lda _vdc_cur_offset+1
+        sta _vdc_cur_prev+1
+
+_vdc_cur_done:
+        rts
+
+_vdc_cur_offset: .word 0
+_vdc_cur_prev:   .word 0       ; Previous cursor offset (for erase)
+_vdc_cur_drawn:  .byte 0       ; 1 = cursor block currently on screen
 
 ; VDC RGBI -> VIC-II color lookup table
 ; VDC RGBI encoding:  R G B I  (4 bits)

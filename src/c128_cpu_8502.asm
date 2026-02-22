@@ -979,9 +979,9 @@ VIC_FrameTasks:
         jsr VDC_RenderFrame
 _skip_vdc_render:
 
-        ; Cursor blink (text mode only)
-        lda c128_video_mode
-        bne _frame_done
+        ; Cursor blink (80-col VDC mode only)
+        lda vdc_mode_active
+        beq _frame_done
 
         inc c128_cur_div
         lda c128_cur_div
@@ -993,7 +993,7 @@ _skip_vdc_render:
         lda c128_cur_phase
         eor #1
         sta c128_cur_phase
-        ; TODO: jsr C128_VID_UpdateCursor
+        jsr VDC_UpdateCursor
 
 _frame_done:
         rts
@@ -1806,6 +1806,23 @@ _hook_c543_vdc_poll:
         #finish_cycles_inline
         rts
 _hook_not_c5xx:
+
+        ; Hook $C25E: keyboard idle wait loop
+        ; The loop at $C25E spins: JSR $CD6F / JSR $C234 / LDA $D0 / ORA $D1 / BEQ $C25E
+        ; This burns enormous host CPU time. When no key is pending,
+        ; consume remaining scanline cycles so frame tasks fire quickly.
+        cmp #$C2
+        bne _hook_not_c2
+        lda c128_pc_lo
+        cmp #$5E
+        bne _hook_chain_kernal_reload
+        ; Check if keyboard buffer has anything
+        jsr hook_check_keybuf
+        bne _hook_chain_kernal_reload  ; Key waiting - let KERNAL process it normally
+        ; No key - burn cycles to end of scanline batch
+        jsr hook_keyboard_idle
+        rts
+_hook_not_c2:
 
         ; Hook $E1xx: raster waits and delay loop
         cmp #$E1
