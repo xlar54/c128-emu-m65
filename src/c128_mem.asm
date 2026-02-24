@@ -1303,7 +1303,6 @@ _wrd_no_inv:
         cmp #BANK_RAM0
         bne _wrd_need_bank
         sta C128_MEM_PTR+2
-        sta _wrd_saved_bank
 _wrd_do_write:
         lda c128_addr_lo
         sta C128_MEM_PTR
@@ -1315,23 +1314,20 @@ _wrd_do_write:
         lda c128_saved_data
         sta [C128_MEM_PTR],z
 
-        ; Mirror writes to pages $00-$0F to LOW_RAM_BUFFER
-        lda _wrd_saved_bank
+        ; Mirror writes to pages $00-$0F to LOW_RAM_BUFFER (bank 0 only)
+        lda C128_MEM_PTR+2
         cmp #BANK_RAM0
         bne _wrd_done
         lda c128_addr_hi
         cmp #$10
         bcs _wrd_done
+        ; Reuse Z=0 from above. Just change bank and page offset.
         clc
         adc #>LOW_RAM_BUFFER
         sta C128_MEM_PTR+1
-        lda #<LOW_RAM_BUFFER
-        sta C128_MEM_PTR+0
         lda #$00
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        lda c128_addr_lo
-        taz
+        sta C128_MEM_PTR+2      ; bank 0
+        ldz c128_addr_lo
         lda c128_saved_data
         sta [C128_MEM_PTR],z
 _wrd_done:
@@ -1340,10 +1336,7 @@ _wrd_done:
 _wrd_need_bank:
         jsr get_physical_bank
         sta C128_MEM_PTR+2
-        sta _wrd_saved_bank
         jmp _wrd_do_write
-
-_wrd_saved_bank: .byte 0
 
 
 ; ============================================================

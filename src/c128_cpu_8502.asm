@@ -98,7 +98,7 @@ read_data_fast .macro
         lda c128_addr_hi
         cmp #$40
         bcs _rdf_slow\@
-        ; Fast path: only set page, use Z for low byte
+        ; Fast path: A already has addr_hi, use directly as page
         sta C128_RAM_PTR+1
         ldz c128_addr_lo
         lda [C128_RAM_PTR],z
@@ -118,19 +118,21 @@ write_data_fast .macro
         lda c128_addr_hi
         cmp #$D0
         bcs _wdf_slow\@
-        ; Invalidate code cache if writing to current code page
+        ; Fast path: check code cache invalidation only if same page as executing code
         cmp c128_code_page_hi
-        bne _wdf_no_inv\@
-        lda #0
-        sta c128_code_valid
-        lda c128_addr_hi
-_wdf_no_inv\@:
-        ; Fast path: only set page, use Z for low byte
+        beq _wdf_inv\@
+_wdf_write\@:
+        ; Direct write: A still has addr_hi
         sta C128_RAM_PTR+1
         ldz c128_addr_lo
         lda c128_data
         sta [C128_RAM_PTR],z
         bra _wdf_done\@
+_wdf_inv\@:
+        lda #0
+        sta c128_code_valid
+        lda c128_addr_hi
+        bra _wdf_write\@
 _wdf_slow\@:
         jsr C128_Write
 _wdf_done\@:
@@ -139,18 +141,17 @@ _wdf_done\@:
 ; ------------------------------------------------------------
 ; finish_cycles_inline - Inlined cycle accounting macro
 ; A = base cycle count on entry
-; Most instructions won't cross a scanline, so we inline the fast path
 ; ------------------------------------------------------------
 finish_cycles_inline .macro
         clc
-        adc c128_xtra             ; Add extra cycles (page crossing, etc.)
-        adc vic_cycle_accum     ; Add to accumulated cycles
+        adc c128_xtra
+        adc vic_cycle_accum
         sta vic_cycle_accum
         cmp #VIC_CYCLES_PER_LINE
         bcc _fc_skip\@
-        jsr finish_do_scanline  ; Only call if we crossed scanline boundary
+        jsr finish_do_scanline
 _fc_skip\@:
-        jmp finish_and_loop     ; Decrement batch counter, loop or return
+        jmp finish_and_loop
 .endmacro
 
 ; ------------------------------------------------------------
@@ -165,7 +166,7 @@ finish_cycles_no_xtra .macro
         bcc _fc_skip\@
         jsr finish_do_scanline
 _fc_skip\@:
-        jmp finish_and_loop     ; Decrement batch counter, loop or return
+        jmp finish_and_loop
 .endmacro
 
 
@@ -190,6 +191,53 @@ zn_table:
         .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
         .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
         .byte $80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80,$80
+
+
+; -----------------------------------------------------------------
+; Hook page flags table (256 bytes, indexed by PC high byte)
+; 0 = no hooks at all (skip to step_fetch immediately)
+; $80+ = KERNAL hooks only (LOAD/SAVE/OPEN at $A8,$C8,$F8,$FF)
+; 1-6 = inline hook (VDC poll, keyboard idle, raster wait, etc.)
+; -----------------------------------------------------------------
+hook_page_flags:
+        ; $00-$7F: never hooked (PC < $8000 already skipped before table)
+        .fill 128, 0
+        ; $80-$A7: no hooks
+        .fill 40, 0
+        ; $A8: KERNAL hooks (LOAD etc)
+        .byte $80
+        ; $A9-$C1: no hooks
+        .fill 25, 0
+        ; $C2: keyboard idle hook
+        .byte 4
+        ; $C3-$C4: no hooks
+        .byte 0, 0
+        ; $C5: VDC poll hook
+        .byte 3
+        ; $C6-$C7: no hooks
+        .byte 0, 0
+        ; $C8: KERNAL hooks
+        .byte $80
+        ; $C9-$CC: no hooks
+        .fill 4, 0
+        ; $CD: VDC polling loops
+        .byte 1
+        ; $CE: VDC screen clear
+        .byte 2
+        ; $CF-$DF: no hooks
+        .fill 17, 0
+        ; $E0: PLA cold/warm start
+        .byte 6
+        ; $E1: raster waits + delay loop
+        .byte 5
+        ; $E2-$F7: no hooks
+        .fill 22, 0
+        ; $F8: KERNAL hooks
+        .byte $80
+        ; $F9-$FE: no hooks
+        .fill 6, 0
+        ; $FF: KERNAL hooks
+        .byte $80
 
 
 ; -----------------------------------------------------------------
@@ -419,14 +467,8 @@ _f16_fast:
         lda [c128_code_ptr],z   ; Second byte (hi)
         sta c128_addr_hi
         ; Advance PC by 2
-        lda c128_pc_lo
-        clc
-        adc #2
-        sta c128_pc_lo
-        bcs _f16_pc_carry
-        rts
-_f16_pc_carry:
-        inc c128_pc_hi
+        inw c128_pc_lo
+        inw c128_pc_lo
         rts
 
 _f16_slow:
@@ -445,11 +487,11 @@ _f16_slow:
 cached_stack_bank: .byte BANK_RAM0
 
 ; --- init_stack_ptr ---
-; Call once at startup to initialize the dedicated c128_stack_ptr
-; After this, only c128_stack_ptr+0 (low byte = SP) needs updating
+; Initialize dedicated c128_stack_ptr. Byte +0 stays $00 permanently;
+; push/pull use Z register = SP to index into the stack page.
 init_stack_ptr:
         lda #$00
-        sta c128_stack_ptr+0    ; Will be set to SP before each use
+        sta c128_stack_ptr+0    ; Always 0 - Z register provides offset
         lda #$01
         sta c128_stack_ptr+1    ; Page $01 (stack page)
         lda #BANK_RAM0
@@ -459,10 +501,10 @@ init_stack_ptr:
         rts
 
 ; --- push_data ---
+; --- push_data ---
+; Uses c128_stack_ptr with +0=0 always, Z register = SP for offset
 push_data:
-        lda c128_sp
-        sta c128_stack_ptr+0
-        ldz #0
+        ldz c128_sp
         lda c128_data
         sta [c128_stack_ptr],z
         dec c128_sp
@@ -471,9 +513,7 @@ push_data:
 ; --- pull_to_a ---
 pull_to_a:
         inc c128_sp
-        lda c128_sp
-        sta c128_stack_ptr+0
-        ldz #0
+        ldz c128_sp
         lda [c128_stack_ptr],z
         rts
 
@@ -1670,28 +1710,42 @@ sm_counter: .byte 0
 
 ; ============================================================
 ; finish_and_loop - End of instruction trampoline
-; Called from finish macros via jmp. Handles batch counter,
-; interrupt check, hook check, fetch, and dispatch - all without
-; any JSR/RTS overhead back to the batch loop.
-; Saves ~15 cycles per instruction vs old jsr StepDecode path.
+; Optimized: fast path for the common case (no interrupts,
+; PC in low RAM) jumps directly to step_fetch.
 ; ============================================================
 finish_and_loop:
         dec sm_counter
-        beq _fal_done           ; Batch complete
-
-        ; --- Interrupt check (inlined) ---
-        lda c128_nmi_pending
-        bne _fal_do_nmi
+        bne _fal_continue
+        rts                     ; Batch complete - return to main loop
+_fal_continue:
+        ; Fast path: no interrupts pending?
         lda c128_irq_pending
-        beq _fal_dispatch
-        lda c128_p
-        and #P_I
-        beq _fal_do_irq
+        ora c128_nmi_pending
+        bne _fal_irq_check
 
-_fal_dispatch:
-        ; --- Hook check + fetch ---
+        ; No interrupts - check if hooks needed
         lda c128_pc_hi
         bpl step_fetch          ; PC < $8000: skip hooks, go to fetch
+        jmp C128CPU_StepDecode_hooks
+
+_fal_irq_check:
+        ; --- Interrupt check ---
+        lda c128_nmi_pending
+        bne _fal_do_nmi
+        ; IRQ pending - check I flag
+        lda c128_p
+        and #P_I
+        bne _fal_dispatch       ; IRQ masked, continue
+_fal_do_irq:
+        lda #0
+        sta c128_irq_pending
+        jsr cpu_take_irq
+        lda #7
+        #finish_cycles_inline
+
+_fal_dispatch:
+        lda c128_pc_hi
+        bpl step_fetch
         jmp C128CPU_StepDecode_hooks
 
 _fal_do_nmi:
@@ -1700,18 +1754,7 @@ _fal_do_nmi:
         jsr cpu_take_nmi
         lda #7
         #finish_cycles_inline
-        ; loops back via jmp finish_and_loop
 
-_fal_do_irq:
-        lda #0
-        sta c128_irq_pending
-        jsr cpu_take_irq
-        lda #7
-        #finish_cycles_inline
-        ; loops back via jmp finish_and_loop
-
-_fal_done:
-        rts                     ; Return to main loop
 
 ; ============================================================
 ; C128CPU_Step - Entry point for single instruction (for external callers)
@@ -1751,53 +1794,55 @@ C128CPU_StepDecode_hooks:
         ; (c128_xtra is initialized by addressing mode helpers that need it)
 
         ; --------------------------------------------------------
-        ; Hooks - only check for ROM area ($8000+)
-        ; First check inline hooks (fast), then call hooks file
+        ; Hooks - table-driven dispatch for O(1) page check
+        ; Instead of linear chain of comparisons, use lookup table
         ; --------------------------------------------------------
         lda c128_pc_hi
         bpl step_fetch         ; Skip all hooks if PC < $8000
 
-        ; --- Inline hooks for busy-wait loops ---
-        ; A = c128_pc_hi throughout this chain (reloaded only when clobbered)
+        ; Table lookup: 1 load + 1 branch for non-hooked pages
+        tax
+        lda hook_page_flags,x
+        beq step_fetch          ; 0 = no hooks for this page at all
+        bmi _hook_chain_kernal_only  ; $80+ = KERNAL hooks only (LOAD/SAVE etc)
 
-        ; Most common KERNAL pages are $C0-$CF, $E0-$FF, $F8-$FF
-        ; Order checks by frequency to minimize comparisons
+        ; Inline hook - dispatch by flag value
+        cmp #1
+        beq _hook_page_cd
+        cmp #2
+        beq _hook_page_ce
+        cmp #3
+        beq _hook_page_c5
+        cmp #4
+        beq _hook_page_c2
+        cmp #5
+        beq _hook_page_e1
+        cmp #6
+        beq _hook_page_e0
+        jmp step_fetch
 
-        ; Hook VDC polling loops at $CDCF, $CDDD
-        cmp #$CD
-        bne _hook_not_cdxx
+_hook_page_cd:
         lda c128_pc_lo
         cmp #$CF
         beq _hook_vdc_poll_skip
         cmp #$DD
         beq _hook_vdc_poll_skip
-        jmp _hook_chain_kernal
-_hook_not_cdxx:
+        jmp step_fetch
 
-        ; Hook $CE0C: VDC screen clear (skip the polling loop)
-        cmp #$CE
-        bne _hook_not_ce
+_hook_page_ce:
         lda c128_pc_lo
         cmp #$0C
-        bne _hook_chain_kernal_reload
+        bne +
         jsr hook_vdc_screen_clear
         lda #4
         #finish_cycles_inline
         rts
-_hook_not_ce:
++       jmp step_fetch
 
-        ; Hook $C543: VDC poll
-        cmp #$C5
-        bne _hook_not_c5xx
+_hook_page_c5:
         lda c128_pc_lo
         cmp #$43
-        beq _hook_c543_vdc_poll
-        ; NOTE: $C55D SCNKEY hook disabled - skipping it broke the
-        ; KERNAL IRQ handler flow (screen editor, cursor blink, scroll).
-        ; Keyboard injection via $D619 in VIC_FrameTasks works without
-        ; this hook since injected keys go directly into the buffer.
-        jmp _hook_chain_kernal_reload
-_hook_c543_vdc_poll:
+        bne +
         lda #$48
         sta c128_pc_lo
         lda #0
@@ -1805,53 +1850,41 @@ _hook_c543_vdc_poll:
         lda #4
         #finish_cycles_inline
         rts
-_hook_not_c5xx:
++       jmp step_fetch
 
-        ; Hook $C25E: keyboard idle wait loop
-        ; The loop at $C25E spins: JSR $CD6F / JSR $C234 / LDA $D0 / ORA $D1 / BEQ $C25E
-        ; This burns enormous host CPU time. When no key is pending,
-        ; consume remaining scanline cycles so frame tasks fire quickly.
-        cmp #$C2
-        bne _hook_not_c2
+_hook_page_c2:
         lda c128_pc_lo
         cmp #$5E
-        bne _hook_chain_kernal_reload
-        ; Check if keyboard buffer has anything
+        bne +
         jsr hook_check_keybuf
-        bne _hook_chain_kernal_reload  ; Key waiting - let KERNAL process it normally
-        ; No key - burn cycles to end of scanline batch
+        bne +
         jsr hook_keyboard_idle
         rts
-_hook_not_c2:
++       jmp step_fetch
 
-        ; Hook $E1xx: raster waits and delay loop
-        cmp #$E1
-        bne _hook_not_e1
+_hook_page_e1:
         lda c128_pc_lo
         cmp #$42
         beq hook_raster_wait_1
         cmp #$4E
         beq hook_raster_wait_2
-        ; E1A8 = delay loop (DEY/BNE/DEX/BNE, 65K iterations) - skip it
         cmp #$A8
-        bne _hook_chain_kernal_reload
+        bne +
         lda #$AE
-        sta c128_pc_lo          ; Skip to $E1AE
+        sta c128_pc_lo
         lda #$00
-        sta c128_x              ; X=0 (loop finished)
-        sta c128_y              ; Y=0 (loop finished)
+        sta c128_x
+        sta c128_y
         sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
-_hook_not_e1:
++       jmp step_fetch
 
-        ; Hook $E03A: PLA reads cold/warm start flag (boot only)
-        cmp #$E0
-        bne _hook_chain_kernal
+_hook_page_e0:
         lda c128_pc_lo
         cmp #$3A
-        bne _hook_chain_kernal_reload
+        bne +
         lda #$80
         sta c128_a
         lda c128_p
@@ -1859,14 +1892,16 @@ _hook_not_e1:
         and #<~(P_Z)
         sta c128_p
         inc c128_pc_lo
-        bne +
+        bne _hpe0_no_carry
         inc c128_pc_hi
-+       inc c128_sp
+_hpe0_no_carry:
+        inc c128_sp
         lda #0
         sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
++       jmp step_fetch
 
 _hook_vdc_poll_skip:
         lda c128_pc_lo
@@ -1879,11 +1914,17 @@ _hook_vdc_poll_skip:
         #finish_cycles_inline
         rts
 
+_hook_chain_kernal_only:
+        ; From table dispatch: X = c128_pc_hi, A = table flag ($80)
+        txa                     ; Restore pc_hi into A
+        bra _hook_chain_kernal_check
+
 _hook_chain_kernal_reload:
         lda c128_pc_hi
 _hook_chain_kernal:
-        ; --- KERNAL call hooks (LOAD, SAVE, OPEN, etc.) ---
-        ; Only call if PC is in hook-relevant pages ($A8, $C8, $F8, $FF)
+_hook_chain_kernal_check:
+        ; KERNAL call hooks (LOAD, SAVE, OPEN, etc.)
+        ; A = c128_pc_hi. Only pages $A8, $C8, $F8, $FF have hooks.
         cmp #$FF
         beq _hook_do_check
         cmp #$F8
@@ -2003,6 +2044,30 @@ _br_same:
         lda c128_addr_hi
         sta c128_pc_hi
         rts
+
+; Inline branch macro - saves JSR/RTS (12 cycles) per branch taken
+branch_do_inline .macro
+        lda #$01
+        sta c128_xtra
+        lda c128_pc_lo
+        clc
+        adc c128_tmp
+        sta c128_pc_lo            ; Write directly to PC (no temp needed)
+        lda c128_pc_hi
+        adc #$00
+        sta c128_addr_hi          ; Tentative new hi
+        lda c128_tmp
+        bpl _bri_pos\@
+        dec c128_addr_hi
+_bri_pos\@:
+        lda c128_pc_hi
+        cmp c128_addr_hi
+        beq _bri_done\@
+        inc c128_xtra
+_bri_done\@:
+        lda c128_addr_hi
+        sta c128_pc_hi
+.endmacro
 
 ; --- do_adc ---  (supports decimal mode when P_D set)
 do_adc:
@@ -2508,7 +2573,7 @@ op_10:
         ;lda c128_p
         ;and #P_N
         ;bne _op10_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -2862,7 +2927,7 @@ op_30:
         ;lda c128_p
         ;and #P_N
         ;beq _op30_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -3157,7 +3222,7 @@ op_50:
         ;lda c128_p
         ;and #P_V
         ;bne _op50_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -3466,7 +3531,7 @@ op_70:
         ;lda c128_p
         ;and #P_V
         ;beq _op70_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -3707,7 +3772,7 @@ op_90:
         ;lda c128_p
         ;and #P_C
         ;bne _op90_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -3936,7 +4001,7 @@ op_b0:
         ;lda c128_p
         ;and #P_C
         ;beq _opb0_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -4180,7 +4245,7 @@ op_d0:
         #fetch8_operand
         sta c128_tmp
         bbs 1, c128_p, _opd0_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
@@ -4385,7 +4450,7 @@ op_f0:
         ;lda c128_p
         ;and #P_Z
         ;beq _opf0_nt
-        jsr branch_do
+        #branch_do_inline
         lda #2
         #finish_cycles_inline
         rts
