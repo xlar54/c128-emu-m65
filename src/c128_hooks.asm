@@ -2268,7 +2268,7 @@ C128Hook_FastCHROUT:
         ; Returns: CLC = handled, SEC = let ROM handle
 
         cmp #$0D
-        beq fco_rom             ; CR: let ROM handle (complex state updates)
+        beq fco_cr              ; CR: handle ourselves (including scroll)
 
         ; Check printable range
         cmp #$20
@@ -2319,8 +2319,10 @@ fco_printable:
         sec
         sbc vdc_regs+13
         sta C128_MEM_PTR+0
+        sta fco_scr_offset      ; save offset lo for color write
         lda vdc_regs+14
         sbc vdc_regs+12
+        sta fco_scr_offset+1    ; save offset hi for color write
         clc
         adc #$04
         sta C128_MEM_PTR+1
@@ -2331,6 +2333,81 @@ fco_printable:
         ldz #0
         lda fco_scrcode
         sta [C128_MEM_PTR],z
+
+        ; Get text color from C128 ZP $F1
+        ; In 80-col mode, $F1 holds VDC attribute byte:
+        ;   low nibble = VDC RGBI color, high nibble = attributes
+        ; Default: $07 = light cyan, no attributes
+        lda #$F1
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_ReadFast
+        sta fco_vdc_attr        ; full byte for VDC attr write
+        ; Translate low nibble (VDC color) to VIC color for MEGA65 color RAM
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta fco_vic_color
+
+        ; Write VDC attribute at cursor position in attr RAM
+        ; VDC attr address = R14:R15 + (R20:R21 - R12:R13)
+        lda vdc_regs+21
+        sec
+        sbc vdc_regs+13
+        sta fco_tmp
+        lda vdc_regs+20
+        sbc vdc_regs+12
+        sta fco_tmp+1
+        lda vdc_regs+15
+        clc
+        adc fco_tmp
+        sta C128_MEM_PTR+0
+        lda vdc_regs+14
+        adc fco_tmp+1
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda fco_vdc_attr
+        sta [C128_MEM_PTR],z
+
+        ; Write VIC color to MEGA65 color RAM at screen offset
+        ; If displaying 80-col: write to $0FF80000 + offset
+        ; If displaying 40-col: write to 80-col save buffer $021000 + offset
+        lda display_showing_80
+        beq _fco_color_to_buf
+        ; Live color RAM
+        lda fco_scr_offset
+        sta vdc_color_ptr+0
+        lda fco_scr_offset+1
+        sta vdc_color_ptr+1
+        lda #$F8
+        sta vdc_color_ptr+2
+        lda #$0F
+        sta vdc_color_ptr+3
+        bra _fco_color_write
+_fco_color_to_buf:
+        ; 80-col save buffer at $021000
+        lda fco_scr_offset
+        sta vdc_color_ptr+0
+        lda fco_scr_offset+1
+        clc
+        adc #>COLOR_80_SAVE
+        sta vdc_color_ptr+1
+        lda #$02
+        sta vdc_color_ptr+2
+        lda #$00
+        sta vdc_color_ptr+3
+_fco_color_write:
+        ldz #0
+        lda fco_vic_color
+        sta [vdc_color_ptr],z
 
         ; Advance VDC cursor R14:R15
         inc vdc_regs+15
@@ -2353,135 +2430,64 @@ fco_printable:
         rts
 
 fco_cr:
-        ; Carriage Return: move to start of next line
-        ; First: read current row, check if scroll needed
+        ; Carriage Return: check if scroll needed
+        ; Only handle ourselves if at bottom row (scroll)
+        ; Otherwise let ROM handle (line links, screen editor state)
         lda #$EB
         sta c128_addr_lo
         lda #$00
         sta c128_addr_hi
         jsr C128_Read
         cmp #24
-        bcs fco_rom            ; Row >= 24: scroll needed, let ROM handle
-        sta fco_old_row
+        bcs fco_scroll         ; Row >= 24: we handle scroll
+        sec                    ; Row < 24: let ROM handle CR
+        rts
 
-        ; Compute new row
-        clc
-        adc #1
-        sta fco_new_row
+fco_scroll:
+        ; CR at row 24: scroll everything up, stay at row 24 col 0
+        ; Use shared scroll routine
+        jsr scroll_screen_up
 
-        ; Write new row to $EB
+        ; Update KERNAL ZP: row=24, col=0
+        lda #24
         sta c128_data
         lda #$EB
         sta c128_addr_lo
         lda #$00
         sta c128_addr_hi
         jsr C128_Write
-
-        ; Write column = 0 to $EC
         lda #0
         sta c128_data
         lda #$EC
         sta c128_addr_lo
         jsr C128_Write
 
-        ; Compute PNT = screen_start + (new_row * 80) and write to $E0-$E1
-        ; new_row * 80 = new_row * 64 + new_row * 16
-        lda fco_new_row
-        sta fco_tmp
-        lda #0
-        sta fco_tmp+1
-        ; *2
-        asl fco_tmp
-        rol fco_tmp+1
-        ; *4
-        asl fco_tmp
-        rol fco_tmp+1
-        ; Save *4 for later (need *4 + *64 = *4*(1+16) -- wait, *16+*64 = *80)
-        ; Actually: *16
-        asl fco_tmp
-        rol fco_tmp+1
-        asl fco_tmp
-        rol fco_tmp+1
-        ; Now fco_tmp = row*16, save it
-        lda fco_tmp
-        sta fco_r16
-        lda fco_tmp+1
-        sta fco_r16+1
-        ; Continue to *64
-        asl fco_tmp
-        rol fco_tmp+1
-        asl fco_tmp
-        rol fco_tmp+1
-        ; fco_tmp = row*64
-        ; row*80 = row*64 + row*16
-        lda fco_tmp
-        clc
-        adc fco_r16
-        sta fco_tmp
-        lda fco_tmp+1
-        adc fco_r16+1
-        sta fco_tmp+1
-
-        ; PNT = screen_start (R12:R13) + row*80
+        ; Update PNT ($E0/$E1) to point to row 24 in VDC RAM
+        ; Row 24 * 80 = 1920 = $0780
         lda vdc_regs+13
         clc
-        adc fco_tmp
-        sta fco_pnt
-        lda vdc_regs+12
-        adc fco_tmp+1
-        sta fco_pnt+1
-
-        ; Write PNT lo to $E0
-        lda fco_pnt
+        adc #<1920
         sta c128_data
         lda #$E0
         sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
         jsr C128_Write
-
-        ; Write PNT hi to $E1
-        lda fco_pnt+1
+        lda vdc_regs+12
+        adc #>1920
         sta c128_data
         lda #$E1
         sta c128_addr_lo
         jsr C128_Write
 
-        ; Update VDC cursor R14:R15 to PNT (start of new line)
-        lda fco_pnt+1
-        sta vdc_regs+14
-        lda fco_pnt
+        ; Update VDC cursor to row 24, col 0
+        lda vdc_regs+13
+        clc
+        adc #<1920
         sta vdc_regs+15
+        lda vdc_regs+12
+        adc #>1920
+        sta vdc_regs+14
 
-        ; Update line link table at $0A00 + new_row
-        ; Each entry: bit 7 = not start of logical line, bits 0-6 = line length
-        ; For CR, the new line IS a start of logical line
-        ; Set the PREVIOUS line's length = old column
-        ; Actually, the line link table is complex. Let's just mark it.
-        ; Entry for old_row: bits 0-6 = screen width (80), bit 7 = start
-        ; For simplicity, write $50 (80 = $50, bit 7 clear = start of logical line)
-        lda #80
-        sta c128_data
-        lda fco_old_row
-        clc
-        adc #$00                ; $0A00 + old_row
-        sta c128_addr_lo
-        lda #$0A
-        sta c128_addr_hi
-        jsr C128_Write
-
-        ; New row entry: also mark as start of logical line
-        lda #80
-        sta c128_data
-        lda fco_new_row
-        clc
-        adc #$00
-        sta c128_addr_lo
-        lda #$0A
-        sta c128_addr_hi
-        jsr C128_Write
-
-        clc                     ; Handled
+        clc                     ; handled
         rts
 
 fco_rom_pop:
@@ -2520,6 +2526,16 @@ fco_new_row:   .byte 0
 fco_pnt:       .word 0
 fco_tmp:       .word 0
 fco_r16:       .word 0
+fco_vic_color: .byte 0
+fco_vdc_attr:  .byte 0
+fco_scr_offset: .word 0
+
+; VIC-II -> VDC RGBI color reverse lookup table
+; VIC: 0=blk 1=wht 2=red 3=cyn 4=pur 5=grn 6=blu 7=yel
+;      8=org 9=brn 10=lrd 11=dgr 12=gry 13=lgr 14=lbl 15=lgr
+vic_to_vdc_color:
+        .byte $00, $0F, $08, $07, $0A, $04, $02, $0D
+        .byte $00, $0C, $09, $01, $00, $05, $03, $0E
 
 ; ============================================================
 ; Sequential File I/O Handlers
@@ -3090,7 +3106,6 @@ C128Hook_OnPRIMM:
         sta c128_addr_hi
         jsr C128_ReadFast
         sta _primm_ptr_lo
-        sta _primm_str_lo       ; save string start for pass 2
 
         lda c128_sp
         clc
@@ -3098,17 +3113,12 @@ C128Hook_OnPRIMM:
         sta c128_addr_lo
         jsr C128_ReadFast
         sta _primm_ptr_hi
-        sta _primm_str_hi
 
         ; Add 1 (JSR pushes addr-1)
         inc _primm_ptr_lo
         bne +
         inc _primm_ptr_hi
 +
-        lda _primm_ptr_lo
-        sta _primm_str_lo
-        lda _primm_ptr_hi
-        sta _primm_str_hi
 
         ; Read current row/col
         lda #$EB
@@ -3117,56 +3127,65 @@ C128Hook_OnPRIMM:
         sta c128_addr_hi
         jsr C128_ReadFast
         sta _primm_row
-        sta _primm_save_row     ; save for pass 2
 
         lda #$EC
         sta c128_addr_lo
         jsr C128_ReadFast
         sta _primm_col
-        sta _primm_save_col
 
-        ; Cache color attribute
+        ; Cache color attribute from C128 ZP $F1
+        ; In 80-col mode, $F1 = VDC attribute byte (low nibble = VDC color)
         lda #$F1
         sta c128_addr_lo
         jsr C128_ReadFast
-        sta _primm_attr
+        sta _primm_attr         ; full byte for VDC attr RAM
+        ; Translate low nibble (VDC color) to VIC for MEGA65 color RAM
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta _primm_vic_color
 
-        ; ===== PASS 1: MEGA65 screen (what user sees) =====
-_primm_pass1:
+        ; ===== SINGLE PASS: MEGA65 screen + color + VDC screen + VDC attrs =====
+_primm_loop:
         lda _primm_ptr_lo
         sta c128_addr_lo
         lda _primm_ptr_hi
         sta c128_addr_hi
         jsr C128_ReadFast
 
-        beq _primm_pass1_done
+        beq _primm_loop_done
 
         cmp #$0D
-        beq _primm_p1_cr
+        beq _primm_cr
 
         cmp #$20
-        bcc _primm_p1_next
+        bcc _primm_next
         cmp #$80
-        bcc _primm_p1_print
+        bcc _primm_print
         cmp #$A0
-        bcc _primm_p1_next
+        bcc _primm_next
 
-_primm_p1_print:
+_primm_print:
         ldx _primm_col
         cpx #80
-        bcs _primm_p1_next
+        bcs _primm_next
 
         jsr fco_petscii_to_screen
+        sta _primm_scrcode
 
-        ; Write to MEGA65 screen: $020400 + row*80 + col
+        ; --- MEGA65 screen: $020400 + row*80 + col ---
         ldx _primm_row
-        pha
         lda _primm_row_lo,x
         clc
         adc _primm_col
-        sta C128_MEM_PTR+0
+        sta _primm_offset
         lda _primm_row_hi,x
         adc #0
+        sta _primm_offset+1
+
+        lda _primm_offset
+        sta C128_MEM_PTR+0
+        lda _primm_offset+1
         clc
         adc #$04
         sta C128_MEM_PTR+1
@@ -3174,79 +3193,44 @@ _primm_p1_print:
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3
-        pla
+        lda _primm_scrcode
         ldz #0
         sta [C128_MEM_PTR],z
 
-        inc _primm_col
-        jmp _primm_p1_next
-
-_primm_p1_cr:
-        lda #0
-        sta _primm_col
-        lda _primm_row
-        cmp #24
-        bcs _primm_p1_next
-        inc _primm_row
-
-_primm_p1_next:
-        inc _primm_ptr_lo
-        bne _primm_pass1
-        inc _primm_ptr_hi
-        jmp _primm_pass1
-
-_primm_pass1_done:
-        ; Save final position for ZP updates
-        ; _primm_ptr_lo/hi now points to the null terminator
-
-        ; ===== PASS 2: VDC screen + attribute RAM =====
-        ; Reset to string start and saved row/col
-        lda _primm_str_lo
-        sta _primm_p2_lo
-        lda _primm_str_hi
-        sta _primm_p2_hi
-        lda _primm_save_row
-        sta _primm_p2_row
-        lda _primm_save_col
-        sta _primm_p2_col
-
-_primm_pass2:
-        lda _primm_p2_lo
-        sta c128_addr_lo
-        lda _primm_p2_hi
-        sta c128_addr_hi
-        jsr C128_ReadFast
-
-        beq _primm_pass2_done
-
-        cmp #$0D
-        beq _primm_p2_cr
-
-        cmp #$20
-        bcc _primm_p2_next
-        cmp #$80
-        bcc _primm_p2_print
-        cmp #$A0
-        bcc _primm_p2_next
-
-_primm_p2_print:
-        ldx _primm_p2_col
-        cpx #80
-        bcs _primm_p2_next
-
-        jsr fco_petscii_to_screen
-        sta _primm_scrcode
-
-        ; VDC screen RAM
-        ldx _primm_p2_row
-        lda _primm_row_lo,x
+        ; --- MEGA65 color RAM ---
+        lda _primm_offset
+        sta vdc_color_ptr+0
+        lda _primm_offset+1
+        sta vdc_color_ptr+1
+        lda display_showing_80
+        beq _primm_color_buf
+        ; Live color RAM at $0FF80000 + offset
+        lda #$F8
+        sta vdc_color_ptr+2
+        lda #$0F
+        sta vdc_color_ptr+3
+        bra _primm_color_wr
+_primm_color_buf:
+        ; 80-col save buffer at $021000 + offset
+        lda vdc_color_ptr+1
         clc
-        adc _primm_p2_col
+        adc #>COLOR_80_SAVE
+        sta vdc_color_ptr+1
+        lda #$02
+        sta vdc_color_ptr+2
+        lda #$00
+        sta vdc_color_ptr+3
+_primm_color_wr:
+        lda _primm_vic_color
+        ldz #0
+        sta [vdc_color_ptr],z
+
+        ; --- VDC screen RAM ---
+        lda _primm_offset
         clc
         adc vdc_regs+13
         sta C128_MEM_PTR+0
-        lda _primm_row_hi,x
-        adc #0
+        lda _primm_offset+1
         adc vdc_regs+12
         and #$3F
         clc
@@ -3260,7 +3244,7 @@ _primm_p2_print:
         ldz #0
         sta [C128_MEM_PTR],z
 
-        ; VDC attribute RAM (+$0800)
+        ; --- VDC attribute RAM (+$0800) ---
         lda C128_MEM_PTR+1
         clc
         adc #$08
@@ -3268,24 +3252,31 @@ _primm_p2_print:
         lda _primm_attr
         sta [C128_MEM_PTR],z
 
-        inc _primm_p2_col
-        jmp _primm_p2_next
+        inc _primm_col
+        jmp _primm_next
 
-_primm_p2_cr:
+_primm_cr:
         lda #0
-        sta _primm_p2_col
-        lda _primm_p2_row
+        sta _primm_col
+        lda _primm_row
         cmp #24
-        bcs _primm_p2_next
-        inc _primm_p2_row
+        bcs _primm_need_scroll
+        inc _primm_row
+        jmp _primm_next
 
-_primm_p2_next:
-        inc _primm_p2_lo
-        bne _primm_pass2
-        inc _primm_p2_hi
-        jmp _primm_pass2
+_primm_need_scroll:
+        ; Scroll all screen buffers up one line
+        jsr scroll_screen_up
+        ; Row stays at 24, col already set to 0
+        jmp _primm_next
 
-_primm_pass2_done:
+_primm_next:
+        inc _primm_ptr_lo
+        bne _primm_loop
+        inc _primm_ptr_hi
+        jmp _primm_loop
+
+_primm_loop_done:
 
 _primm_done:
         ; --- Write KERNAL ZP state ---
@@ -3379,17 +3370,195 @@ _primm_ptr_lo: .byte 0
 _primm_ptr_hi: .byte 0
 _primm_row:    .byte 0
 _primm_col:    .byte 0
-_primm_attr:   .byte 0
+_primm_attr:      .byte 0
+_primm_vic_color: .byte 0
 _primm_scrcode: .byte 0
 _primm_offset: .word 0
-_primm_str_lo: .byte 0
-_primm_str_hi: .byte 0
-_primm_save_row: .byte 0
-_primm_save_col: .byte 0
-_primm_p2_lo:  .byte 0
-_primm_p2_hi:  .byte 0
-_primm_p2_row: .byte 0
-_primm_p2_col: .byte 0
+
+; ============================================================
+; scroll_screen_up - Scroll all screen buffers up one line
+; Scrolls VDC screen RAM, VDC attr RAM, MEGA65 screen, and
+; MEGA65 color RAM. Clears bottom row (row 24) in all four.
+; ============================================================
+scroll_screen_up:
+        ; --- Scroll VDC screen RAM up one line (1920 bytes) ---
+        lda vdc_regs+13
+        clc
+        adc #80
+        sta _scr_scroll_src
+        lda vdc_regs+12
+        adc #0
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta _scr_scroll_src+1
+
+        lda vdc_regs+13
+        clc
+        adc #<VDC_RAM_BASE
+        sta _scr_scroll_dst
+        lda vdc_regs+12
+        and #$3F
+        adc #>VDC_RAM_BASE
+        sta _scr_scroll_dst+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00               ; copy
+        .word 1920
+_scr_scroll_src:
+        .word $0000
+        .byte $03               ; bank 3
+_scr_scroll_dst:
+        .word $0000
+        .byte $03               ; bank 3
+        .byte $00
+        .word $0000
+
+        ; --- Scroll VDC attr RAM up one line ---
+        lda vdc_regs+21
+        clc
+        adc #80
+        sta _attr_scroll_src
+        lda vdc_regs+20
+        adc #0
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta _attr_scroll_src+1
+
+        lda vdc_regs+21
+        clc
+        adc #<VDC_RAM_BASE
+        sta _attr_scroll_dst
+        lda vdc_regs+20
+        and #$3F
+        adc #>VDC_RAM_BASE
+        sta _attr_scroll_dst+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00               ; copy
+        .word 1920
+_attr_scroll_src:
+        .word $0000
+        .byte $03
+_attr_scroll_dst:
+        .word $0000
+        .byte $03
+        .byte $00
+        .word $0000
+
+        ; --- Scroll MEGA65 screen up one line ---
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00               ; copy
+        .word 1920
+        .word $0450             ; src = $020450
+        .byte $02
+        .word $0400             ; dst = $020400
+        .byte $02
+        .byte $00
+        .word $0000
+
+        ; --- Scroll MEGA65 color RAM up one line ---
+        lda #$00
+        sta $D707
+        .byte $80, $FF, $81, $FF, $00
+        .byte $00               ; copy
+        .word 1920
+        .word $0050             ; src = offset 80
+        .byte $08
+        .word $0000             ; dst = offset 0
+        .byte $08
+        .byte $00
+        .word $0000
+
+        ; --- Clear bottom row in VDC screen RAM ---
+        lda vdc_regs+13
+        clc
+        adc #<1920
+        sta _scr_clr_dst
+        lda vdc_regs+12
+        adc #>1920
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta _scr_clr_dst+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 80
+        .word $0020             ; space
+        .byte $00
+_scr_clr_dst:
+        .word $0000
+        .byte $03
+        .byte $00
+        .word $0000
+
+        ; --- Clear bottom row in VDC attr RAM ---
+        lda vdc_regs+21
+        clc
+        adc #<1920
+        sta _attr_clr_dst
+        lda vdc_regs+20
+        adc #>1920
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta _attr_clr_dst+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 80
+        .word $0007             ; default attr (light cyan)
+        .byte $00
+_attr_clr_dst:
+        .word $0000
+        .byte $03
+        .byte $00
+        .word $0000
+
+        ; --- Clear bottom row in MEGA65 screen ---
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 80
+        .word $0020             ; space
+        .byte $00
+        .word $0400+1920        ; $020B80
+        .byte $02
+        .byte $00
+        .word $0000
+
+        ; --- Clear bottom row in MEGA65 color RAM ---
+        lda #$00
+        sta $D707
+        .byte $80, $FF, $81, $FF, $00
+        .byte $03               ; fill
+        .word 80
+        .word $0003             ; cyan (VIC color 3)
+        .byte $00
+        .word 1920              ; offset 1920
+        .byte $08
+        .byte $00
+        .word $0000
+
+        ; Mark dirty
+        lda #1
+        sta vdc_screen_dirty
+        sta vdc_attr_dirty
+        rts
+
 C128Hook_OnCHRIN:
 
         ; Reset stale graphics flags before file operations
