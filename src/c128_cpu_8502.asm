@@ -1010,17 +1010,35 @@ _vic_next_line:
 ; ============================================================
 VIC_FrameTasks:
         ; Keyboard injection - read MEGA65 hardware keyboard and inject
-        ; into C128 keyboard buffer (replaces emulated CIA matrix scan)
+        ; into C128 keyboard buffer. TAB key is intercepted for screen toggle.
         jsr C128_KeyboardInject
 
-        ; VDC 80-column rendering (only when in 80-col mode)
-        lda vdc_mode_active
+        ; Poll C128 ZP $D7 to track 40/80 col emulation mode
+        ; $D7 = $00: 40-col, $D7 = $80: 80-col
+        ; This ONLY updates vdc_mode_active (for hook gating).
+        ; It does NOT change what's displayed — only TAB does that.
+        lda #$D7
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; read C128 $D7
+        bmi _c128_wants_80      ; bit 7 set = 80-col
+        ; C128 is in 40-col
+        lda #0
+        sta vdc_mode_active
+        jmp _mode_check_done
+_c128_wants_80:
+        lda #1
+        sta vdc_mode_active
+_mode_check_done:
+
+        ; VDC 80-column rendering only when displaying 80-col screen
+        lda display_showing_80
         beq _skip_vdc_render
         jsr VDC_RenderFrame
 _skip_vdc_render:
 
-        ; Cursor blink (80-col VDC mode only)
-        lda vdc_mode_active
+        ; Cursor blink (only when displaying 80-col)
+        lda display_showing_80
         beq _frame_done
 
         inc c128_cur_div
@@ -1059,6 +1077,25 @@ C128_KeyboardInject:
         cmp #$FF
         beq _ki_done            ; $FF = no key pending
 
+        ; Intercept TAB ($09) for display-only screen peek
+        cmp #$09
+        bne _ki_not_tab
+
+        ; Dequeue TAB (don't pass to C128)
+        lda #$01
+        sta $D610
+        ; Toggle what's displayed
+        lda display_showing_80
+        eor #1
+        sta display_showing_80
+        beq _tab_show_40
+        jsr display_show_80col
+        rts
+_tab_show_40:
+        jsr display_show_40col
+        rts
+
+_ki_not_tab:
         ; Dequeue the key by writing 1 to $D610
         pha
         lda #$01
@@ -1140,6 +1177,21 @@ hook_vdc_screen_clear:
         .byte $03               ; dst bank = 3
         .byte $00               ; command high byte
         .word $0000             ; modulo
+
+        ; Also clear MEGA65 visible screen at $020400
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $00          ; dst MB = $00
+        .byte $00               ; end options
+        .byte $03               ; fill
+        .word 2000              ; count = 80*25
+        .word $0020             ; fill with $20 (space)
+        .byte $00               ; unused
+        .word $0400             ; dst = $0400
+        .byte $02               ; dst bank 2 ($020400)
+        .byte $00
+        .word $0000
 
         ; Clear VDC attribute RAM ($0800-$09CF) with default attr
         ; Default: $07 = light cyan foreground, no flags
@@ -1238,9 +1290,24 @@ hook_check_keybuf:
 ; This saves the ~25 MEGA65 cycles of instruction decode per iteration
 ; while keeping the C128 timing identical.
 hook_keyboard_idle:
+        ; Set faster cursor blink (one-time)
+        lda _blink_set
+        bne +
+        inc _blink_set
+        ; Write blink rate = 3 to C128 $0A20
+        lda #$20
+        sta c128_addr_lo
+        lda #$0A
+        sta c128_addr_hi
+        lda #1
+        sta c128_data
+        jsr C128_Write
++
         lda #63
         #finish_cycles_no_xtra
         rts
+
+_blink_set: .byte 0
 
 ; write_milestone - Write progress byte A to $0FE0F
 ; Uses 32-bit pointer to write to host RAM
@@ -1295,6 +1362,8 @@ vic_raster_compare_hi: .byte $01     ; Raster compare high bit
 ; Cursor state
 c128_cur_div:          .byte 0
 c128_cur_phase:        .byte 0
+tab_last:             .byte 0
+display_showing_80:   .byte 1           ; 1=showing 80-col, 0=showing 40-col
 pc_trace_idx:          .byte 0
 pc_trace_hi:           .fill 128, 0
 pc_trace_lo:           .fill 128, 0
@@ -1823,11 +1892,72 @@ C128CPU_StepDecode_hooks:
 
 _hook_page_cd:
         lda c128_pc_lo
+        ; $CDCC = VDC write register: X=register, A=value
+        ; Normally: STX $D600 / BIT $D600 / BPL poll / STA $D601 / RTS
+        ; We do it all in one shot.
+        cmp #$CC
+        beq _hook_vdc_write_reg
+        ; $CDDA = VDC read register: X=register -> A=value
+        ; Normally: STX $D600 / BIT $D600 / BPL poll / LDA $D601 / RTS
+        cmp #$DA
+        beq _hook_vdc_read_reg
+        ; Keep old poll skip hooks as fallback
         cmp #$CF
         beq _hook_vdc_poll_skip
         cmp #$DD
         beq _hook_vdc_poll_skip
         jmp step_fetch
+
+_hook_vdc_write_reg:
+        ; X=register number, A=value to write
+        ; Do the VDC operation directly, then skip to the RTS at $CDD7
+        lda c128_a              ; value to write
+        sta c128_saved_data
+        sta c128_data
+        ; Set VDC register index
+        lda c128_x
+        and #$3F
+        sta vdc_index
+        ; Write data to VDC
+        lda #$01                ; $D601
+        sta c128_addr_lo
+        lda #$D6
+        sta c128_addr_hi
+        jsr write_vdc_register
+        ; Skip to the RTS at $CDD7 - let the CPU execute RTS naturally
+        lda #$D7
+        sta c128_pc_lo
+        lda #$CD
+        sta c128_pc_hi
+        lda #0
+        sta c128_code_valid
+        lda #8                  ; ~8 cycles for the whole operation
+        #finish_cycles_no_xtra
+        rts
+
+_hook_vdc_read_reg:
+        ; X=register number -> A=value read
+        ; Set VDC register index
+        lda c128_x
+        and #$3F
+        sta vdc_index
+        ; Read from VDC
+        lda #$01                ; $D601
+        sta c128_addr_lo
+        lda #$D6
+        sta c128_addr_hi
+        jsr read_vdc_register
+        sta c128_a              ; Store result in C128 A register
+        ; Skip to the RTS at $CDE5
+        lda #$E5
+        sta c128_pc_lo
+        lda #$CD
+        sta c128_pc_hi
+        lda #0
+        sta c128_code_valid
+        lda #8
+        #finish_cycles_no_xtra
+        rts
 
 _hook_page_ce:
         lda c128_pc_lo
@@ -1958,12 +2088,15 @@ step_fetch:
         lda [c128_code_ptr],z
         inw c128_pc_lo
 _step_dispatch:
+        sta last_opcode        ; Save raw opcode for debug
         asl                     ; opcode * 2, carry set if opcode >= $80
         tax
         bcc _step_dispatch_lo
         jmp (op_table_hi,x)     ; opcodes $80-$FF
 _step_dispatch_lo:
         jmp (op_table_lo,x)     ; opcodes $00-$7F
+
+last_opcode: .byte 0
 
 _step_fetch_slow:
         jsr fetch8
@@ -1991,12 +2124,130 @@ _fc_done:
         rts
 
 op_illegal:
-        ; ILLEGAL OPCODE - just halt with red border
-        ; The live trace above already printed where we are
+        ; ILLEGAL OPCODE - show diagnostic info
+        ; NOTE: PC has already been incremented past the opcode by fetch8
         lda #$02
-        sta $D020
+        sta $D020               ; Red border
+
+        ; Decrement PC to show actual illegal opcode address
+        lda c128_pc_lo
+        bne +
+        dec c128_pc_hi
++       dec c128_pc_lo
+
+        ; Use C128_MEM_PTR ($F0-$F3) as screen pointer at $020400
+        lda #$00
+        sta C128_MEM_PTR+0
+        lda #$04
+        sta C128_MEM_PTR+1
+        lda #$02
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Write "PC=" then PC value
+        ldz #0
+        lda #$10                ; 'P'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$03                ; 'C'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D                ; '='
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_pc_hi
+        jsr _ill_write_hex
+        lda c128_pc_lo
+        jsr _ill_write_hex
+
+        ; " OP="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$0F                ; 'O'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$10                ; 'P'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda last_opcode
+        jsr _ill_write_hex
+
+        ; " A="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$01
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_a
+        jsr _ill_write_hex
+
+        ; " S="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$13
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_sp
+        jsr _ill_write_hex
+
+        ; " M=" (mmu_cr)
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$0D                ; 'M'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda mmu_cr
+        jsr _ill_write_hex
+
+        ; " R=" (mmu_basic_lo_rom flag)
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$12                ; 'R'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda mmu_basic_lo_rom
+        jsr _ill_write_hex
+
 _ill_halt:
         jmp _ill_halt
+
+; Helper: write byte in A as 2 hex chars at [C128_MEM_PTR],z; advances Z by 2
+_ill_write_hex:
+        pha
+        lsr
+        lsr
+        lsr
+        lsr
+        jsr trace_to_scrcode
+        sta [C128_MEM_PTR],z
+        inz
+        pla
+        and #$0F
+        jsr trace_to_scrcode
+        sta [C128_MEM_PTR],z
+        inz
+        rts
 
 ; ---- Convert nibble in A to screen code ----
 ; 0-9 -> $30-$39, A-F -> $01-$06

@@ -393,6 +393,62 @@ clear_low_ram_buffer:
         rts
 
 ; ============================================================
+; display_show_40col - Display-only: show 40-col VIC screen
+; Does NOT change vdc_mode_active (emulation state unchanged)
+; ============================================================
+display_show_40col:
+        lda #$00
+        sta $D031               ; H640 off
+        lda #40
+        sta $D058
+        lda #0
+        sta $D059
+        ; Point SCRNPTR at C128 VIC screen in bank 4: $040400
+        lda #$00
+        sta $D060               ; SCRNPTR[7:0]
+        lda #$04
+        sta $D061               ; SCRNPTR[15:8]
+        lda #$04
+        sta $D062               ; SCRNPTR[23:16] = $04
+        lda #$00
+        sta $D063               ; -> $040400
+        lda #13
+        sta $D020               ; border = light green
+        lda #11
+        sta $D021               ; background = dark grey
+        rts
+
+; ============================================================
+; display_show_80col - Display-only: show 80-col VDC screen
+; Does NOT change vdc_mode_active (emulation state unchanged)
+; ============================================================
+display_show_80col:
+        lda #$80
+        sta $D031               ; H640 on
+        lda #80
+        sta $D058
+        lda #0
+        sta $D059
+        ; Point SCRNPTR back at bank 2: $020400
+        lda #$00
+        sta $D060               ; SCRNPTR[7:0]
+        lda #$04
+        sta $D061               ; SCRNPTR[15:8]
+        lda #$02
+        sta $D062               ; SCRNPTR[23:16] = $02
+        lda #$00
+        sta $D063               ; -> $020400
+        lda #0
+        sta $D020               ; border = black
+        sta $D021               ; background = black
+        ; Force immediate VDC render
+        lda #1
+        sta vdc_screen_dirty
+        sta vdc_attr_dirty
+        jsr VDC_RenderFrame
+        rts
+
+; ============================================================
 ; mmu_update_derived - Recompute derived MMU state from CR/RCR
 ; Called whenever MMU CR or RCR changes
 ; ============================================================
@@ -1139,10 +1195,6 @@ _rv_vdc_open:
 
 _rv_vdc_data:
         ; R31: Read byte from VDC RAM at address R18:R19, auto-increment
-        ; In 40-col mode, skip actual RAM read (return shadow, just advance addr)
-        ldx vdc_mode_active
-        beq _rv_vdc_data_skip
-
         ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
@@ -1817,10 +1869,6 @@ _wvdc_data:
         lda c128_saved_data
         sta vdc_regs+31         ; Always update shadow
 
-        ; In 40-col mode, skip actual RAM write (not rendered)
-        ldx vdc_mode_active
-        beq _wvdc_data_skip
-
 _wvdc_data_go:
         ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
@@ -1928,10 +1976,6 @@ _wvdc_word_count:
         lda c128_saved_data
         sta vdc_regs+30
 
-        ; In 40-col mode, skip actual fill (not rendered) - just advance addr
-        ldx vdc_mode_active
-        beq _wvdc_wc_skip
-
         ; Dirty flags handled individually by copy/fill paths below
 
         ; Count = value + 1 (16-bit because value=$FF -> count=256)
@@ -2012,15 +2056,26 @@ _vdc_fill_dst:
         bcs _vdc_fill_is_attr
 
         ; Screen area fill: mirror to MEGA65 screen at $020400
+        ; Original R18:R19 = current R18:R19 - fill_count (already advanced)
         ; Dest offset = original R18:R19 - R12:R13
-        ; Original R19 = current R19 - fill_count (since R18:R19 advanced)
+        ; Then add $0400 for MEGA65 screen base
+
+        ; Compute original R19 = current R19 - fill_count_lo
         lda vdc_regs+19
         sec
-        sbc _vdc_fill_count      ; back to original R19
-        sbc vdc_regs+13          ; subtract screen start lo (borrow propagates)
-        sta _vdc_scr_fill_dst
+        sbc _vdc_fill_count
+        sta _vdc_scr_tmp_lo
         lda _vdc_fill_orig_hi
-        sbc vdc_regs+12          ; subtract screen start hi
+        sbc _vdc_fill_count+1
+        sta _vdc_scr_tmp_hi
+
+        ; Subtract R12:R13 (VDC screen start)
+        lda _vdc_scr_tmp_lo
+        sec
+        sbc vdc_regs+13
+        sta _vdc_scr_fill_dst
+        lda _vdc_scr_tmp_hi
+        sbc vdc_regs+12
         clc
         adc #$04                ; +$0400 base
         sta _vdc_scr_fill_dst+1
@@ -2060,6 +2115,8 @@ _vdc_fill_is_attr:
         rts
 
 _vdc_fill_orig_hi: .byte 0
+_vdc_scr_tmp_lo:   .byte 0
+_vdc_scr_tmp_hi:   .byte 0
 
 _vdc_block_copy:
         ; --- Block copy via DMA ---
