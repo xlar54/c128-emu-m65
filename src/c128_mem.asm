@@ -2682,15 +2682,15 @@ _vdc_cur_no_erase:
         sbc vdc_regs+12         ; R12 screen start high
         sta _vdc_cur_offset+1
 
-        ; Bounds check: offset must be 0-1999
-        bne _vdc_cur_check_hi
+        ; Bounds check: offset must be 0-1999 ($0000-$07CF)
+        lda _vdc_cur_offset+1
+        cmp #>2000              ; compare high byte with $07
+        bcc _vdc_cur_in_bounds  ; high < $07: definitely in bounds
+        bne _vdc_cur_done       ; high > $07: out of bounds
+        ; High byte == $07, check low byte
         lda _vdc_cur_offset
-        cmp #<2000
-        bcc _vdc_cur_in_bounds
-        bra _vdc_cur_done
-_vdc_cur_check_hi:
-        cmp #>2000
-        bcs _vdc_cur_done
+        cmp #<2000              ; compare low byte with $D0
+        bcs _vdc_cur_done       ; low >= $D0: out of bounds (offset >= 2000)
 
 _vdc_cur_in_bounds:
         ; --- Step 3: If cursor phase ON, draw at new position ---
