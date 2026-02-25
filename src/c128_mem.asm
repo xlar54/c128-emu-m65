@@ -150,7 +150,7 @@ vdc_regs:        .fill 12, 0     ; R0-R11
                  .byte $08, $00  ; R20:R21 = attribute start ($0800)
                  .byte 80        ; R22 = chars per line (80)
                  .byte $08       ; R23 = char height (8 scan lines)
-                 .byte $20       ; R24 = block mode (bit 5 = fill)
+                 .byte $00       ; R24 = VSS (bit 7: 1=copy, 0=fill; bits 4-0: vert scroll)
                  .byte $07       ; R25 = attr mode flags
                  .byte $F0       ; R26 = color: white fg ($F), black bg ($0)
                  .byte 0         ; R27 = row increment
@@ -176,11 +176,22 @@ c128_charset_dirty: .byte 0
 c128_video_mode:    .byte 0       ; 0=text, 1=bitmap
 c128_file_op_active: .byte 0
 vdc_mode_active:    .byte 0       ; 0=40-col (no VDC render), 1=80-col (VDC active)
+vdc_screen_dirty:   .byte 1       ; 1=screen RAM changed, needs DMA copy
+vdc_attr_dirty:     .byte 1       ; 1=attribute RAM changed, needs translation
 
 ; ============================================================
 ; C128_MemInit - Initialize memory system
 ; ============================================================
 C128_MemInit:
+        ; Initialize C128_RAM_PTR ($F8-$FB) - dedicated fast path pointer
+        ; This pointer is ONLY used by read/write_data_fast macros
+        ; and is NEVER modified by anything else.
+        lda #$00
+        sta C128_RAM_PTR+0      ; Low byte always 0 (Z used as offset)
+        sta C128_RAM_PTR+3      ; Megabyte always 0
+        lda #BANK_RAM0
+        sta C128_RAM_PTR+2      ; Bank always 4 (C128 RAM bank 0)
+
         ; Set MMU to default power-on state
         lda #$00
         sta mmu_cr              ; All ROMs visible, bank 0, I/O
@@ -232,6 +243,9 @@ _clear_cia:
         ; Re-derive MMU state AFTER clear_low_ram_buffer
         ; (DMA may have zeroed our variables if they overlap $A000-$AFFF)
         jsr mmu_update_derived
+
+        ; Initialize 40/80 col color save buffers
+        jsr init_color_buffers
 
         rts
 
@@ -382,6 +396,161 @@ clear_low_ram_buffer:
         rts
 
 ; ============================================================
+; Color RAM save/restore buffers in bank 2:
+;   $020C00 = 40-col color save (1000 bytes)
+;   $021000 = 80-col color save (2000 bytes)
+; Color RAM is at $0FF80000 = MB $FF, bank $0F, addr $8000
+; ============================================================
+COLOR_40_SAVE = $0C00           ; bank 2 offset
+COLOR_80_SAVE = $1000           ; bank 2 offset
+
+; ============================================================
+; init_color_buffers - Fill 40/80 col color save buffers
+; 40-col: light green (13) x 1000 at $020C00
+; 80-col: white (1) x 2000 at $021000
+; ============================================================
+init_color_buffers:
+        ; Fill 40-col buffer with light green (13)
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 1000              ; 1000 bytes
+        .word 13                ; fill with 13 (light green)
+        .byte $00
+        .word COLOR_40_SAVE     ; dst = $020C00
+        .byte $02               ; bank 2
+        .byte $00
+        .word $0000
+        ; Fill 80-col buffer with white (1)
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 2000              ; 2000 bytes
+        .word 1                 ; fill with 1 (white)
+        .byte $00
+        .word COLOR_80_SAVE     ; dst = $021000
+        .byte $02               ; bank 2
+        .byte $00
+        .word $0000
+        rts
+
+; ============================================================
+; display_show_40col - Display-only: show 40-col VIC screen
+; Does NOT change vdc_mode_active (emulation state unchanged)
+; ============================================================
+display_show_40col:
+        ; Save 80-col colors: $0FF80000 -> $021000 (2000 bytes)
+        lda #$00
+        sta $D707
+        .byte $80, $FF          ; src MB = $FF (color RAM)
+        .byte $81, $00          ; dst MB = $00
+        .byte $00
+        .byte $00               ; copy
+        .word 2000
+        .word $0000             ; src addr ($0FF80000)
+        .byte $08               ; src bank $08
+        .word COLOR_80_SAVE     ; dst = $021000
+        .byte $02               ; dst bank 2
+        .byte $00
+        .word $0000
+        ; Restore 40-col colors: $020C00 -> $0FF80000 (1000 bytes)
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $FF          ; dst MB = $FF (color RAM)
+        .byte $00
+        .byte $00               ; copy
+        .word 1000
+        .word COLOR_40_SAVE     ; src = $020C00
+        .byte $02               ; src bank 2
+        .word $0000             ; dst addr ($0FF80000)
+        .byte $08               ; dst bank $08
+        .byte $00
+        .word $0000
+
+        lda #$00
+        sta $D031               ; H640 off
+        lda #40
+        sta $D058
+        lda #0
+        sta $D059
+        ; Point SCRNPTR at C128 VIC screen in bank 4: $040400
+        lda #$00
+        sta $D060               ; SCRNPTR[7:0]
+        lda #$04
+        sta $D061               ; SCRNPTR[15:8]
+        lda #$04
+        sta $D062               ; SCRNPTR[23:16] = $04
+        lda #$00
+        sta $D063               ; -> $040400
+        lda #13
+        sta $D020               ; border = light green
+        lda #11
+        sta $D021               ; background = dark grey
+        rts
+
+; ============================================================
+; display_show_80col - Display-only: show 80-col VDC screen
+; Does NOT change vdc_mode_active (emulation state unchanged)
+; ============================================================
+display_show_80col:
+        ; Save 40-col colors: $0FF80000 -> $020C00 (1000 bytes)
+        lda #$00
+        sta $D707
+        .byte $80, $FF          ; src MB = $FF (color RAM)
+        .byte $81, $00          ; dst MB = $00
+        .byte $00
+        .byte $00               ; copy
+        .word 1000
+        .word $0000             ; src addr ($0FF80000)
+        .byte $08               ; src bank $08
+        .word COLOR_40_SAVE     ; dst = $020C00
+        .byte $02               ; dst bank 2
+        .byte $00
+        .word $0000
+        ; Restore 80-col colors: $021000 -> $0FF80000 (2000 bytes)
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $FF          ; dst MB = $FF (color RAM)
+        .byte $00
+        .byte $00               ; copy
+        .word 2000
+        .word COLOR_80_SAVE     ; src = $021000
+        .byte $02               ; src bank 2
+        .word $0000             ; dst addr ($0FF80000)
+        .byte $08               ; dst bank $08
+        .byte $00
+        .word $0000
+
+        lda #$80
+        sta $D031               ; H640 on
+        lda #80
+        sta $D058
+        lda #0
+        sta $D059
+        ; Point SCRNPTR back at bank 2: $020400
+        lda #$00
+        sta $D060               ; SCRNPTR[7:0]
+        lda #$04
+        sta $D061               ; SCRNPTR[15:8]
+        lda #$02
+        sta $D062               ; SCRNPTR[23:16] = $02
+        lda #$00
+        sta $D063               ; -> $020400
+        lda #0
+        sta $D020               ; border = black
+        sta $D021               ; background = black
+        ; Force immediate VDC render
+        lda #1
+        sta vdc_screen_dirty
+        sta vdc_attr_dirty
+        jsr VDC_RenderFrame
+        rts
+
+; ============================================================
 ; mmu_update_derived - Recompute derived MMU state from CR/RCR
 ; Called whenever MMU CR or RCR changes
 ; ============================================================
@@ -456,6 +625,10 @@ _mmu_hi_done:
 
         ; Update shared RAM from RCR ($D506)
         jsr mmu_update_shared
+
+        ; Invalidate code cache so fetch8 picks up new ROM/RAM mapping
+        lda #0
+        sta c128_code_valid
         rts
 
 ; ============================================================
@@ -560,9 +733,14 @@ C128_ReadFast:
         cmp #$40
         bcs C128_Read           ; $4000+ needs full handler (ROM/IO possible)
 
-        ; $0000-$3FFF: RAM - read from physical bank via 32-bit pointer
-        jsr get_physical_bank
+        ; $0000-$3FFF: Almost always BANK_RAM0
+        lda mmu_ram_bank
+        cmp #BANK_RAM0
+        bne _rf_need_bank_check
+
+        ; Fast path: bank is RAM0, no shared check needed
         sta C128_MEM_PTR+2
+_rf_do_read:
         lda c128_addr_lo
         sta C128_MEM_PTR
         lda c128_addr_hi
@@ -572,6 +750,12 @@ C128_ReadFast:
         ldz #0
         lda [C128_MEM_PTR],z
         rts
+
+_rf_need_bank_check:
+        ; Bank 1 selected - must check shared regions
+        jsr get_physical_bank
+        sta C128_MEM_PTR+2
+        jmp _rf_do_read
 
 ; ============================================================
 ; C128_Read - Full memory read handler
@@ -698,9 +882,12 @@ _rd_io_other:
         rts
 
 _rd_color_ram:
-        ; Color RAM at $D800-$DBFF
-        ; Read via 32-bit pointer to $0FF80000 + offset
-        ; C128 $D800 = color RAM offset $000, $DBFF = offset $3FF
+        ; Color RAM at $D800-$DBFF (always 40-col VIC color reads)
+        ; If displaying 80-col, read from 40-col save buffer instead
+        lda display_showing_80
+        bne _rd_color_from_buffer
+
+        ; Displaying 40-col: read from live color RAM $0FF80000
         lda c128_addr_lo
         sta C128_MEM_PTR+0
         lda c128_addr_hi
@@ -708,12 +895,31 @@ _rd_color_ram:
         sbc #$D8                ; $D8->$00, $D9->$01, $DA->$02, $DB->$03
         sta C128_MEM_PTR+1
         lda #$F8
-        sta C128_MEM_PTR+2      ; -> $xF80xxx
+        sta C128_MEM_PTR+2
         lda #$0F
-        sta C128_MEM_PTR+3      ; -> $0FF80xxx
+        sta C128_MEM_PTR+3
         ldz #0
         lda [C128_MEM_PTR],z
         and #$0F                ; Color RAM is 4 bits
+        rts
+
+_rd_color_from_buffer:
+        ; Displaying 80-col: read from 40-col save buffer at $020C00
+        lda c128_addr_lo
+        sta C128_MEM_PTR+0
+        lda c128_addr_hi
+        sec
+        sbc #$D8
+        clc
+        adc #>COLOR_40_SAVE     ; + $0C
+        sta C128_MEM_PTR+1
+        lda #$02                ; bank 2
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+        and #$0F
         rts
 
 _rd_cia1:
@@ -845,8 +1051,11 @@ read_from_chargen:
 ; read_ram_direct - Read from physical RAM with shared logic
 ; ============================================================
 read_ram_direct:
-        jsr get_physical_bank
+        lda mmu_ram_bank
+        cmp #BANK_RAM0
+        bne _rrd_need_bank
         sta C128_MEM_PTR+2
+_rrd_do_read:
         lda c128_addr_lo
         sta C128_MEM_PTR
         lda c128_addr_hi
@@ -856,6 +1065,10 @@ read_ram_direct:
         ldz #$00
         lda [C128_MEM_PTR],z
         rts
+_rrd_need_bank:
+        jsr get_physical_bank
+        sta C128_MEM_PTR+2
+        jmp _rrd_do_read
 
 
 ; ============================================================
@@ -1037,7 +1250,11 @@ _rc1_port_a:
 
 _rc1_port_b:
         ; $DC01: Keyboard row read
-        lda $DC01              ; Read from real MEGA65 CIA
+        ; Return $FF (no keys pressed) - keyboard input is handled
+        ; by injecting MEGA65 $D619 PETSCII codes directly into the
+        ; C128 keyboard buffer. Passing real CIA through here causes
+        ; duplicate keypresses since both paths see the same key.
+        lda #$FF
         rts
 
 _rc1_icr:
@@ -1102,6 +1319,10 @@ _rv_vdc_open:
 
 _rv_vdc_data:
         ; R31: Read byte from VDC RAM at address R18:R19, auto-increment
+        ; In 40-col mode, skip actual RAM read (return shadow, just advance addr)
+        ldx vdc_mode_active
+        beq _rv_vdc_data_skip
+
         ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
@@ -1111,17 +1332,24 @@ _rv_vdc_data:
         adc #>VDC_RAM_BASE      ; add $20
         sta C128_MEM_PTR+1
         lda #VDC_RAM_BANK       ; $03
-        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
+        sta C128_MEM_PTR+2
         lda #VDC_RAM_MB         ; $00
         sta C128_MEM_PTR+3
         ldz #0
         lda [C128_MEM_PTR],z
-        pha
+        sta vdc_regs+31         ; update shadow with actual value
         ; Auto-increment R18:R19
         inc vdc_regs+19
         bne +
         inc vdc_regs+18
-+       pla
++       rts
+
+_rv_vdc_data_skip:
+        ; 40-col: return last known R31 value, still auto-increment
+        inc vdc_regs+19
+        bne +
+        inc vdc_regs+18
++       lda vdc_regs+31
         rts
 
 
@@ -1201,8 +1429,13 @@ _wr_vdc:
         jmp write_vdc_register
 
 _wr_color_ram:
-        ; Color RAM $D800-$DBFF
-        ; Write via 32-bit pointer to $0FF80000 + offset
+        ; Color RAM $D800-$DBFF (always 40-col VIC color writes)
+        ; If currently displaying 80-col, redirect to 40-col save buffer
+        ; so we don't corrupt the live color RAM (used by 80-col display)
+        lda display_showing_80
+        bne _wr_color_to_buffer
+
+        ; Displaying 40-col: write directly to color RAM $0FF80000
         lda c128_addr_lo
         sta C128_MEM_PTR+0
         lda c128_addr_hi
@@ -1212,10 +1445,32 @@ _wr_color_ram:
         lda #$F8
         sta C128_MEM_PTR+2
         lda #$0F
-        sta C128_MEM_PTR+3      ; -> $0FF80xxx
+        sta C128_MEM_PTR+3
         ldz #0
         lda c128_saved_data
         and #$0F                ; Color RAM is 4 bits
+        sta [C128_MEM_PTR],z
+        rts
+
+_wr_color_to_buffer:
+        ; Displaying 80-col: write to 40-col save buffer at $020C00
+        ; Offset = (addr_hi - $D8) * 256 + addr_lo
+        ; Buffer addr = $020C00 + offset
+        lda c128_addr_lo
+        sta C128_MEM_PTR+0
+        lda c128_addr_hi
+        sec
+        sbc #$D8                ; $D8->$00, $D9->$01, $DA->$02, $DB->$03
+        clc
+        adc #>COLOR_40_SAVE     ; + $0C
+        sta C128_MEM_PTR+1
+        lda #$02                ; bank 2
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda c128_saved_data
+        and #$0F
         sta [C128_MEM_PTR],z
         rts
 
@@ -1248,9 +1503,13 @@ write_ram_direct:
         sta c128_code_valid
 _wrd_no_inv:
 
-        jsr get_physical_bank
+        ; Fast path: when bank 0 selected (99%+ of the time),
+        ; skip get_physical_bank entirely
+        lda mmu_ram_bank
+        cmp #BANK_RAM0
+        bne _wrd_need_bank
         sta C128_MEM_PTR+2
-        sta _wrd_saved_bank     ; Save bank for mirror check
+_wrd_do_write:
         lda c128_addr_lo
         sta C128_MEM_PTR
         lda c128_addr_hi
@@ -1261,32 +1520,29 @@ _wrd_no_inv:
         lda c128_saved_data
         sta [C128_MEM_PTR],z
 
-        ; Mirror writes to pages $00-$0F in bank 4 to LOW_RAM_BUFFER
-        ; so CPU fast ZP/stack reads see the correct data
-        ; Rebuilds C128_MEM_PTR each time
-        lda _wrd_saved_bank
+        ; Mirror writes to pages $00-$0F to LOW_RAM_BUFFER (bank 0 only)
+        lda C128_MEM_PTR+2
         cmp #BANK_RAM0
         bne _wrd_done
         lda c128_addr_hi
         cmp #$10
         bcs _wrd_done
-        ; Set C128_MEM_PTR to LOW_RAM_BUFFER + c128_addr_hi page
+        ; Reuse Z=0 from above. Just change bank and page offset.
         clc
         adc #>LOW_RAM_BUFFER
         sta C128_MEM_PTR+1
-        lda #<LOW_RAM_BUFFER
-        sta C128_MEM_PTR+0
         lda #$00
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        lda c128_addr_lo
-        taz
+        sta C128_MEM_PTR+2      ; bank 0
+        ldz c128_addr_lo
         lda c128_saved_data
         sta [C128_MEM_PTR],z
 _wrd_done:
         rts
 
-_wrd_saved_bank: .byte 0
+_wrd_need_bank:
+        jsr get_physical_bank
+        sta C128_MEM_PTR+2
+        jmp _wrd_do_write
 
 
 ; ============================================================
@@ -1735,7 +1991,24 @@ write_vdc_register:
         bcs _wvdc_done
         lda c128_saved_data
         sta vdc_regs,x
+        ; Mark dirty if screen/attr pointer regs changed
+        cpx #12
+        beq _wvdc_mark_scr_dirty
+        cpx #13
+        beq _wvdc_mark_scr_dirty
+        cpx #20
+        beq _wvdc_mark_attr_dirty
+        cpx #21
+        beq _wvdc_mark_attr_dirty
 _wvdc_done:
+        rts
+_wvdc_mark_scr_dirty:
+        lda #1
+        sta vdc_screen_dirty
+        rts
+_wvdc_mark_attr_dirty:
+        lda #1
+        sta vdc_attr_dirty
         rts
 
 _wvdc_index:
@@ -1747,6 +2020,14 @@ _wvdc_index:
 
 _wvdc_data:
         ; R31: Write byte to VDC RAM at address R18:R19, auto-increment
+        lda c128_saved_data
+        sta vdc_regs+31         ; Always update shadow
+
+        ; In 40-col mode, skip actual RAM write (not rendered)
+        ldx vdc_mode_active
+        beq _wvdc_data_skip
+
+_wvdc_data_go:
         ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
@@ -1756,14 +2037,84 @@ _wvdc_data:
         adc #>VDC_RAM_BASE      ; add $20
         sta C128_MEM_PTR+1
         lda #VDC_RAM_BANK       ; $03
-        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
+        sta C128_MEM_PTR+2
         lda #VDC_RAM_MB         ; $00
         sta C128_MEM_PTR+3
         ldz #0
         lda c128_saved_data
         sta [C128_MEM_PTR],z
-        sta vdc_regs+31         ; also update shadow
+
+        ; --- Inline attribute translation to MEGA65 color RAM ---
+        ; Check if this write is to attribute area (R18 >= R20)
+        lda vdc_regs+18
+        cmp vdc_regs+20
+        bcc _wvdc_is_screen
+        bne _wvdc_is_attr
+        lda vdc_regs+19
+        cmp vdc_regs+21
+        bcc _wvdc_is_screen
+
+_wvdc_is_attr:
+        ; Attribute write: translate color and write to color RAM or buffer
+        ; Offset within attr area = (R18:R19) - (R20:R21)
+        lda vdc_regs+19
+        sec
+        sbc vdc_regs+21
+        sta vdc_color_ptr+0
+        lda vdc_regs+18
+        sbc vdc_regs+20
+        sta vdc_color_ptr+1
+        ; If displaying 40-col, redirect to 80-col save buffer at $021000
+        lda display_showing_80
+        bne _wvdc_attr_live
+        ; 40-col display: write to buffer at bank 2, $1000 + offset
+        lda vdc_color_ptr+1
+        clc
+        adc #>COLOR_80_SAVE     ; + $10
+        sta vdc_color_ptr+1
+        lda #$02                ; bank 2
+        sta vdc_color_ptr+2
+        lda #$00
+        sta vdc_color_ptr+3
+        bra _wvdc_attr_do_write
+_wvdc_attr_live:
+        ; 80-col display: write to live color RAM at $0FF80000
+        lda #$F8
+        sta vdc_color_ptr+2
+        lda #$0F
+        sta vdc_color_ptr+3
+_wvdc_attr_do_write:
+        ; Translate: extract low nibble, lookup VIC color
+        lda c128_saved_data
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        ldz #0
+        sta [vdc_color_ptr],z
+        jmp _wvdc_data_skip
+
+_wvdc_is_screen:
+        ; Screen write: copy char directly to MEGA65 screen at $020400 + offset
+        ; Offset = (R18:R19) - (R12:R13)
+        lda vdc_regs+19
+        sec
+        sbc vdc_regs+13
+        sta vdc_color_ptr+0     ; Reuse ptr temporarily
+        lda vdc_regs+18
+        sbc vdc_regs+12
+        clc
+        adc #$04                ; +$0400 base
+        sta vdc_color_ptr+1
+        lda #$02                ; Bank 2 = $020000
+        sta vdc_color_ptr+2
+        lda #$00
+        sta vdc_color_ptr+3
+        ldz #0
+        lda c128_saved_data
+        sta [vdc_color_ptr],z
+
         ; Auto-increment R18:R19
+_wvdc_data_skip:
         inc vdc_regs+19
         bne +
         inc vdc_regs+18
@@ -1798,57 +2149,275 @@ _wvdc_word_count:
         lda c128_saved_data
         sta vdc_regs+30
 
-        ; Count = value + 1
+        ; In 40-col mode, skip actual fill (not rendered) - just advance addr
+        ldx vdc_mode_active
+        beq _wvdc_wc_skip
+
+        ; Dirty flags handled individually by copy/fill paths below
+
+        ; Count = value + 1 (16-bit because value=$FF -> count=256)
         lda c128_saved_data
         clc
         adc #1
-        sta _vdc_count
+        sta _vdc_fill_count
         lda #0
         adc #0
-        sta _vdc_count+1
+        sta _vdc_fill_count+1
 
-        ; Check bit 5 of R24: 1 = fill, 0 = copy
+        ; Check bit 7 of R24 (VSS register): 1 = copy, 0 = fill
+        ; (Oxyron VDC ref: R24 bit 7 = "Fill/Copy")
         lda vdc_regs+24
-        and #$20
-        beq _vdc_block_copy
+        bmi _vdc_block_copy
 
-        ; --- Block fill: fill (count) bytes with R31 value ---
+        ; --- Block fill via DMA ---
+        ; Fill (count) bytes at VDC R18:R19 with R31 value
+        ; Uses same DMA list format as hook_vdc_screen_clear
+
+        ; Set fill value in source addr field (little-endian, hi byte=0)
         lda vdc_regs+31
-        sta _vdc_fill_byte
+        sta _vdc_fill_val
+        lda #$00
+        sta _vdc_fill_val+1
 
-_vdc_fill_loop:
+        ; Set destination: bank 3, addr = R18:R19 + VDC_RAM_BASE
         lda vdc_regs+19
-        sta C128_MEM_PTR+0
+        clc
+        adc #<VDC_RAM_BASE
+        sta _vdc_fill_dst
         lda vdc_regs+18
         and #$3F
-        clc
-        adc #>VDC_RAM_BASE      ; add $20
-        sta C128_MEM_PTR+1
-        lda #VDC_RAM_BANK       ; $03
-        sta C128_MEM_PTR+2      ; Always bank 3, no carry addition
-        lda #VDC_RAM_MB         ; $00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda _vdc_fill_byte
-        sta [C128_MEM_PTR],z
+        adc #>VDC_RAM_BASE
+        sta _vdc_fill_dst+1
 
-        ; Increment R18:R19
-        inc vdc_regs+19
-        bne +
-        inc vdc_regs+18
-+
-        ; Decrement count
-        lda _vdc_count
-        bne +
-        dec _vdc_count+1
-+       dec _vdc_count
-        lda _vdc_count
-        ora _vdc_count+1
-        bne _vdc_fill_loop
+        ; Trigger DMA fill
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $00          ; dst MB = $00
+        .byte $00               ; end options
+        .byte $03               ; fill command
+_vdc_fill_count:
+        .word $0000             ; count (filled above)
+_vdc_fill_val:
+        .word $0000             ; fill value in src addr field (filled above)
+        .byte $00               ; src bank (ignored for fill)
+_vdc_fill_dst:
+        .word $0000             ; dst addr (filled above)
+        .byte $03               ; dst bank = 3 (VDC RAM)
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+
+        ; Advance R18:R19 by count (as real VDC hardware would)
+        clc
+        lda vdc_regs+19
+        adc _vdc_fill_count
+        sta vdc_regs+19
+        lda vdc_regs+18
+        adc _vdc_fill_count+1
+        sta vdc_regs+18
+
+        ; --- Also fill MEGA65 screen/color RAM ---
+        ; Check if fill destination is screen or attr area
+        ; Use the pre-advance R18 value: recompute from current - count
+        lda vdc_regs+18
+        sec
+        sbc _vdc_fill_count+1
+        sta _vdc_fill_orig_hi
+        lda vdc_regs+19
+        sec
+        sbc _vdc_fill_count
+        ; (don't need lo, just need hi for area check)
+
+        lda _vdc_fill_orig_hi
+        cmp vdc_regs+20
+        bcs _vdc_fill_is_attr
+
+        ; Screen area fill: mirror to MEGA65 screen at $020400
+        ; Dest offset = original R18:R19 - R12:R13
+        ; Original R19 = current R19 - fill_count (since R18:R19 advanced)
+        lda vdc_regs+19
+        sec
+        sbc _vdc_fill_count      ; back to original R19
+        sbc vdc_regs+13          ; subtract screen start lo (borrow propagates)
+        sta _vdc_scr_fill_dst
+        lda _vdc_fill_orig_hi
+        sbc vdc_regs+12          ; subtract screen start hi
+        clc
+        adc #$04                ; +$0400 base
+        sta _vdc_scr_fill_dst+1
+
+        lda _vdc_fill_count
+        sta _vdc_scr_fill_cnt
+        lda _vdc_fill_count+1
+        sta _vdc_scr_fill_cnt+1
+
+        lda vdc_regs+31
+        sta _vdc_scr_fill_val
+        lda #$00
+        sta _vdc_scr_fill_val+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00
+        .byte $81, $00
+        .byte $00
+        .byte $03               ; fill command
+_vdc_scr_fill_cnt:
+        .word $0000
+_vdc_scr_fill_val:
+        .word $0000
+        .byte $00
+_vdc_scr_fill_dst:
+        .word $0000
+        .byte $02               ; dst bank = 2 ($020000)
+        .byte $00
+        .word $0000
         rts
 
+_vdc_fill_is_attr:
+        ; Attribute area fill: mark dirty for batch processing
+        lda #1
+        sta vdc_attr_dirty
+        rts
+
+_vdc_fill_orig_hi: .byte 0
+
 _vdc_block_copy:
-        ; --- Block copy: not implemented yet, just advance address ---
+        ; --- Block copy via DMA ---
+        ; VDC 8563 block copy:
+        ; R32:R33 = block copy source address
+        ; R18:R19 = update address (destination)
+        ; Count was already computed in _vdc_fill_count
+
+        ; Set source: bank 3, addr = R32:R33 + VDC_RAM_BASE
+        lda vdc_regs+33
+        clc
+        adc #<VDC_RAM_BASE
+        sta _vdc_copy_src
+        lda vdc_regs+32
+        and #$3F
+        adc #>VDC_RAM_BASE
+        sta _vdc_copy_src+1
+
+        ; Set destination: bank 3, addr = R18:R19 + VDC_RAM_BASE
+        lda vdc_regs+19
+        clc
+        adc #<VDC_RAM_BASE
+        sta _vdc_copy_dst
+        lda vdc_regs+18
+        and #$3F
+        adc #>VDC_RAM_BASE
+        sta _vdc_copy_dst+1
+
+        ; Copy count into DMA list
+        lda _vdc_fill_count
+        sta _vdc_copy_count
+        lda _vdc_fill_count+1
+        sta _vdc_copy_count+1
+
+        ; Trigger DMA copy (VDC RAM in bank 3)
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $00          ; dst MB = $00
+        .byte $00               ; end options
+        .byte $00               ; copy command (not fill)
+_vdc_copy_count:
+        .word $0000             ; count
+_vdc_copy_src:
+        .word $0000             ; src addr
+        .byte $03               ; src bank = 3 (VDC RAM)
+_vdc_copy_dst:
+        .word $0000             ; dst addr
+        .byte $03               ; dst bank = 3 (VDC RAM)
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+
+        ; --- Also copy within MEGA65 screen RAM so display updates ---
+        ; Determine if this is a screen copy or attribute copy
+        ; Screen area: R12:R13 to R20:R21-1
+        ; Attribute area: R20:R21 onwards
+        ; Check destination (R18): if < R20, it's screen area
+        lda vdc_regs+18
+        cmp vdc_regs+20
+        bcs _vdc_copy_attr
+
+        ; Screen area copy: mirror to MEGA65 screen at $020400
+        ; Source offset from screen start = R32:R33 - R12:R13
+        lda vdc_regs+33
+        sec
+        sbc vdc_regs+13
+        sta _vdc_scr_copy_src
+        lda vdc_regs+32
+        sbc vdc_regs+12
+        clc
+        adc #$04                ; +$0400 base
+        sta _vdc_scr_copy_src+1
+
+        ; Dest offset from screen start = R18:R19 - R12:R13
+        lda vdc_regs+19
+        sec
+        sbc vdc_regs+13
+        sta _vdc_scr_copy_dst
+        lda vdc_regs+18
+        sbc vdc_regs+12
+        clc
+        adc #$04
+        sta _vdc_scr_copy_dst+1
+
+        ; Copy count
+        lda _vdc_fill_count
+        sta _vdc_scr_copy_cnt
+        lda _vdc_fill_count+1
+        sta _vdc_scr_copy_cnt+1
+
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $00          ; dst MB = $00
+        .byte $00               ; end options
+        .byte $00               ; copy command
+_vdc_scr_copy_cnt:
+        .word $0000
+_vdc_scr_copy_src:
+        .word $0000
+        .byte $02               ; src bank = 2 ($020000)
+_vdc_scr_copy_dst:
+        .word $0000
+        .byte $02               ; dst bank = 2 ($020000)
+        .byte $00
+        .word $0000
+
+        jmp _vdc_copy_advance
+
+_vdc_copy_attr:
+        ; Attribute area copy: translate and copy to MEGA65 color RAM
+        ; For now, just mark attr dirty so the batch loop handles it
+        lda #1
+        sta vdc_attr_dirty
+
+_vdc_copy_advance:
+        ; Advance R18:R19 by count (as real VDC hardware would)
+        clc
+        lda vdc_regs+19
+        adc _vdc_fill_count
+        sta vdc_regs+19
+        lda vdc_regs+18
+        adc _vdc_fill_count+1
+        sta vdc_regs+18
+
+        ; Advance R32:R33 by count (source also advances)
+        clc
+        lda vdc_regs+33
+        adc _vdc_fill_count
+        sta vdc_regs+33
+        lda vdc_regs+32
+        adc _vdc_fill_count+1
+        sta vdc_regs+32
+        rts
+
+_wvdc_wc_skip:
+        ; 40-col mode: Advance R18:R19 by (value + 1)
         clc
         lda vdc_regs+19
         adc c128_saved_data
@@ -1860,9 +2429,6 @@ _vdc_block_copy:
         bne +
         inc vdc_regs+18
 +       rts
-
-_vdc_count:   .word 0
-_vdc_fill_byte: .byte 0
 
 ; ============================================================
 ; Utility: print_hex8 - Print byte in A as 2 hex chars
@@ -1919,9 +2485,16 @@ VDC_RenderFrame:
         sta $D021               ; black background
 
         ; --- Step 1: DMA copy VDC screen RAM to MEGA65 screen ---
+        ; Only if screen RAM has changed since last render
+        lda vdc_screen_dirty
+        beq _vdc_skip_screen_dma
+
+        lda #0
+        sta vdc_screen_dirty    ; Clear dirty flag
+
         ; VDC RAM is at $32000: real_addr = $32000 + VDC_addr
         ; Source: bank 3, addr = VDC R12:R13 + $2000
-        ; Dest:   $040400 (MEGA65 screen pointer target)
+        ; Dest:   $020400 (MEGA65 screen pointer target)
         ; Count:  2000 bytes (80 x 25)
 
         ; Build the DMA source addr = VDC R12:R13 + $2000
@@ -1953,7 +2526,17 @@ _vdc_dma_scr_bank:
         .byte $00               ; command high byte
         .word $0000             ; modulo
 
+_vdc_skip_screen_dma:
+
         ; --- Step 2: Translate VDC attribute RAM -> MEGA65 color RAM ---
+        ; DISABLED: Attributes are now translated inline during R31 writes.
+        ; The batch loop is only needed after R30 block fill/copy operations
+        ; which set vdc_attr_dirty.
+        lda vdc_attr_dirty
+        beq _vdc_skip_attr
+
+        lda #0
+        sta vdc_attr_dirty      ; Clear dirty flag
         ; Read each attribute byte from VDC RAM, extract low nibble
         ; (VDC RGBI color), convert via lookup table, write to color RAM.
 
@@ -1980,45 +2563,172 @@ _vdc_dma_scr_bank:
         lda #$0F
         sta vdc_color_ptr+3     ; -> $0FF80000
 
-        ; 16-bit counter: 2000 = $07D0
-        lda #<2000
-        sta _vdc_count_lo
-        lda #>2000
-        sta _vdc_count_hi
+        ; Process in pages of 256 bytes using Z as index
+        ; First: 7 full pages (7 x 256 = 1792)
+        lda #7
+        sta _vdc_page_count
 
-        ldz #0                  ; Always use Z=0 for 32-bit indexed access
-
-_vdc_attr_loop:
-        lda [C128_MEM_PTR],z    ; Read VDC attribute byte from VDC RAM
-        and #$0F                ; Extract VDC foreground RGBI color (bits 3-0)
+_vdc_attr_page:
+        ldz #0
+_vdc_attr_inner:
+        lda [C128_MEM_PTR],z    ; Read VDC attribute byte
+        and #$0F                ; Extract foreground color
         tax
         lda vdc_to_vic_color,x  ; Convert to VIC-II color
         sta [vdc_color_ptr],z   ; Write to color RAM
+        inz
+        bne _vdc_attr_inner     ; Loop 256 times (Z wraps)
 
-        ; Increment source pointer
-        inc C128_MEM_PTR+0
-        bne +
+        ; Advance source and dest pointers by 256 (increment high byte)
         inc C128_MEM_PTR+1
-+
-        ; Increment dest pointer
-        inc vdc_color_ptr+0
-        bne +
         inc vdc_color_ptr+1
-+
-        ; Decrement 16-bit counter
-        lda _vdc_count_lo
-        bne +
-        dec _vdc_count_hi
-+       dec _vdc_count_lo
-        lda _vdc_count_lo
-        ora _vdc_count_hi
-        bne _vdc_attr_loop
 
+        dec _vdc_page_count
+        bne _vdc_attr_page
+
+        ; Remaining: 2000 - 1792 = 208 bytes
+        ldz #0
+_vdc_attr_tail:
+        lda [C128_MEM_PTR],z
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta [vdc_color_ptr],z
+        inz
+        cpz #208
+        bne _vdc_attr_tail
+
+_vdc_skip_attr:
         rts
 
-_vdc_count_lo: .byte 0
-_vdc_count_hi: .byte 0
-_vdc_render_count: .byte 0
+_vdc_page_count: .byte 0
+
+; ============================================================
+; VDC_UpdateCursor - Draw/erase cursor on MEGA65 screen
+;
+; Checks VDC R10 bits 6:5 for cursor mode:
+;   %01 = cursor disabled (CRSROFF writes $20)
+; Tracks previous cursor position. On each call:
+; 1. Erase old cursor (restore char from VDC RAM at old position)
+; 2. If cursor enabled and phase is ON, draw new cursor
+;
+; MEGA65 screen at $020400, VDC screen RAM at $32000 + R12:R13
+; ============================================================
+VDC_UpdateCursor:
+        ; Check VDC R10 bits 6:5 - if %01, cursor is disabled
+        lda vdc_regs+10
+        and #%01100000
+        cmp #%00100000          ; %01 = cursor off
+        bne _vdc_cur_enabled
+
+        ; Cursor disabled - erase if currently drawn, then exit
+        lda _vdc_cur_drawn
+        beq _vdc_cur_done       ; Not drawn, nothing to do
+        jmp _vdc_cur_do_erase   ; Erase and exit
+
+_vdc_cur_enabled:
+        ; --- Step 1: Erase old cursor at previous position ---
+        lda _vdc_cur_drawn
+        beq _vdc_cur_no_erase   ; Not drawn, nothing to erase
+
+_vdc_cur_do_erase:
+
+        ; Read original char from VDC screen RAM at old position
+        ; VDC RAM addr = R12:R13 + prev_offset, at $32000+
+        lda vdc_regs+13
+        clc
+        adc _vdc_cur_prev
+        sta C128_MEM_PTR
+        lda vdc_regs+12
+        and #$3F
+        adc _vdc_cur_prev+1
+        clc
+        adc #>VDC_RAM_BASE      ; + $20
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK       ; bank 3
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; original char
+        pha
+
+        ; Write to MEGA65 screen at old position
+        lda _vdc_cur_prev
+        clc
+        adc #<$0400
+        sta C128_MEM_PTR
+        lda _vdc_cur_prev+1
+        adc #>$0400
+        sta C128_MEM_PTR+1
+        lda #$02                ; bank 2
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        pla
+        ldz #0
+        sta [C128_MEM_PTR],z
+
+        lda #0
+        sta _vdc_cur_drawn      ; mark as erased
+
+_vdc_cur_no_erase:
+        ; --- Step 2: Compute new cursor offset ---
+        lda vdc_regs+15         ; R15 cursor pos low
+        sec
+        sbc vdc_regs+13         ; R13 screen start low
+        sta _vdc_cur_offset
+        lda vdc_regs+14         ; R14 cursor pos high
+        sbc vdc_regs+12         ; R12 screen start high
+        sta _vdc_cur_offset+1
+
+        ; Bounds check: offset must be 0-1999
+        bne _vdc_cur_check_hi
+        lda _vdc_cur_offset
+        cmp #<2000
+        bcc _vdc_cur_in_bounds
+        bra _vdc_cur_done
+_vdc_cur_check_hi:
+        cmp #>2000
+        bcs _vdc_cur_done
+
+_vdc_cur_in_bounds:
+        ; --- Step 3: If cursor phase ON, draw at new position ---
+        lda c128_cur_phase
+        beq _vdc_cur_save_prev  ; Phase OFF - just save position, don't draw
+
+        ; Write reverse space ($A0) to MEGA65 screen
+        lda _vdc_cur_offset
+        clc
+        adc #<$0400
+        sta C128_MEM_PTR
+        lda _vdc_cur_offset+1
+        adc #>$0400
+        sta C128_MEM_PTR+1
+        lda #$02
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        lda #$A0               ; reverse space
+        ldz #0
+        sta [C128_MEM_PTR],z
+
+        lda #1
+        sta _vdc_cur_drawn      ; mark as drawn
+
+_vdc_cur_save_prev:
+        ; Save current offset as previous for next call
+        lda _vdc_cur_offset
+        sta _vdc_cur_prev
+        lda _vdc_cur_offset+1
+        sta _vdc_cur_prev+1
+
+_vdc_cur_done:
+        rts
+
+_vdc_cur_offset: .word 0
+_vdc_cur_prev:   .word 0       ; Previous cursor offset (for erase)
+_vdc_cur_drawn:  .byte 0       ; 1 = cursor block currently on screen
 
 ; VDC RGBI -> VIC-II color lookup table
 ; VDC RGBI encoding:  R G B I  (4 bits)

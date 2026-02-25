@@ -336,16 +336,7 @@ rom_fail_msg:
 ; Include emulator components
 ; ============================================================
         .include "c128_cpu_8502.asm"
-        .include "c128_cpu_z80.asm"
         .include "c128_hooks.asm"
         .include "c128_mem.asm"
         .include "c128_sound.asm"
         .include "c128_host.asm"
-        ;.include "c128_monitor.asm"  ; DISABLED - writes to bank 1, corrupts ROMs
-
-; Stub out monitor entry points
-C128Mon_Check:
-        clc             ; carry clear = no monitor
-        rts
-C128Mon_Enter:
-        rts

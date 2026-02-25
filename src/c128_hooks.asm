@@ -176,17 +176,18 @@ C128Hook_Reset:
 ;   Called once per emulated instruction, right before opcode fetch.
 ; ------------------------------------------------------------
 C128Hook_CheckAndRun:
-        pha
-        txa
-        pha
-        tya
-        pha
-
         lda c128_pc_hi
 
         ; ----- Check for $FFxx addresses (KERNAL calls) -----
         cmp #$FF
         bne _not_ff
+
+        ; Save registers only when we have a potential match
+        pha
+        txa
+        pha
+        tya
+        pha
         
         lda c128_pc_lo
         cmp #$BD                        ; SETNAM = $FFBD
@@ -214,7 +215,9 @@ C128Hook_CheckAndRun:
         beq _do_chrout
         cmp #$E4                        ; GETIN = $FFE4
         beq _do_getin
-        jmp _check_other
+        cmp #$7D                        ; PRIMM = $FF7D
+        beq _do_primm
+        jmp _done                       ; No match in $FF page
 
 _do_setnam:
         jsr C128Hook_OnSETNAM
@@ -258,7 +261,24 @@ _do_chrin:
 _do_chrout:
         lda seq_output_slot
         cmp #$FF
-        beq _done               ; Let guest ROM handle it
+        bne _do_chrout_file
+        ; Screen output: try fast path for 80-col
+        ; Check C128's actual mode flag, not our cached state
+        lda #$D7
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; C128 $D7: $00=40-col, $80=80-col
+        bpl _done               ; 40-col: let ROM handle
+        lda c128_a
+        jsr C128Hook_FastCHROUT
+        bcs _done               ; Carry set = couldn't handle, let ROM do it
+        ; Clear C128 carry flag (ROM does CLC at $C31E before RTS)
+        lda c128_p
+        and #$FE                ; clear bit 0 (carry)
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        jmp _done
+_do_chrout_file:
         jsr C128Hook_OnCHROUT
         jmp _done
 
@@ -267,6 +287,16 @@ _do_getin:
         cmp #$FF
         beq _done               ; No file input - let ROM handle
         jsr C128Hook_OnGETIN
+        jmp _done
+
+_do_primm:
+        ; Check C128's actual mode flag, not our cached state
+        lda #$D7
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; C128 $D7: $00=40-col, $80=80-col
+        bpl _done               ; 40-col: let ROM handle PRIMM natively
+        jsr C128Hook_OnPRIMM
         jmp _done
 
 _do_load_direct:
@@ -309,73 +339,65 @@ _not_ff:
         cmp #$F8
         bne _check_f9
         lda c128_pc_lo
-        cmp #$67                        ; $F867 = IOINIT entry (serial init + auto-boot)
-        bne _f8_done
+        cmp #$67                        ; $F867 = IOINIT entry
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
         ; Skip IOINIT entirely - no serial bus or disk drive
         ; But we must initialize CIA1 Timer A for keyboard scanning IRQ
-        ; C128 KERNAL sets Timer A to $4025 (~60Hz on PAL)
         lda #$25
         sta cia1_timer_a_latch_lo
         sta cia1_timer_a_lo
         lda #$40
         sta cia1_timer_a_latch_hi
         sta cia1_timer_a_hi
-        ; Enable Timer A IRQ (bit 0 of ICR mask)
-        lda #$81                        ; Set bit 0 (Timer A)
+        lda #$81
         sta cia1_icr_mask
-        ; Start Timer A: continuous mode
-        lda #$01                        ; bit 0 = start
+        lda #$01
         sta cia1_timer_a_ctrl
-        ; Write keyboard column select to $DC00 (all columns = $FF)
         lda #$FF
         sta $DC00
-        ; Simulate RTS to return to caller (who did JSR $FF56)
         jsr C128Hook_RTS_Guest
-_f8_done:
         jmp _done
 
 _check_f9:
-        cmp #$F9
-        bne _check_fa
-        jmp _done
-
-_check_fa:
-        cmp #$FA
-        bne _check_c4_rom
-        jmp _done
-
-_check_c4_rom:
-_check_c4_done:
-        ; Reload c128_pc_hi for next check
-        lda c128_pc_hi
-
         ; ----- Check for $C8xx (DIRECTORY at $C8BC) -----
-_check_c8:
         cmp #$C8
         bne _check_a8
         lda c128_pc_lo
-        cmp #$BC                        ; DIRECTORY = $C8BC
-        bne _done
+        cmp #$BC
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr C128Hook_OnDIRECTORY
         jmp _done
 
 _check_a8:
         ; ----- Check for LOAD hook at $A800 -----
         cmp #$A8
-        bne _done
+        bne _done_fast
         lda c128_pc_lo
-        cmp #$00
-        bne _done
-
-_check_other:
-        lda c128_pc_hi
-        cmp #$A8
-        bne _done
-        lda c128_pc_lo
-        bne _done
-        
-        ; We're at $A800 - the JSR $FFD5 inside BASIC LOAD
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
         jsr C128Hook_OnLOAD
+        jmp _done
+
+; Fast exit - no registers were saved, just return
+_done_fast:
+        rts
 
 _done:
         pla
@@ -2222,6 +2244,284 @@ C128Hook_RTS_Guest:
 
 
 ; ============================================================
+; C128Hook_FastCHROUT - Fast 80-column screen character output
+; Input: A = PETSCII character to print
+; Output: Carry clear = handled, Carry set = let ROM handle
+;
+; Handles printable characters and CR ($0D) directly.
+; All other control codes fall back to ROM.
+; Writes to VDC RAM + MEGA65 screen, updates cursor position
+; and KERNAL ZP variables ($EC=column, $EB=row).
+; ============================================================
+C128Hook_FastCHROUT:
+        ; Fast 80-column screen output. Handles:
+        ; - Printable chars ($20-$7F, $A0-$FF): write to screen, advance cursor
+        ; - CR ($0D): move to start of next line (if no scroll needed)
+        ; All other control codes -> SEC -> ROM handles.
+        ;
+        ; Maintains KERNAL ZP state:
+        ;   $EC = PNTR (cursor column)
+        ;   $EB = TBLX (cursor row)
+        ;   $E0-$E1 = PNT (pointer to screen line start in VDC RAM)
+        ;   $CE = char under cursor
+        ;
+        ; Returns: CLC = handled, SEC = let ROM handle
+
+        cmp #$0D
+        beq fco_rom             ; CR: let ROM handle (complex state updates)
+
+        ; Check printable range
+        cmp #$20
+        bcc fco_rom            ; $00-$1F: control codes
+        cmp #$80
+        bcc fco_printable      ; $20-$7F: printable
+        cmp #$A0
+        bcc fco_rom            ; $80-$9F: control codes
+        ; $A0-$FF: printable
+
+fco_printable:
+        pha                     ; Save PETSCII
+
+        ; Read current column ($EC) - bail if would wrap
+        lda #$EC
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Read
+        cmp #79
+        bcs fco_rom_pop        ; Column >= 79: would wrap, let ROM handle
+        sta fco_old_col
+
+        ; Convert PETSCII to screen code
+        pla
+        pha
+        jsr fco_petscii_to_screen
+        sta fco_scrcode
+
+        ; Write to VDC RAM at cursor position (R14:R15)
+        lda vdc_regs+15
+        sta C128_MEM_PTR+0
+        lda vdc_regs+14
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda fco_scrcode
+        sta [C128_MEM_PTR],z
+
+        ; Write to MEGA65 screen ($020400 + offset from screen start)
+        lda vdc_regs+15
+        sec
+        sbc vdc_regs+13
+        sta C128_MEM_PTR+0
+        lda vdc_regs+14
+        sbc vdc_regs+12
+        clc
+        adc #$04
+        sta C128_MEM_PTR+1
+        lda #$02
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda fco_scrcode
+        sta [C128_MEM_PTR],z
+
+        ; Advance VDC cursor R14:R15
+        inc vdc_regs+15
+        bne +
+        inc vdc_regs+14
++
+        ; Update KERNAL column $EC = old + 1
+        lda fco_old_col
+        clc
+        adc #1
+        sta c128_data
+        lda #$EC
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Write
+
+        pla                     ; Clean stack
+        clc
+        rts
+
+fco_cr:
+        ; Carriage Return: move to start of next line
+        ; First: read current row, check if scroll needed
+        lda #$EB
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Read
+        cmp #24
+        bcs fco_rom            ; Row >= 24: scroll needed, let ROM handle
+        sta fco_old_row
+
+        ; Compute new row
+        clc
+        adc #1
+        sta fco_new_row
+
+        ; Write new row to $EB
+        sta c128_data
+        lda #$EB
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Write
+
+        ; Write column = 0 to $EC
+        lda #0
+        sta c128_data
+        lda #$EC
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; Compute PNT = screen_start + (new_row * 80) and write to $E0-$E1
+        ; new_row * 80 = new_row * 64 + new_row * 16
+        lda fco_new_row
+        sta fco_tmp
+        lda #0
+        sta fco_tmp+1
+        ; *2
+        asl fco_tmp
+        rol fco_tmp+1
+        ; *4
+        asl fco_tmp
+        rol fco_tmp+1
+        ; Save *4 for later (need *4 + *64 = *4*(1+16) -- wait, *16+*64 = *80)
+        ; Actually: *16
+        asl fco_tmp
+        rol fco_tmp+1
+        asl fco_tmp
+        rol fco_tmp+1
+        ; Now fco_tmp = row*16, save it
+        lda fco_tmp
+        sta fco_r16
+        lda fco_tmp+1
+        sta fco_r16+1
+        ; Continue to *64
+        asl fco_tmp
+        rol fco_tmp+1
+        asl fco_tmp
+        rol fco_tmp+1
+        ; fco_tmp = row*64
+        ; row*80 = row*64 + row*16
+        lda fco_tmp
+        clc
+        adc fco_r16
+        sta fco_tmp
+        lda fco_tmp+1
+        adc fco_r16+1
+        sta fco_tmp+1
+
+        ; PNT = screen_start (R12:R13) + row*80
+        lda vdc_regs+13
+        clc
+        adc fco_tmp
+        sta fco_pnt
+        lda vdc_regs+12
+        adc fco_tmp+1
+        sta fco_pnt+1
+
+        ; Write PNT lo to $E0
+        lda fco_pnt
+        sta c128_data
+        lda #$E0
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Write
+
+        ; Write PNT hi to $E1
+        lda fco_pnt+1
+        sta c128_data
+        lda #$E1
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; Update VDC cursor R14:R15 to PNT (start of new line)
+        lda fco_pnt+1
+        sta vdc_regs+14
+        lda fco_pnt
+        sta vdc_regs+15
+
+        ; Update line link table at $0A00 + new_row
+        ; Each entry: bit 7 = not start of logical line, bits 0-6 = line length
+        ; For CR, the new line IS a start of logical line
+        ; Set the PREVIOUS line's length = old column
+        ; Actually, the line link table is complex. Let's just mark it.
+        ; Entry for old_row: bits 0-6 = screen width (80), bit 7 = start
+        ; For simplicity, write $50 (80 = $50, bit 7 clear = start of logical line)
+        lda #80
+        sta c128_data
+        lda fco_old_row
+        clc
+        adc #$00                ; $0A00 + old_row
+        sta c128_addr_lo
+        lda #$0A
+        sta c128_addr_hi
+        jsr C128_Write
+
+        ; New row entry: also mark as start of logical line
+        lda #80
+        sta c128_data
+        lda fco_new_row
+        clc
+        adc #$00
+        sta c128_addr_lo
+        lda #$0A
+        sta c128_addr_hi
+        jsr C128_Write
+
+        clc                     ; Handled
+        rts
+
+fco_rom_pop:
+        pla
+fco_rom:
+        sec                     ; Let ROM handle
+        rts
+
+; PETSCII to screen code conversion
+fco_petscii_to_screen:
+        cmp #$40
+        bcc fco_sc_done        ; $20-$3F: screen code = PETSCII
+        cmp #$60
+        bcc fco_sc_upper       ; $40-$5F: uppercase
+        cmp #$80
+        bcc fco_sc_lower       ; $60-$7F: lowercase
+        cmp #$C0
+        bcc fco_sc_done        ; $A0-$BF: graphics
+        sec
+        sbc #$80                ; $C0-$DF -> $40-$5F
+fco_sc_upper:
+        sec
+        sbc #$40
+        rts
+fco_sc_lower:
+        sec
+        sbc #$20
+        rts
+fco_sc_done:
+        rts
+
+fco_scrcode:   .byte 0
+fco_old_col:   .byte 0
+fco_old_row:   .byte 0
+fco_new_row:   .byte 0
+fco_pnt:       .word 0
+fco_tmp:       .word 0
+fco_r16:       .word 0
+
+; ============================================================
 ; Sequential File I/O Handlers
 ; ============================================================
 ; These routines intercept OPEN, CLOSE, CHKIN, CHKOUT, CLRCHN,
@@ -2767,78 +3067,284 @@ _clrchn_check_out:
         rts
 
 
+
 ; ============================================================
-; C128Hook_OnPRIMM - Handle PRIMM (print immediate string)
+; C128Hook_OnPRIMM - Ultra-fast PRIMM handler
 ;
-; PRIMM is called via JSR $FA17 (or JMP $FA17 from $FF7D).
-; The string follows inline after the JSR. The return address
-; on the stack points to the byte BEFORE the string.
-;
-; We need to:
-; 1. Read return address from guest stack (points to string-1)
-; 2. Add 1 to get string start
-; 3. Read bytes, output via guest CHROUT (write to screen RAM)
-; 4. Update return address to point past null terminator
-; 5. Simulate RTS
+; Uses 3 ZP quad-pointers for parallel writes:
+;   C128_MEM_PTR ($F0): VDC screen RAM
+;   c128_code_ptr ($E0): VDC attribute RAM  
+;   c128_zp_ptr ($14): MEGA65 screen
+; Z register = column offset (shared across all 3 pointers)
 ; ============================================================
+
+; ZP pointer aliases for clarity
+
 C128Hook_OnPRIMM:
-        ; Get return address from guest stack
-        ; SP points below the return address
-        ; But PRIMM pushes A, X, Y first: 3 bytes
-        ; Actually - we catch at $FA17 BEFORE any pushes happen
-        ; So the stack has the JSR return address at SP+1/SP+2
+        ; Read return address from stack
         lda c128_sp
         clc
         adc #1
         sta c128_addr_lo
         lda #$01
         sta c128_addr_hi
-        jsr C128_ReadFast       ; return addr lo
+        jsr C128_ReadFast
         sta _primm_ptr_lo
+        sta _primm_str_lo       ; save string start for pass 2
 
         lda c128_sp
         clc
         adc #2
         sta c128_addr_lo
-        jsr C128_ReadFast       ; return addr hi
+        jsr C128_ReadFast
         sta _primm_ptr_hi
+        sta _primm_str_hi
 
-        ; Return address from JSR is (target-1), so add 1 for string start
+        ; Add 1 (JSR pushes addr-1)
         inc _primm_ptr_lo
-        bne _primm_loop
+        bne +
         inc _primm_ptr_hi
++
+        lda _primm_ptr_lo
+        sta _primm_str_lo
+        lda _primm_ptr_hi
+        sta _primm_str_hi
 
-_primm_loop:
-        ; Read next string byte
+        ; Read current row/col
+        lda #$EB
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_ReadFast
+        sta _primm_row
+        sta _primm_save_row     ; save for pass 2
+
+        lda #$EC
+        sta c128_addr_lo
+        jsr C128_ReadFast
+        sta _primm_col
+        sta _primm_save_col
+
+        ; Cache color attribute
+        lda #$F1
+        sta c128_addr_lo
+        jsr C128_ReadFast
+        sta _primm_attr
+
+        ; ===== PASS 1: MEGA65 screen (what user sees) =====
+_primm_pass1:
         lda _primm_ptr_lo
         sta c128_addr_lo
         lda _primm_ptr_hi
         sta c128_addr_hi
         jsr C128_ReadFast
-        
-        ; Null terminator?
-        beq _primm_end
 
-        ; Output character via screen write to guest screen RAM
-        ; Store char in guest A and call the screen editor output
-        sta c128_a
-        
-        ; Write to C128 screen RAM directly
-        ; Use the guest's cursor position from ZP $EB (row) and $EC (col)
-        ; Actually, simpler: just call guest CHROUT by letting ROM handle it
-        ; For now, skip the character output - just advance past the string
-        ; The important thing is to get past the string without crashing
+        beq _primm_pass1_done
 
-        ; Advance pointer
+        cmp #$0D
+        beq _primm_p1_cr
+
+        cmp #$20
+        bcc _primm_p1_next
+        cmp #$80
+        bcc _primm_p1_print
+        cmp #$A0
+        bcc _primm_p1_next
+
+_primm_p1_print:
+        ldx _primm_col
+        cpx #80
+        bcs _primm_p1_next
+
+        jsr fco_petscii_to_screen
+
+        ; Write to MEGA65 screen: $020400 + row*80 + col
+        ldx _primm_row
+        pha
+        lda _primm_row_lo,x
+        clc
+        adc _primm_col
+        sta C128_MEM_PTR+0
+        lda _primm_row_hi,x
+        adc #0
+        clc
+        adc #$04
+        sta C128_MEM_PTR+1
+        lda #$02
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        pla
+        ldz #0
+        sta [C128_MEM_PTR],z
+
+        inc _primm_col
+        jmp _primm_p1_next
+
+_primm_p1_cr:
+        lda #0
+        sta _primm_col
+        lda _primm_row
+        cmp #24
+        bcs _primm_p1_next
+        inc _primm_row
+
+_primm_p1_next:
         inc _primm_ptr_lo
-        bne _primm_loop
+        bne _primm_pass1
         inc _primm_ptr_hi
-        jmp _primm_loop
+        jmp _primm_pass1
 
-_primm_end:
-        ; _primm_ptr now points to the null terminator
-        ; Set return address to null terminator address
-        ; (RTS will add 1, so execution continues after the null)
+_primm_pass1_done:
+        ; Save final position for ZP updates
+        ; _primm_ptr_lo/hi now points to the null terminator
+
+        ; ===== PASS 2: VDC screen + attribute RAM =====
+        ; Reset to string start and saved row/col
+        lda _primm_str_lo
+        sta _primm_p2_lo
+        lda _primm_str_hi
+        sta _primm_p2_hi
+        lda _primm_save_row
+        sta _primm_p2_row
+        lda _primm_save_col
+        sta _primm_p2_col
+
+_primm_pass2:
+        lda _primm_p2_lo
+        sta c128_addr_lo
+        lda _primm_p2_hi
+        sta c128_addr_hi
+        jsr C128_ReadFast
+
+        beq _primm_pass2_done
+
+        cmp #$0D
+        beq _primm_p2_cr
+
+        cmp #$20
+        bcc _primm_p2_next
+        cmp #$80
+        bcc _primm_p2_print
+        cmp #$A0
+        bcc _primm_p2_next
+
+_primm_p2_print:
+        ldx _primm_p2_col
+        cpx #80
+        bcs _primm_p2_next
+
+        jsr fco_petscii_to_screen
+        sta _primm_scrcode
+
+        ; VDC screen RAM
+        ldx _primm_p2_row
+        lda _primm_row_lo,x
+        clc
+        adc _primm_p2_col
+        clc
+        adc vdc_regs+13
+        sta C128_MEM_PTR+0
+        lda _primm_row_hi,x
+        adc #0
+        adc vdc_regs+12
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        lda _primm_scrcode
+        ldz #0
+        sta [C128_MEM_PTR],z
+
+        ; VDC attribute RAM (+$0800)
+        lda C128_MEM_PTR+1
+        clc
+        adc #$08
+        sta C128_MEM_PTR+1
+        lda _primm_attr
+        sta [C128_MEM_PTR],z
+
+        inc _primm_p2_col
+        jmp _primm_p2_next
+
+_primm_p2_cr:
+        lda #0
+        sta _primm_p2_col
+        lda _primm_p2_row
+        cmp #24
+        bcs _primm_p2_next
+        inc _primm_p2_row
+
+_primm_p2_next:
+        inc _primm_p2_lo
+        bne _primm_pass2
+        inc _primm_p2_hi
+        jmp _primm_pass2
+
+_primm_pass2_done:
+
+_primm_done:
+        ; --- Write KERNAL ZP state ---
+        lda _primm_row
+        sta c128_data
+        lda #$EB
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        jsr C128_Write
+
+        lda _primm_col
+        sta c128_data
+        lda #$EC
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; $E0/$E1 = PNT
+        ldx _primm_row
+        lda _primm_row_lo,x
+        sta c128_data
+        lda #$E0
+        sta c128_addr_lo
+        jsr C128_Write
+        lda _primm_row_hi,x
+        sta c128_data
+        lda #$E1
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; $E2/$E3 = attribute pointer
+        ldx _primm_row
+        lda _primm_row_lo,x
+        sta c128_data
+        lda #$E2
+        sta c128_addr_lo
+        jsr C128_Write
+        lda _primm_row_hi,x
+        and #$07
+        ora #$08
+        sta c128_data
+        lda #$E3
+        sta c128_addr_lo
+        jsr C128_Write
+
+        ; VDC cursor regs
+        ldx _primm_row
+        lda vdc_regs+13
+        clc
+        adc _primm_row_lo,x
+        clc
+        adc _primm_col
+        sta vdc_regs+15
+        lda vdc_regs+12
+        adc _primm_row_hi,x
+        adc #0
+        sta vdc_regs+14
+
+        ; Update return address on stack to point to null
         lda c128_sp
         clc
         adc #1
@@ -2847,7 +3353,7 @@ _primm_end:
         sta c128_addr_hi
         lda _primm_ptr_lo
         sta c128_data
-        jsr C128_Write          ; update return addr lo
+        jsr C128_Write
 
         lda c128_sp
         clc
@@ -2855,22 +3361,35 @@ _primm_end:
         sta c128_addr_lo
         lda _primm_ptr_hi
         sta c128_data
-        jsr C128_Write          ; update return addr hi
+        jsr C128_Write
 
-        ; Now simulate RTS - pop return address and jump there+1
         jsr C128Hook_RTS_Guest
         rts
 
+_primm_row_lo:
+        .byte $00,$50,$A0,$F0,$40,$90,$E0,$30
+        .byte $80,$D0,$20,$70,$C0,$10,$60,$B0
+        .byte $00,$50,$A0,$F0,$40,$90,$E0,$30,$80
+_primm_row_hi:
+        .byte $00,$00,$00,$00,$01,$01,$01,$02
+        .byte $02,$02,$03,$03,$03,$04,$04,$04
+        .byte $05,$05,$05,$05,$06,$06,$06,$07,$07
+
 _primm_ptr_lo: .byte 0
 _primm_ptr_hi: .byte 0
-
-
-; ============================================================
-; C128Hook_OnCHRIN - Character input
-;
-; If input is from a file we manage, read from host.
-; Otherwise let ROM handle (keyboard input).
-; ============================================================
+_primm_row:    .byte 0
+_primm_col:    .byte 0
+_primm_attr:   .byte 0
+_primm_scrcode: .byte 0
+_primm_offset: .word 0
+_primm_str_lo: .byte 0
+_primm_str_hi: .byte 0
+_primm_save_row: .byte 0
+_primm_save_col: .byte 0
+_primm_p2_lo:  .byte 0
+_primm_p2_hi:  .byte 0
+_primm_p2_row: .byte 0
+_primm_p2_col: .byte 0
 C128Hook_OnCHRIN:
 
         ; Reset stale graphics flags before file operations
