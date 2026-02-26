@@ -326,10 +326,13 @@ C128_VideoInit:
         lda #0
         sta $D059
 
-        ; 80-column colors: black border and background
-        lda #0
-        sta $D020               ; border = black
-        sta $D021               ; background = black
+        ; 80-column colors from VDC register 26 (border matches background)
+        lda vdc_regs+26
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta $D020
+        sta $D021
 
         lda #1
         sta vdc_mode_active     ; Flag: VDC rendering active
@@ -485,10 +488,11 @@ display_show_40col:
         sta $D062               ; SCRNPTR[23:16] = $04
         lda #$00
         sta $D063               ; -> $040400
-        lda #13
-        sta $D020               ; border = light green
-        lda #11
-        sta $D021               ; background = dark grey
+        ; Restore 40-col border/background from VIC-II shadow registers
+        lda vic_regs+$20
+        sta $D020
+        lda vic_regs+$21
+        sta $D021
         rts
 
 ; ============================================================
@@ -540,10 +544,7 @@ display_show_80col:
         sta $D062               ; SCRNPTR[23:16] = $02
         lda #$00
         sta $D063               ; -> $020400
-        lda #0
-        sta $D020               ; border = black
-        sta $D021               ; background = black
-        ; Force immediate VDC render
+        ; Force immediate VDC render (sets border/bg from VDC R26)
         lda #1
         sta vdc_screen_dirty
         sta vdc_attr_dirty
@@ -1319,9 +1320,7 @@ _rv_vdc_open:
 
 _rv_vdc_data:
         ; R31: Read byte from VDC RAM at address R18:R19, auto-increment
-        ; In 40-col mode, skip actual RAM read (return shadow, just advance addr)
-        ldx vdc_mode_active
-        beq _rv_vdc_data_skip
+        ; Always read from actual VDC RAM (mode switch may be in progress)
 
         ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
         lda vdc_regs+19         ; address lo
@@ -1343,14 +1342,6 @@ _rv_vdc_data:
         bne +
         inc vdc_regs+18
 +       rts
-
-_rv_vdc_data_skip:
-        ; 40-col: return last known R31 value, still auto-increment
-        inc vdc_regs+19
-        bne +
-        inc vdc_regs+18
-+       lda vdc_regs+31
-        rts
 
 
 ; ============================================================
@@ -1454,13 +1445,11 @@ _wr_color_ram:
 
 _wr_color_to_buffer:
         ; Displaying 80-col: write to 40-col save buffer at $020C00
-        ; Offset = (addr_hi - $D8) * 256 + addr_lo
-        ; Buffer addr = $020C00 + offset
         lda c128_addr_lo
         sta C128_MEM_PTR+0
         lda c128_addr_hi
         sec
-        sbc #$D8                ; $D8->$00, $D9->$01, $DA->$02, $DB->$03
+        sbc #$D8
         clc
         adc #>COLOR_40_SAVE     ; + $0C
         sta C128_MEM_PTR+1
@@ -2000,6 +1989,8 @@ write_vdc_register:
         beq _wvdc_mark_attr_dirty
         cpx #21
         beq _wvdc_mark_attr_dirty
+        cpx #26
+        beq _wvdc_update_colors
 _wvdc_done:
         rts
 _wvdc_mark_scr_dirty:
@@ -2009,6 +2000,19 @@ _wvdc_mark_scr_dirty:
 _wvdc_mark_attr_dirty:
         lda #1
         sta vdc_attr_dirty
+        rts
+_wvdc_update_colors:
+        ; R26 written: high nibble = FG, low nibble = BG
+        ; Apply BG color to MEGA65 $D021 when in 80-col mode
+        ; so COLOR 6 command takes visible effect on VDC display
+        lda vdc_mode_active
+        beq _wvdc_done          ; 40-col mode: VIC handles its own colors
+        lda vdc_regs+26
+        and #$0F                ; low nibble = VDC background color (RGBI)
+        tax
+        lda vdc_to_vic_color,x  ; translate RGBI -> VIC-II color index
+        sta $D020               ; border matches background on VDC
+        sta $D021               ; apply to MEGA65 background
         rts
 
 _wvdc_index:
@@ -2022,10 +2026,6 @@ _wvdc_data:
         ; R31: Write byte to VDC RAM at address R18:R19, auto-increment
         lda c128_saved_data
         sta vdc_regs+31         ; Always update shadow
-
-        ; In 40-col mode, skip actual RAM write (not rendered)
-        ldx vdc_mode_active
-        beq _wvdc_data_skip
 
 _wvdc_data_go:
         ; VDC RAM is at $32000-$35FFF: real_addr = $32000 + VDC_addr
@@ -2043,6 +2043,17 @@ _wvdc_data_go:
         ldz #0
         lda c128_saved_data
         sta [C128_MEM_PTR],z
+
+        ; Skip MEGA65 screen/color mirroring if in 40-col mode
+        ; (VDC RAM is always written above, but MEGA65 display only
+        ; needs updating when actively showing 80-col)
+        ; Mark dirty so VDC_RenderFrame will re-copy when switching to 80-col
+        ldx vdc_mode_active
+        bne _wvdc_do_mirror
+        lda #1
+        sta vdc_screen_dirty
+        jmp _wvdc_data_skip
+_wvdc_do_mirror:
 
         ; --- Inline attribute translation to MEGA65 color RAM ---
         ; Check if this write is to attribute area (R18 >= R20)
@@ -2149,12 +2160,6 @@ _wvdc_word_count:
         lda c128_saved_data
         sta vdc_regs+30
 
-        ; In 40-col mode, skip actual fill (not rendered) - just advance addr
-        ldx vdc_mode_active
-        beq _wvdc_wc_skip
-
-        ; Dirty flags handled individually by copy/fill paths below
-
         ; Count = value + 1 (16-bit because value=$FF -> count=256)
         lda c128_saved_data
         clc
@@ -2215,6 +2220,10 @@ _vdc_fill_dst:
         lda vdc_regs+18
         adc _vdc_fill_count+1
         sta vdc_regs+18
+
+        ; Skip MEGA65 mirroring if in 40-col mode
+        lda vdc_mode_active
+        beq _wvdc_wc_done
 
         ; --- Also fill MEGA65 screen/color RAM ---
         ; Check if fill destination is screen or attr area
@@ -2278,6 +2287,7 @@ _vdc_fill_is_attr:
         ; Attribute area fill: mark dirty for batch processing
         lda #1
         sta vdc_attr_dirty
+_wvdc_wc_done:
         rts
 
 _vdc_fill_orig_hi: .byte 0
@@ -2334,6 +2344,10 @@ _vdc_copy_dst:
         .word $0000             ; modulo
 
         ; --- Also copy within MEGA65 screen RAM so display updates ---
+        ; Skip MEGA65 mirroring if in 40-col mode
+        lda vdc_mode_active
+        beq _vdc_copy_advance
+
         ; Determine if this is a screen copy or attribute copy
         ; Screen area: R12:R13 to R20:R21-1
         ; Attribute area: R20:R21 onwards
@@ -2479,10 +2493,14 @@ C128Vid_DisableHostBitmap:
 ; Attrs:  VDC $0800-$09CF = $20800-$209CF (2000 bytes)
 ; ============================================================
 VDC_RenderFrame:
-        ; Force 80-col border/background colors
-        lda #$00
-        sta $D020               ; black border
-        sta $D021               ; black background
+        ; Force 80-col border/background colors from VDC register 26
+        ; VDC has no separate border color - border matches background
+        lda vdc_regs+26
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta $D020
+        sta $D021
 
         ; --- Step 1: DMA copy VDC screen RAM to MEGA65 screen ---
         ; Only if screen RAM has changed since last render
@@ -2683,14 +2701,17 @@ _vdc_cur_no_erase:
         sta _vdc_cur_offset+1
 
         ; Bounds check: offset must be 0-1999 ($0000-$07CF)
-        lda _vdc_cur_offset+1
-        cmp #>2000              ; compare high byte with $07
-        bcc _vdc_cur_in_bounds  ; high < $07: definitely in bounds
+        ; High byte in A after the SBC above
+        ; high < $07: definitely in bounds
+        ; high > $07: definitely out of bounds
+        ; high == $07: check low byte < $D0
+        cmp #$07
+        bcc _vdc_cur_in_bounds  ; high < $07: in bounds
         bne _vdc_cur_done       ; high > $07: out of bounds
-        ; High byte == $07, check low byte
+        ; high == $07: check low byte
         lda _vdc_cur_offset
-        cmp #<2000              ; compare low byte with $D0
-        bcs _vdc_cur_done       ; low >= $D0: out of bounds (offset >= 2000)
+        cmp #$D0
+        bcs _vdc_cur_done       ; low >= $D0: offset >= 2000, out of bounds
 
 _vdc_cur_in_bounds:
         ; --- Step 3: If cursor phase ON, draw at new position ---
