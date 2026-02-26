@@ -353,6 +353,15 @@ _not_ff:
         lda c128_pc_lo
         cmp #$65
         bne _done_fast
+        ; In 40-col mode AND displaying 40-col, let ROM handle IRQ
+        ; (screen editor does cursor blink for 40-col)
+        ; But if C128 is in 80-col mode ($D7=$80), keep fast hook
+        ; even if we're peeking at 40-col via TAB
+        lda vdc_mode_active
+        ora display_showing_80
+        bne _do_irq_hook
+        jmp _done_fast
+_do_irq_hook:
         ; Match - save regs and handle
         pha
         txa
