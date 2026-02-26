@@ -289,6 +289,18 @@ _do_getin:
         jsr C128Hook_OnGETIN
         jmp _done
 
+_do_gone:
+        jsr C128Hook_GONE
+        jmp _done
+
+_do_crunch:
+        jsr C128Hook_Crunch
+        jmp _done
+
+_do_chrget:
+        jsr C128Hook_CHRGET
+        jmp _done
+
 _do_primm:
         ; Check C128's actual mode flag, not our cached state
         lda #$D7
@@ -335,6 +347,31 @@ _do_load_monitor:
         jmp _done
 
 _not_ff:
+        ; ----- Check for IRQ handler at $FA65 (fires 60x/sec) -----
+        cmp #$FA
+        bne _check_f8
+        lda c128_pc_lo
+        cmp #$65
+        bne _done_fast
+        ; In 40-col mode AND displaying 40-col, let ROM handle IRQ
+        ; (screen editor does cursor blink for 40-col)
+        ; But if C128 is in 80-col mode ($D7=$80), keep fast hook
+        ; even if we're peeking at 40-col via TAB
+        lda vdc_mode_active
+        ora display_showing_80
+        bne _do_irq_hook
+        jmp _done_fast
+_do_irq_hook:
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
+        jsr C128Hook_IRQ
+        jmp _done
+
+_check_f8:
         ; ----- Check for $F8xx (auto-boot) -----
         cmp #$F8
         bne _check_f9
@@ -381,6 +418,22 @@ _check_f9:
         jmp _done
 
 _check_a8:
+        ; ----- Check for BASIC dispatch at $4B3F -----
+        cmp #$4B
+        bne _check_a8_load
+        lda c128_pc_lo
+        cmp #$3F
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
+        jsr C128Hook_GONE
+        jmp _done
+
+_check_a8_load:
         ; ----- Check for LOAD hook at $A800 -----
         cmp #$A8
         bne _done_fast
@@ -2393,16 +2446,16 @@ fco_printable:
         sta vdc_color_ptr+3
         bra _fco_color_write
 _fco_color_to_buf:
-        ; 80-col save buffer at $021000
+        ; 80-col save buffer in attic RAM at $8012000
         lda fco_scr_offset
         sta vdc_color_ptr+0
         lda fco_scr_offset+1
         clc
-        adc #>COLOR_80_SAVE
+        adc #>COLOR_80_ADDR
         sta vdc_color_ptr+1
-        lda #$02
+        lda #COLOR_80_BANK
         sta vdc_color_ptr+2
-        lda #$00
+        lda #COLOR_80_MB
         sta vdc_color_ptr+3
 _fco_color_write:
         ldz #0
@@ -3211,14 +3264,14 @@ _primm_print:
         sta vdc_color_ptr+3
         bra _primm_color_wr
 _primm_color_buf:
-        ; 80-col save buffer at $021000 + offset
+        ; 80-col save buffer in attic RAM at $8012000 + offset
         lda vdc_color_ptr+1
         clc
-        adc #>COLOR_80_SAVE
+        adc #>COLOR_80_ADDR
         sta vdc_color_ptr+1
-        lda #$02
+        lda #COLOR_80_BANK
         sta vdc_color_ptr+2
-        lda #$00
+        lda #COLOR_80_MB
         sta vdc_color_ptr+3
 _primm_color_wr:
         lda _primm_vic_color
@@ -3374,6 +3427,522 @@ _primm_attr:      .byte 0
 _primm_vic_color: .byte 0
 _primm_scrcode: .byte 0
 _primm_offset: .word 0
+; ============================================================
+; C128Hook_GONE - Fast BASIC token dispatch
+;
+; Hooked at $4B3F (execute statement dispatch).
+; At entry, CHRGET has already been called (at $4AF0).
+; c128_a = the token byte.
+; Text pointer ($3D/$3E) already advanced past the token.
+;
+; The ROM at $4B3F would:
+;   1. Check special tokens ($FE, $CB, $CA, etc.)
+;   2. SBC #$80, ASL, index into $46FC table
+;   3. Push handler addr-1, JMP $0380 (CHRGET)
+;   4. CHRGET advances past token to first argument, then RTS → handler
+;
+; We replicate: look up handler, do the second CHRGET natively,
+; set guest PC directly to handler address.
+;
+; Only handles standard tokens $80-$A2 and $D5-$FA.
+; Tokens $A3-$D4 are functions (syntax error in statement context).
+; Tokens $CB (USING), $CA (GO), $FB-$FD, $FE prefix, $CE prefix,
+; and non-tokens all bail to ROM.
+; ============================================================
+C128Hook_GONE:
+        lda c128_a
+
+        ; Zero? End of statement — bail to ROM
+        beq _gone_bail
+
+        ; --- Check for tokens we handle ---
+        cmp #$80
+        bcc _gone_bail          ; < $80: not a token (implicit LET etc.)
+
+        cmp #$FE
+        beq _gone_bail          ; FE prefix
+        cmp #$CE
+        beq _gone_bail          ; CE prefix (only reachable via $4BF7)
+        cmp #$FB
+        bcs _gone_bail          ; >= $FB: syntax error range
+        cmp #$CB
+        beq _gone_bail          ; USING token: special handling
+        cmp #$CA
+        beq _gone_bail          ; GO token: special handling
+
+        ; Check function range $A3-$D4 (syntax error as statement)
+        cmp #$A3
+        bcc _gone_std_token     ; < $A3: standard token $80-$A2
+        cmp #$D5
+        bcc _gone_bail          ; $A3-$D4: function tokens, let ROM error
+
+        ; $D5-$FA: remap like ROM does (SBC #$32)
+        sec
+        sbc #$32
+        bra _gone_do_dispatch
+
+_gone_std_token:
+        ; Standard token $80-$A2
+_gone_do_dispatch:
+        ; A = token (possibly remapped)
+        sec
+        sbc #$80
+        bcc _gone_bail          ; shouldn't happen, but safety
+
+        ; index = (token - $80) * 2
+        asl
+        sta _gone_tmp
+
+        ; Read handler address from action vector table at ROM $46FC
+        ; Table has addr-1 entries
+        lda #$FC
+        clc
+        adc _gone_tmp
+        sta C128_MEM_PTR+0
+        lda #$46
+        adc #0
+        sta C128_MEM_PTR+1
+        lda #$01                ; ROM bank 1
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Read handler address-1
+        ldz #0
+        lda [C128_MEM_PTR],z    ; low byte
+        sta _gone_handler
+        ldz #1
+        lda [C128_MEM_PTR],z    ; high byte
+        sta _gone_handler+1
+
+        ; Add 1 to get actual handler address
+        inc _gone_handler
+        bne +
+        inc _gone_handler+1
++
+        ; --- Do the second CHRGET natively ---
+        ; The ROM pushes handler addr-1 then JMPs to $0380 (CHRGET).
+        ; CHRGET advances the text pointer to the handler's first
+        ; argument, sets A and flags, then RTS → handler.
+        ; We do the CHRGET here instead.
+
+        ; Read text pointer $3D/$3E
+        lda #$3D
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
+        sta _gone_txtptr
+        ldz #1
+        lda [c128_zp_ptr],z
+        sta _gone_txtptr+1
+
+        ; Increment text pointer and read byte
+_gone_chrget:
+        inc _gone_txtptr
+        bne +
+        inc _gone_txtptr+1
++
+        lda _gone_txtptr
+        sta C128_MEM_PTR+0
+        lda _gone_txtptr+1
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+
+        ; Skip spaces
+        cmp #$20
+        beq _gone_chrget
+
+        ; CHRGET sets flags based on the byte:
+        ; CMP #$3A → carry set if >= $3A, zero if == $3A
+        ; Then SBC #$30, SBC #$D0 sequence sets carry if digit
+        ; We need to replicate the flag state
+        sta _gone_token         ; save the byte we read
+
+        ; Write back text pointer
+        lda #$3D
+        sta c128_zp_ptr
+        lda _gone_txtptr
+        ldz #0
+        sta [c128_zp_ptr],z
+        lda _gone_txtptr+1
+        ldz #1
+        sta [c128_zp_ptr],z
+
+        ; Set A register to the byte we read
+        lda _gone_token
+        sta c128_a
+
+        ; Set Y = 0 (CHRGET always leaves Y=0)
+        lda #0
+        sta c128_y
+
+        ; Set processor flags like CHRGET would.
+        ; The real CHRGET does:
+        ;   CMP #$3A
+        ;   BCS done       ; >= $3A: return with C=1 (not a digit)
+        ;   SEC
+        ;   SBC #$30
+        ;   SEC
+        ;   SBC #$D0       ; final flags from here
+        ;   done: RTS
+        ;
+        ; For A >= $3A: flags come from CMP #$3A (C=1, Z=1 if colon)
+        ; For A < $3A:  flags come from SBC #$D0 after SBC #$30
+        ;   Digits $30-$39: SBC $30 = $00-$09, SBC $D0 = $30-$39 (C=0)
+        ;   Value $00:      SBC $30 = $D0(C=0), SEC, SBC $D0 = $00 (C=1? no)
+        ;     Actually: SEC; 0-$30 = $D0 C=0; SEC; $D0-$D0 = $00 C=1, Z=1
+        ;   Non-digit < $3A: similar
+        ;
+        ; We replicate the exact ROM sequence on the byte:
+        lda _gone_token
+        cmp #$3A
+        bcs _gone_flags_done    ; A >= $3A: flags from CMP are correct
+        ; A < $3A: do the digit detection sequence
+        sec
+        sbc #$30
+        sec
+        sbc #$D0
+_gone_flags_done:
+        ; Now native 6502 flags match what CHRGET would produce
+        php
+        pla                     ; get flags
+        and #$C3                ; keep N, Z, C (bits 7, 1, 0)
+        sta _gone_tmp
+        lda c128_p
+        and #$3C                ; preserve I, D, V, B
+        ora _gone_tmp           ; merge in N, Z, C
+        sta c128_p
+
+        ; Restore A to the token byte (CHRGET returns the byte in A)
+        lda _gone_token
+        sta c128_a
+
+        ; --- Set guest PC to handler ---
+        ; Pop the return address from JSR $4B3F off the guest stack
+        ; since we're not returning through $4B3F.
+        ; The stack has: return to $4AF5 (from JSR $4B3F at $4AF3)
+        ; We need to remove this and push back the $4AF5 return
+        ; Actually, the ROM's pattern is:
+        ;   $4AF3: JSR $4B3F
+        ;   Inside $4B3F: push handler_addr-1, JMP CHRGET
+        ;   CHRGET RTS → handler
+        ;   Handler eventually JMPs to NEWSTT
+        ;
+        ; The guest stack currently has $4AF5 (return from JSR $4B3F).
+        ; If we just set PC to handler, the handler will eventually
+        ; JMP to NEWSTT (or RTS, which would pop $4AF5 and go to $4AF6).
+        ; $4AF6 is JSR $4BB5 (NEWSTT check), so RTS back to $4AF5+1=$4AF6
+        ; is fine — that IS the normal flow after a statement executes.
+        ;
+        ; So: leave the stack as-is. Set PC to handler.
+        ; Handler does its work, then typically JMPs to $4AF6 or similar.
+        ; If handler does RTS, it returns to $4AF6 which is NEWSTT. Perfect.
+
+        lda _gone_handler
+        sta c128_pc_lo
+        lda _gone_handler+1
+        sta c128_pc_hi
+
+        lda #1
+        sta c128_hook_pc_changed
+
+        rts
+
+_gone_bail:
+        ; Can't handle this token natively.
+        ; Original byte at $4B3F was BEQ $4B3E ($F0 $FD).
+        ; We must emulate this and continue from $4B41.
+        ; If A==0: branch to $4B3E (end of statement = RTS)
+        ; If A!=0: fall through to $4B41 (continue dispatch)
+        lda c128_a
+        beq +
+        ; A != 0: set PC to $4B41 (past the 2-byte BEQ instruction)
+        lda #$41
+        sta c128_pc_lo
+        lda #$4B
+        sta c128_pc_hi
+        lda #1
+        sta c128_hook_pc_changed
+        rts
++       ; A == 0: branch to $4B3E
+        lda #$3E
+        sta c128_pc_lo
+        lda #$4B
+        sta c128_pc_hi
+        lda #1
+        sta c128_hook_pc_changed
+        rts
+
+_gone_txtptr:  .word 0
+_gone_handler: .word 0
+_gone_token:   .byte 0
+_gone_tmp:     .byte 0
+
+; ============================================================
+; C128Hook_CHRGET - Fast CHRGET replacement
+;
+; Hooked via JMP $FF42 patched into CHRGET at $0380.
+; Called via JSR $0380 from BASIC interpreter (very frequently).
+;
+; CHRGET: increment text pointer, read byte from bank 0 RAM,
+; skip spaces, set flags for token/digit/colon detection.
+;
+; On exit: A = byte read, Y = 0
+;   Flags: Z=1 if byte is $00 or $3A (colon)
+;          C=1 if byte >= $3A (not a digit)
+;          C=0 if byte is $30-$39 (digit)
+; ============================================================
+C128Hook_CHRGET:
+        ; DISABLED - redirect to original CHRGET code at $0383
+        ; $0380 = JMP $FF42 (our hook)
+        ; $0383 = original $02 (was BNE offset)
+        ; We need to do what CHRGET does: INC $3D, BNE +2, INC $3E
+        ; then fall into CHRGOT at $0386
+        ; Simplest: do the INC ourselves and set PC to $0386 (CHRGOT)
+        lda #$3D
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z     ; read $3D
+        clc
+        adc #1
+        sta [c128_zp_ptr],z     ; write $3D
+        bne _chrget_disabled_no_carry
+        ldz #1
+        lda [c128_zp_ptr],z     ; read $3E
+        clc
+        adc #1
+        sta [c128_zp_ptr],z     ; write $3E
+_chrget_disabled_no_carry:
+        ; Set PC to CHRGOT ($0386) and let ROM handle the rest
+        lda #$86
+        sta c128_pc_lo
+        lda #$03
+        sta c128_pc_hi
+        lda #1
+        sta c128_hook_pc_changed
+        rts
+        lda #$3D
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z     ; $3D
+        sta _chrget_ptr
+        ldz #1
+        lda [c128_zp_ptr],z     ; $3E
+        sta _chrget_ptr+1
+
+_chrget_loop:
+        ; Increment text pointer
+        inc _chrget_ptr
+        bne +
+        inc _chrget_ptr+1
++
+        ; Read byte from C128 bank 0 RAM
+        lda _chrget_ptr
+        sta C128_MEM_PTR+0
+        lda _chrget_ptr+1
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z
+
+        ; Skip spaces
+        cmp #$20
+        beq _chrget_loop
+
+        ; Save the byte
+        sta _chrget_byte
+
+        ; --- Write back text pointer ---
+        lda #$3D
+        sta c128_zp_ptr
+        lda _chrget_ptr
+        ldz #0
+        sta [c128_zp_ptr],z
+        lda _chrget_ptr+1
+        ldz #1
+        sta [c128_zp_ptr],z
+
+        ; --- Set guest registers ---
+        lda _chrget_byte
+        sta c128_a
+
+        ; Y = 0
+        lda #0
+        sta c128_y
+
+        ; --- Set flags like CHRGET does ---
+        ; CHRGET ends with:
+        ;   CMP #$3A    → C=1 if A >= $3A, Z=1 if A == $3A
+        ;   BCS done    → if >= $3A, return with those flags
+        ;   CMP #$20    → (already handled - spaces skipped)
+        ;   SEC
+        ;   SBC #$30
+        ;   SEC
+        ;   SBC #$D0    → C=0 if digit ($30-$39), C=1 otherwise
+        ;   RTS
+        ;
+        ; The important outcomes:
+        ;   $00: Z=1, C=0
+        ;   $01-$2F: Z=0, C=0 (after SBC sequence)
+        ;   $30-$39 (digits): Z=0, C=0
+        ;   $3A (colon): Z=1, C=1
+        ;   $3B-$FF: Z=0, C=1
+
+        lda _chrget_byte
+        cmp #$3A
+        bcs _chrget_ge3a
+
+        ; < $3A: do the SBC sequence to detect digits
+        ; SEC; SBC #$30; SEC; SBC #$D0
+        ; For digits $30-$39: result is $00-$09, carry clear
+        ; For $00: result wraps, carry... let's just do it
+        lda _chrget_byte
+        sec
+        sbc #$30
+        sec
+        sbc #$D0
+        ; Now: C=0 for digits ($30-$39), C=1 for others
+        ; Z reflects the result (Z=1 only if byte was $00 after wrapping)
+        ; Actually for $00: $00-$30=$D0, $D0-$D0=$00, Z=1, C=1
+        ; Hmm, let me just use the native 6502 flags
+        php
+        pla
+        and #$C3                ; N, Z, C flags
+        sta _chrget_tmp
+        lda c128_p
+        and #$3C                ; preserve I, D, V, B
+        ora _chrget_tmp
+        sta c128_p
+        bra _chrget_do_rts
+
+_chrget_ge3a:
+        ; >= $3A: set C=1, Z=1 if $3A
+        php
+        pla
+        and #$C3
+        sta _chrget_tmp
+        lda c128_p
+        and #$3C
+        ora _chrget_tmp
+        sta c128_p
+
+_chrget_do_rts:
+        ; --- Do RTS: pop return address from guest stack ---
+        jsr C128Hook_RTS_Guest
+
+        rts
+
+_chrget_ptr:  .word 0
+_chrget_byte: .byte 0
+_chrget_tmp:  .byte 0
+
+; ============================================================
+; C128Hook_IRQ - Fast IRQ handler
+;
+; Hooked at $FA65 (KERNAL IRQ entry point).
+; The real IRQ does:
+;   1. JSR $C024 - Screen editor (keyboard scan, cursor) 
+;   2. JSR $F5F8 - Jiffy clock update
+;   3. JSR $EED0 - Tape motor interlock
+;   4. LDA $DC0D - Acknowledge CIA interrupt
+;   5. JSR $4006 - BASIC IRQ (sprites, music, collision)
+;   6. JMP $FF33 - RTI
+;
+; We skip everything except jiffy clock and CIA acknowledge.
+; Keyboard/cursor already handled natively by MEGA65.
+; ============================================================
+C128Hook_IRQ:
+        ; --- Update jiffy clock at $A0-$A2 ---
+        ; $A2 = low byte, $A1 = mid, $A0 = high
+        ; Increment the 3-byte counter
+        lda #$A2
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z     ; read $A2 (low)
+        clc
+        adc #1
+        sta [c128_zp_ptr],z     ; write $A2
+        bcc _irq_no_carry1
+
+        ; Carry to $A1
+        lda #$A1
+        sta c128_zp_ptr
+        lda [c128_zp_ptr],z     ; read $A1 (mid)
+        clc
+        adc #1
+        sta [c128_zp_ptr],z     ; write $A1
+        bcc _irq_no_carry1
+
+        ; Carry to $A0
+        lda #$A0
+        sta c128_zp_ptr
+        lda [c128_zp_ptr],z     ; read $A0 (high)
+        clc
+        adc #1
+        sta [c128_zp_ptr],z     ; write $A0
+
+_irq_no_carry1:
+        ; Check for 24-hour rollover: 5184000 = $4F1A00
+        ; $A0=$4F, $A1=$1A, $A2=$01 means we've hit 5184001
+        ; (ROM checks for $4F1A01 and resets to 0)
+        lda #$A0
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z     ; $A0
+        cmp #$4F
+        bne _irq_clock_done
+        ldz #1
+        lda [c128_zp_ptr],z     ; $A1
+        cmp #$1A
+        bne _irq_clock_done
+        ldz #2
+        lda [c128_zp_ptr],z     ; $A2
+        cmp #$01
+        bcc _irq_clock_done
+
+        ; Reset clock to 0
+        lda #0
+        ldz #0
+        sta [c128_zp_ptr],z     ; $A0 = 0
+        ldz #1
+        sta [c128_zp_ptr],z     ; $A1 = 0
+        ldz #2
+        sta [c128_zp_ptr],z     ; $A2 = 0
+
+_irq_clock_done:
+        ; --- Acknowledge CIA1 interrupt ---
+        ; The ROM reads $DC0D to clear the interrupt flag
+        lda cia1_icr_data
+        lda #0
+        sta cia1_icr_data       ; Clear pending interrupt flags
+
+        ; --- Do RTI natively ---
+        ; The IRQ pushed P, PC onto guest stack (and ROM pushed MMU config).
+        ; $FF33 would: PLA (MMU config) → STA $FF00, then pull Y, X, A, then RTI
+        ; The IRQ entry at $FF17 pushes: MMU config, A, X, Y (then JMPs to handler)
+        ; So the stack is (top→bottom): [handler stuff], Y, X, A, MMU_config, P, PClo, PChi
+        ;
+        ; We need to unwind: pull Y, X, A, MMU_config from stack, then RTI (pull P, PC)
+        ;
+        ; Actually, let's just set PC to $FF33 and let the emulator handle it.
+        ; It's only ~10 emulated instructions and gets the stack cleanup right.
+        lda #$33
+        sta c128_pc_lo
+        lda #$FF
+        sta c128_pc_hi
+
+        lda #1
+        sta c128_hook_pc_changed
+
+        rts
 
 ; ============================================================
 ; scroll_screen_up - Scroll all screen buffers up one line
@@ -3861,3 +4430,516 @@ _sync_b5_dma_dst:
         .byte $00                       ; Dest bank 0
         .byte $00                       ; Sub-command
         .word $0000                     ; Modulo
+; ============================================================
+; C128Hook_Crunch - Native BASIC tokenizer
+; Called when Crunch Tokens vector ($0304) is hit
+; ROM entry: $430D
+;
+; ROM algorithm:
+;   - Save text pointer ($3D/$3E)
+;   - Read chars from input buffer via CHRGET
+;   - For each non-digit, non-special char, try keyword match
+;   - '?' → $99 (PRINT), ':' → pass through, '"' → copy until '"'
+;   - After REM/DATA, copy verbatim until end/colon
+;   - Keywords stored with last char having bit 7 set
+;   - Output written back to same buffer
+;
+; We read from C128 RAM at ($3D/$3E), tokenize natively,
+; write back, then RTS to caller.
+; ============================================================
+
+; Keyword table offsets in BASIC ROM (bank 1, $4000-$7FFF)
+KEYWORD_TABLE_MAIN = $4417      ; tokens $80+
+KEYWORD_TABLE_FE   = $4609      ; FE-prefix tokens
+KEYWORD_TABLE_CE   = $46C9      ; CE-prefix tokens
+
+; Buffer for input/output (use area in high RAM)
+CRUNCH_BUF_SIZE = 256
+
+C128Hook_Crunch:
+        ; The ROM entry at $430D does:
+        ;   LDA $3D / PHA / LDA $3E / PHA  (save text pointer)
+        ;   JSR $0386 (CHRGOT)
+        ;   ... tokenize loop ...
+        ;   PLA / STA $3E / PLA / STA $3D  (restore text pointer)
+        ;   RTS
+        ;
+        ; We need to replicate this: save $3D/$3E, tokenize, restore, RTS
+        
+        ; Read text pointer $3D/$3E from C128 ZP (bank 0)
+        lda #$3D
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z     ; $3D = text pointer lo
+        sta _crunch_src_lo
+        sta _crunch_save_lo     ; save original
+        inz
+        lda [c128_zp_ptr],z     ; $3E = text pointer hi  
+        sta _crunch_src_hi
+        sta _crunch_save_hi     ; save original
+        
+        ; Read input line from C128 bank 0 RAM into our buffer
+        ; Set up 32-bit pointer to C128 bank 0
+        lda _crunch_src_lo
+        sta C128_MEM_PTR+0
+        lda _crunch_src_hi
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        
+        ; Copy input to crunch_input_buf
+        ldy #0
+-       ldz #0
+        lda [C128_MEM_PTR],z
+        sta crunch_input_buf,y
+        beq +                   ; null terminator = done
+        ; Advance C128 pointer
+        inc C128_MEM_PTR+0
+        bne _cr_no_carry1
+        inc C128_MEM_PTR+1
+_cr_no_carry1:
+        iny
+        bne -                   ; max 255 chars
++       sta crunch_input_buf,y  ; store the null
+        
+        ; Now tokenize: read from crunch_input_buf, write to crunch_output_buf
+        ldx #0                  ; X = read index
+        ldy #0                  ; Y = write index
+        stz _crunch_in_data     ; not in DATA/REM mode
+        
+_crunch_loop:
+        lda crunch_input_buf,x
+        beq _crunch_done        ; end of line
+        
+        ; Check if we're in DATA/REM pass-through mode
+        lda _crunch_in_data
+        bne _crunch_passthrough
+        
+        lda crunch_input_buf,x
+        
+        ; Check for space - pass through
+        cmp #$20
+        beq _crunch_store_advance
+        
+        ; Check for quote - copy until matching quote
+        cmp #$22                ; '"'
+        beq _crunch_quoted
+        
+        ; Check for '?' → PRINT token
+        cmp #$3F                ; '?'
+        bne +
+        lda #$99                ; PRINT token
+        sta crunch_output_buf,y
+        iny
+        inx
+        jmp _crunch_loop
++
+        ; Check for colon - pass through
+        cmp #$3A                ; ':'
+        beq _crunch_store_advance
+        
+        ; Check for digit (0-9) - pass through
+        cmp #$30
+        bcc _crunch_try_keyword
+        cmp #$3A
+        bcc _crunch_store_advance
+        
+_crunch_try_keyword:
+        ; Try to match a keyword starting at current position
+        ; First try main keyword table
+        jsr _crunch_match_main
+        bcs _crunch_loop        ; matched! token written, indices updated
+        
+        ; Try FE-prefix keywords
+        jsr _crunch_match_fe
+        bcs _crunch_loop
+        
+        ; Try CE-prefix keywords  
+        jsr _crunch_match_ce
+        bcs _crunch_loop
+        
+        ; No keyword match - store character as-is
+        lda crunch_input_buf,x
+        
+_crunch_store_advance:
+        sta crunch_output_buf,y
+        iny
+        inx
+        jmp _crunch_loop
+        
+_crunch_quoted:
+        ; Copy quote and everything until matching quote or EOL
+        lda crunch_input_buf,x
+        sta crunch_output_buf,y
+        iny
+        inx
+        beq _crunch_done        ; safety
+        cmp #$00
+        beq _crunch_done
+        ; We stored the opening quote, now copy until closing quote
+-       lda crunch_input_buf,x
+        beq _crunch_done        ; EOL inside quote
+        sta crunch_output_buf,y
+        iny
+        inx
+        cmp #$22                ; closing quote?
+        bne -
+        jmp _crunch_loop
+        
+_crunch_passthrough:
+        ; In DATA or REM mode - copy verbatim
+        lda crunch_input_buf,x
+        beq _crunch_done
+        cmp #$3A                ; colon ends DATA mode
+        bne +
+        ; Check if DATA mode (not REM) - colon ends DATA
+        lda _crunch_in_data
+        cmp #$83                ; DATA token
+        bne +                   ; REM - keep going
+        stz _crunch_in_data     ; exit DATA mode
+        lda #$3A
++       lda crunch_input_buf,x  ; reload char
+        sta crunch_output_buf,y
+        iny
+        inx
+        jmp _crunch_loop
+        
+_crunch_done:
+        ; Store null terminator
+        lda #$00
+        sta crunch_output_buf,y
+        
+        ; Write tokenized output back to C128 RAM
+        lda _crunch_save_lo
+        sta C128_MEM_PTR+0
+        lda _crunch_save_hi
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        
+        ; Copy output buf back
+        ldy #0
+-       lda crunch_output_buf,y
+        ldz #0
+        sta [C128_MEM_PTR],z
+        beq +                   ; done (wrote null)
+        inc C128_MEM_PTR+0
+        bne _cr_no_carry2
+        inc C128_MEM_PTR+1
+_cr_no_carry2:
+        iny
+        bne -
++
+        ; Restore text pointer $3D/$3E (ROM does PLA/STA)
+        lda _crunch_save_lo
+        sta c128_zp_ptr+0
+        lda #$3D
+        sta c128_zp_ptr+0
+        ldz #0
+        lda _crunch_save_lo
+        sta [c128_zp_ptr],z
+        inz
+        lda _crunch_save_hi
+        sta [c128_zp_ptr],z
+        
+        ; Y = length of tokenized output (ROM expects Y to be meaningful)
+        ; Actually ROM sets Y during processing, and caller uses CHRGOT after
+        ; The ROM entry saves/restores $3D/$3E and does RTS
+        ; We just need to do RTS back to caller
+        jsr C128Hook_RTS_Guest
+        lda #$01
+        sta c128_hook_pc_changed
+        rts
+
+; ============================================================
+; _crunch_match_main - try to match main keyword table
+; Input: X = read position in crunch_input_buf
+; Output: C=1 if matched (token in output, X/Y advanced), C=0 if no match
+; ============================================================
+_crunch_match_main:
+        ; Set up pointer to keyword table in C128 ROM bank 1
+        lda #<KEYWORD_TABLE_MAIN
+        sta C128_MEM_PTR+0
+        lda #>KEYWORD_TABLE_MAIN
+        sta C128_MEM_PTR+1
+        lda #$01                ; Bank 1 (BASIC ROM image)
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        
+        lda #$80                ; first token number
+        sta _crunch_cur_token
+        
+_cm_next_keyword:
+        ; Save read position for this attempt
+        stx _crunch_save_x
+        
+_cm_compare_loop:
+        ; Read keyword byte from ROM
+        ldz #0
+        lda [C128_MEM_PTR],z
+        bmi _cm_last_char       ; bit 7 set = last char of keyword
+        
+        ; Compare with input (case-insensitive: convert input to uppercase)
+        pha
+        lda crunch_input_buf,x
+        jsr _to_uppercase
+        sta _crunch_tmp
+        pla
+        cmp _crunch_tmp
+        bne _cm_skip_keyword    ; no match
+        
+        ; Match so far - advance both
+        inx
+        inc C128_MEM_PTR+0
+        bne _cm_compare_loop
+        inc C128_MEM_PTR+1
+        jmp _cm_compare_loop
+        
+_cm_last_char:
+        ; Last char has bit 7 set - compare without bit 7
+        and #$7F
+        pha
+        lda crunch_input_buf,x
+        jsr _to_uppercase
+        sta _crunch_tmp
+        pla
+        cmp _crunch_tmp
+        bne _cm_skip_last
+        
+        ; Full match! Store token
+        inx                     ; advance past last matched char
+        lda _crunch_cur_token
+        sta crunch_output_buf,y
+        iny
+        
+        ; Check for DATA ($83) or REM ($8F) - enter passthrough mode
+        cmp #$83                ; DATA
+        beq _cm_set_data_mode
+        cmp #$8F                ; REM
+        beq _cm_set_data_mode
+        
+        sec                     ; matched
+        rts
+        
+_cm_set_data_mode:
+        sta _crunch_in_data
+        sec
+        rts
+        
+_cm_skip_last:
+        ; Failed on last char - pointer is AT the last byte
+        ; Advance past it so pointer is at start of next keyword
+        ldx _crunch_save_x
+        inc C128_MEM_PTR+0
+        bne +
+        inc C128_MEM_PTR+1
++       jmp _cm_next_token
+
+_cm_skip_keyword:
+        ; Failed on non-last char - need to skip rest of keyword
+        ldx _crunch_save_x
+        ; Skip forward until we find byte with bit 7 set
+-       ldz #0
+        lda [C128_MEM_PTR],z
+        pha
+        inc C128_MEM_PTR+0
+        bne +
+        inc C128_MEM_PTR+1
++       pla
+        bpl -                   ; loop until bit 7 set = end of keyword
+
+_cm_next_token:        
+        ; Next token
+        inc _crunch_cur_token
+        lda _crunch_cur_token
+        cmp #$CC                ; end of main table (tokens $80-$CB)
+        bcc _cm_next_keyword
+        bcc _cm_next_keyword
+        
+        clc                     ; no match
+        rts
+
+; ============================================================
+; _crunch_match_fe - try FE-prefix keywords
+; ============================================================
+_crunch_match_fe:
+        lda #<KEYWORD_TABLE_FE
+        sta C128_MEM_PTR+0
+        lda #>KEYWORD_TABLE_FE
+        sta C128_MEM_PTR+1
+        lda #$01
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        
+        lda #$02                ; FE tokens start at $FE02
+        sta _crunch_cur_token
+        
+_cmfe_next_keyword:
+        stx _crunch_save_x
+        
+_cmfe_compare_loop:
+        ldz #0
+        lda [C128_MEM_PTR],z
+        bmi _cmfe_last_char
+        
+        pha
+        lda crunch_input_buf,x
+        jsr _to_uppercase
+        sta _crunch_tmp
+        pla
+        cmp _crunch_tmp
+        bne _cmfe_skip_keyword
+        
+        inx
+        inc C128_MEM_PTR+0
+        bne _cmfe_compare_loop
+        inc C128_MEM_PTR+1
+        jmp _cmfe_compare_loop
+        
+_cmfe_last_char:
+        and #$7F
+        pha
+        lda crunch_input_buf,x
+        jsr _to_uppercase
+        sta _crunch_tmp
+        pla
+        cmp _crunch_tmp
+        bne _cmfe_skip_keyword
+        
+        ; Match! Store FE prefix + token
+        inx
+        lda #$FE
+        sta crunch_output_buf,y
+        iny
+        lda _crunch_cur_token
+        sta crunch_output_buf,y
+        iny
+        sec
+        rts
+        
+_cmfe_skip_keyword:
+        ldx _crunch_save_x
+-       ldz #0
+        lda [C128_MEM_PTR],z
+        inc C128_MEM_PTR+0
+        bne +
+        inc C128_MEM_PTR+1
++       bpl -
+        
+        inc _crunch_cur_token
+        lda _crunch_cur_token
+        cmp #$27                ; end of FE table
+        bcc _cmfe_next_keyword
+        
+        clc
+        rts
+
+; ============================================================
+; _crunch_match_ce - try CE-prefix keywords
+; ============================================================
+_crunch_match_ce:
+        lda #<KEYWORD_TABLE_CE
+        sta C128_MEM_PTR+0
+        lda #>KEYWORD_TABLE_CE
+        sta C128_MEM_PTR+1
+        lda #$01
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        
+        lda #$02                ; CE tokens start at $CE02
+        sta _crunch_cur_token
+        
+_cmce_next_keyword:
+        stx _crunch_save_x
+        
+_cmce_compare_loop:
+        ldz #0
+        lda [C128_MEM_PTR],z
+        bmi _cmce_last_char
+        
+        pha
+        lda crunch_input_buf,x
+        jsr _to_uppercase
+        sta _crunch_tmp
+        pla
+        cmp _crunch_tmp
+        bne _cmce_skip_keyword
+        
+        inx
+        inc C128_MEM_PTR+0
+        bne _cmce_compare_loop
+        inc C128_MEM_PTR+1
+        jmp _cmce_compare_loop
+        
+_cmce_last_char:
+        and #$7F
+        pha
+        lda crunch_input_buf,x
+        jsr _to_uppercase
+        sta _crunch_tmp
+        pla
+        cmp _crunch_tmp
+        bne _cmce_skip_keyword
+        
+        ; Match! Store CE prefix + token
+        inx
+        lda #$CE
+        sta crunch_output_buf,y
+        iny
+        lda _crunch_cur_token
+        sta crunch_output_buf,y
+        iny
+        sec
+        rts
+        
+_cmce_skip_keyword:
+        ldx _crunch_save_x
+-       ldz #0
+        lda [C128_MEM_PTR],z
+        inc C128_MEM_PTR+0
+        bne +
+        inc C128_MEM_PTR+1
++       bpl -
+        
+        inc _crunch_cur_token
+        lda _crunch_cur_token
+        cmp #$0B                ; end of CE table
+        bcc _cmce_next_keyword
+        
+        clc
+        rts
+
+; ============================================================
+; _to_uppercase - convert PETSCII lowercase to uppercase
+; Input: A = character
+; Output: A = uppercase character
+; PETSCII: uppercase = $41-$5A, shifted lowercase = $C1-$DA
+; ============================================================
+_to_uppercase:
+        cmp #$C1                ; PETSCII shifted lowercase 'a'
+        bcc +
+        cmp #$DB                ; PETSCII shifted 'z'+1
+        bcs +
+        and #$7F                ; convert $C1-$DA → $41-$5A
++       rts
+
+; Variables for crunch
+_crunch_src_lo:    .byte 0
+_crunch_src_hi:    .byte 0
+_crunch_save_lo:   .byte 0
+_crunch_save_hi:   .byte 0
+_crunch_in_data:   .byte 0
+_crunch_cur_token: .byte 0
+_crunch_save_x:    .byte 0
+_crunch_tmp:       .byte 0
+
+; Buffers
+crunch_input_buf:  .fill CRUNCH_BUF_SIZE, 0
+crunch_output_buf: .fill CRUNCH_BUF_SIZE, 0

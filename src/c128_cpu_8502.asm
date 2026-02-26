@@ -234,8 +234,12 @@ hook_page_flags:
         .fill 22, 0
         ; $F8: KERNAL hooks
         .byte $80
-        ; $F9-$FE: no hooks
-        .fill 6, 0
+        ; $F9: no hooks
+        .byte 0
+        ; $FA: IRQ handler hook
+        .byte $80
+        ; $FB-$FE: no hooks
+        .fill 4, 0
         ; $FF: KERNAL hooks
         .byte $80
 
@@ -1290,11 +1294,11 @@ hook_check_keybuf:
 ; This saves the ~25 MEGA65 cycles of instruction decode per iteration
 ; while keeping the C128 timing identical.
 hook_keyboard_idle:
-        ; Set faster cursor blink (one-time)
+        ; One-time patches (first frame only)
         lda _blink_set
         bne +
         inc _blink_set
-        ; Write blink rate = 3 to C128 $0A20
+        ; Write blink rate = 1 to C128 $0A20
         lda #$20
         sta c128_addr_lo
         lda #$0A
@@ -2057,11 +2061,15 @@ _hook_chain_kernal_check:
         ; A = c128_pc_hi. Only pages $A8, $C8, $F8, $FF have hooks.
         cmp #$FF
         beq _hook_do_check
+        cmp #$FA
+        beq _hook_do_check
         cmp #$F8
         beq _hook_do_check
         cmp #$C8
         beq _hook_do_check
         cmp #$A8
+        beq _hook_do_check
+        cmp #$4B
         beq _hook_do_check
         jmp step_fetch         ; No hooks for this page
 
@@ -4858,9 +4866,45 @@ op_e2:
         #finish_cycles_no_xtra
         rts
 
-; JAM/KIL - halt CPU (these will crash if hit)
+; JAM/KIL opcodes - $02 and $12 are used as trap opcodes for hooks
+; PC has already been incremented past the opcode when we get here
+
 op_02:
+        ; Trap opcode $02 - used for GONE hook at $4B3F
+        ; PC is now $4B40 (one past trap). Check it.
+        lda c128_pc_hi
+        cmp #$4B
+        bne _op02_illegal
+        lda c128_pc_lo
+        cmp #$40                ; $4B3F + 1 = $4B40
+        bne _op02_illegal
+        ; It's the GONE trap - back up PC to $4B3F for the hook
+        dec c128_pc_lo          ; $4B40 → $4B3F
+        jsr C128Hook_GONE
+        lda #$01
+        sta c128_hook_pc_changed
+        jmp finish_and_loop
+_op02_illegal:
+        jmp op_illegal
+
 op_12:
+        ; Trap opcode $12 - used for Crunch hook at $430D
+        ; PC is now $430E (one past trap). Check it.
+        lda c128_pc_hi
+        cmp #$43
+        bne _op12_illegal
+        lda c128_pc_lo
+        cmp #$0E                ; $430D + 1 = $430E
+        bne _op12_illegal
+        ; It's the Crunch trap
+        dec c128_pc_lo          ; $430E → $430D
+        jsr C128Hook_Crunch
+        lda #$01
+        sta c128_hook_pc_changed
+        jmp finish_and_loop
+_op12_illegal:
+        jmp op_illegal
+
 op_22:
 op_32:
 op_42:

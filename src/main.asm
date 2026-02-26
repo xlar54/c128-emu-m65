@@ -193,6 +193,39 @@ start:
         jsr LOAD
 
 
+        ; Patch BASIC ROM: Place trap opcodes for native hooks
+        ; We use illegal opcode $02 (JAM) at hook points.
+        ; The emulator's opcode decoder catches $02 and dispatches
+        ; to our native handler based on PC address.
+        ; This avoids any need for $FF page trampolines.
+        
+        ; Bank 1 pointer already set up from basic_lo LOAD above
+        lda #$01
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        
+        ; Hook 1: GONE dispatch at $4B3F (Execute/Trace Statement)
+        ; Original byte at $4B3F: BEQ $4B3E (opcode $F0)
+        ; Replace with $02 (trap)
+        lda #$3F
+        sta C128_MEM_PTR+0
+        lda #$4B
+        sta C128_MEM_PTR+1
+        lda #$02                ; trap opcode
+        ldz #0
+        sta [C128_MEM_PTR],z
+        
+        ; Hook 2: Crunch Tokens at $430D - DISABLED (tokenizer has bugs)
+        ; TODO: Fix in-place tokenization to match ROM contract
+;        lda #$0D
+;        sta C128_MEM_PTR+0
+;        lda #$43
+;        sta C128_MEM_PTR+1
+;        lda #$12                ; trap opcode
+;        ldz #0
+;        sta [C128_MEM_PTR],z
+
         ; chargen
 
         lda #$01
