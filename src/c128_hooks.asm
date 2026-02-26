@@ -2446,16 +2446,16 @@ fco_printable:
         sta vdc_color_ptr+3
         bra _fco_color_write
 _fco_color_to_buf:
-        ; 80-col save buffer at $021000
+        ; 80-col save buffer in attic RAM at $8012000
         lda fco_scr_offset
         sta vdc_color_ptr+0
         lda fco_scr_offset+1
         clc
-        adc #>COLOR_80_SAVE
+        adc #>COLOR_80_ADDR
         sta vdc_color_ptr+1
-        lda #$02
+        lda #COLOR_80_BANK
         sta vdc_color_ptr+2
-        lda #$00
+        lda #COLOR_80_MB
         sta vdc_color_ptr+3
 _fco_color_write:
         ldz #0
@@ -3264,14 +3264,14 @@ _primm_print:
         sta vdc_color_ptr+3
         bra _primm_color_wr
 _primm_color_buf:
-        ; 80-col save buffer at $021000 + offset
+        ; 80-col save buffer in attic RAM at $8012000 + offset
         lda vdc_color_ptr+1
         clc
-        adc #>COLOR_80_SAVE
+        adc #>COLOR_80_ADDR
         sta vdc_color_ptr+1
-        lda #$02
+        lda #COLOR_80_BANK
         sta vdc_color_ptr+2
-        lda #$00
+        lda #COLOR_80_MB
         sta vdc_color_ptr+3
 _primm_color_wr:
         lda _primm_vic_color

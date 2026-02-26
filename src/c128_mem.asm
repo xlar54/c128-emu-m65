@@ -399,42 +399,50 @@ clear_low_ram_buffer:
         rts
 
 ; ============================================================
-; Color RAM save/restore buffers in bank 2:
-;   $020C00 = 40-col color save (1000 bytes)
-;   $021000 = 80-col color save (2000 bytes)
+; Color RAM save/restore buffers in attic RAM:
+;   $8010000 = 40-col color save (1000 bytes)
+;   $8012000 = 80-col color save (2000 bytes)
 ; Color RAM is at $0FF80000 = MB $FF, bank $0F, addr $8000
 ; ============================================================
-COLOR_40_SAVE = $0C00           ; bank 2 offset
-COLOR_80_SAVE = $1000           ; bank 2 offset
+COLOR_40_ADDR = $0000
+COLOR_40_BANK = $01
+COLOR_40_MB   = $80
+COLOR_80_ADDR = $2000
+COLOR_80_BANK = $01
+COLOR_80_MB   = $80
 
 ; ============================================================
-; init_color_buffers - Fill 40/80 col color save buffers
-; 40-col: light green (13) x 1000 at $020C00
-; 80-col: white (1) x 2000 at $021000
+; init_color_buffers - Fill 40/80 col color save buffers in attic RAM
+; 40-col: light green (13) x 1000 at $8010000
+; 80-col: white (1) x 2000 at $8012000
 ; ============================================================
 init_color_buffers:
         ; Fill 40-col buffer with light green (13)
         lda #$00
         sta $D707
-        .byte $80, $00, $81, $00, $00
+        .byte $80, $00
+        .byte $81, COLOR_40_MB  ; dst MB = $08
+        .byte $00
         .byte $03               ; fill
-        .word 1000              ; 1000 bytes
+        .word 1000
         .word 13                ; fill with 13 (light green)
         .byte $00
-        .word COLOR_40_SAVE     ; dst = $020C00
-        .byte $02               ; bank 2
+        .word COLOR_40_ADDR     ; dst = $0000
+        .byte COLOR_40_BANK     ; dst bank = $01
         .byte $00
         .word $0000
         ; Fill 80-col buffer with white (1)
         lda #$00
         sta $D707
-        .byte $80, $00, $81, $00, $00
+        .byte $80, $00
+        .byte $81, COLOR_80_MB  ; dst MB = $08
+        .byte $00
         .byte $03               ; fill
-        .word 2000              ; 2000 bytes
+        .word 2000
         .word 1                 ; fill with 1 (white)
         .byte $00
-        .word COLOR_80_SAVE     ; dst = $021000
-        .byte $02               ; bank 2
+        .word COLOR_80_ADDR     ; dst = $2000
+        .byte COLOR_80_BANK     ; dst bank = $01
         .byte $00
         .word $0000
         rts
@@ -444,30 +452,30 @@ init_color_buffers:
 ; Does NOT change vdc_mode_active (emulation state unchanged)
 ; ============================================================
 display_show_40col:
-        ; Save 80-col colors: $0FF80000 -> $021000 (2000 bytes)
+        ; Save 80-col colors: $0FF80000 -> attic $8012000 (2000 bytes)
         lda #$00
         sta $D707
         .byte $80, $FF          ; src MB = $FF (color RAM)
-        .byte $81, $00          ; dst MB = $00
+        .byte $81, COLOR_80_MB  ; dst MB = $08 (attic)
         .byte $00
         .byte $00               ; copy
         .word 2000
         .word $0000             ; src addr ($0FF80000)
         .byte $08               ; src bank $08
-        .word COLOR_80_SAVE     ; dst = $021000
-        .byte $02               ; dst bank 2
+        .word COLOR_80_ADDR     ; dst = $2000
+        .byte COLOR_80_BANK     ; dst bank $01
         .byte $00
         .word $0000
-        ; Restore 40-col colors: $020C00 -> $0FF80000 (1000 bytes)
+        ; Restore 40-col colors: attic $8010000 -> $0FF80000 (1000 bytes)
         lda #$00
         sta $D707
-        .byte $80, $00          ; src MB = $00
+        .byte $80, COLOR_40_MB  ; src MB = $08 (attic)
         .byte $81, $FF          ; dst MB = $FF (color RAM)
         .byte $00
         .byte $00               ; copy
         .word 1000
-        .word COLOR_40_SAVE     ; src = $020C00
-        .byte $02               ; src bank 2
+        .word COLOR_40_ADDR     ; src = $0000
+        .byte COLOR_40_BANK     ; src bank $01
         .word $0000             ; dst addr ($0FF80000)
         .byte $08               ; dst bank $08
         .byte $00
@@ -500,30 +508,30 @@ display_show_40col:
 ; Does NOT change vdc_mode_active (emulation state unchanged)
 ; ============================================================
 display_show_80col:
-        ; Save 40-col colors: $0FF80000 -> $020C00 (1000 bytes)
+        ; Save 40-col colors: $0FF80000 -> attic $8010000 (1000 bytes)
         lda #$00
         sta $D707
         .byte $80, $FF          ; src MB = $FF (color RAM)
-        .byte $81, $00          ; dst MB = $00
+        .byte $81, COLOR_40_MB  ; dst MB = $08 (attic)
         .byte $00
         .byte $00               ; copy
         .word 1000
         .word $0000             ; src addr ($0FF80000)
         .byte $08               ; src bank $08
-        .word COLOR_40_SAVE     ; dst = $020C00
-        .byte $02               ; dst bank 2
+        .word COLOR_40_ADDR     ; dst = $0000
+        .byte COLOR_40_BANK     ; dst bank $01
         .byte $00
         .word $0000
-        ; Restore 80-col colors: $021000 -> $0FF80000 (2000 bytes)
+        ; Restore 80-col colors: attic $8012000 -> $0FF80000 (2000 bytes)
         lda #$00
         sta $D707
-        .byte $80, $00          ; src MB = $00
+        .byte $80, COLOR_80_MB  ; src MB = $08 (attic)
         .byte $81, $FF          ; dst MB = $FF (color RAM)
         .byte $00
         .byte $00               ; copy
         .word 2000
-        .word COLOR_80_SAVE     ; src = $021000
-        .byte $02               ; src bank 2
+        .word COLOR_80_ADDR     ; src = $2000
+        .byte COLOR_80_BANK     ; src bank $01
         .word $0000             ; dst addr ($0FF80000)
         .byte $08               ; dst bank $08
         .byte $00
@@ -905,18 +913,18 @@ _rd_color_ram:
         rts
 
 _rd_color_from_buffer:
-        ; Displaying 80-col: read from 40-col save buffer at $020C00
+        ; Displaying 80-col: read from 40-col save buffer in attic $8010000
         lda c128_addr_lo
         sta C128_MEM_PTR+0
         lda c128_addr_hi
         sec
         sbc #$D8
         clc
-        adc #>COLOR_40_SAVE     ; + $0C
+        adc #>COLOR_40_ADDR     ; + $00
         sta C128_MEM_PTR+1
-        lda #$02                ; bank 2
+        lda #COLOR_40_BANK      ; bank $01
         sta C128_MEM_PTR+2
-        lda #$00
+        lda #COLOR_40_MB        ; MB $08
         sta C128_MEM_PTR+3
         ldz #0
         lda [C128_MEM_PTR],z
@@ -1444,18 +1452,18 @@ _wr_color_ram:
         rts
 
 _wr_color_to_buffer:
-        ; Displaying 80-col: write to 40-col save buffer at $020C00
+        ; Displaying 80-col: write to 40-col save buffer in attic $8010000
         lda c128_addr_lo
         sta C128_MEM_PTR+0
         lda c128_addr_hi
         sec
         sbc #$D8
         clc
-        adc #>COLOR_40_SAVE     ; + $0C
+        adc #>COLOR_40_ADDR     ; + $00
         sta C128_MEM_PTR+1
-        lda #$02                ; bank 2
+        lda #COLOR_40_BANK      ; bank $01
         sta C128_MEM_PTR+2
-        lda #$00
+        lda #COLOR_40_MB        ; MB $08
         sta C128_MEM_PTR+3
         ldz #0
         lda c128_saved_data
@@ -2047,11 +2055,12 @@ _wvdc_data_go:
         ; Skip MEGA65 screen/color mirroring if in 40-col mode
         ; (VDC RAM is always written above, but MEGA65 display only
         ; needs updating when actively showing 80-col)
-        ; Mark dirty so VDC_RenderFrame will re-copy when switching to 80-col
+        ; Mark dirty so VDC_RenderFrame re-copies when switching to 80-col
         ldx vdc_mode_active
         bne _wvdc_do_mirror
         lda #1
         sta vdc_screen_dirty
+        sta vdc_attr_dirty
         jmp _wvdc_data_skip
 _wvdc_do_mirror:
 
@@ -2075,17 +2084,17 @@ _wvdc_is_attr:
         lda vdc_regs+18
         sbc vdc_regs+20
         sta vdc_color_ptr+1
-        ; If displaying 40-col, redirect to 80-col save buffer at $021000
+        ; If displaying 40-col, redirect to 80-col save buffer in attic RAM
         lda display_showing_80
         bne _wvdc_attr_live
-        ; 40-col display: write to buffer at bank 2, $1000 + offset
+        ; 40-col display: write to attic buffer at $8012000 + offset
         lda vdc_color_ptr+1
         clc
-        adc #>COLOR_80_SAVE     ; + $10
+        adc #>COLOR_80_ADDR     ; + $20
         sta vdc_color_ptr+1
-        lda #$02                ; bank 2
+        lda #COLOR_80_BANK      ; bank $01
         sta vdc_color_ptr+2
-        lda #$00
+        lda #COLOR_80_MB        ; MB $08
         sta vdc_color_ptr+3
         bra _wvdc_attr_do_write
 _wvdc_attr_live:
