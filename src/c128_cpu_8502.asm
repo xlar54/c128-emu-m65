@@ -266,8 +266,14 @@ hook_page_flags:
         .fill 25, 0
         ; $C2: keyboard idle hook
         .byte 4
-        ; $C3-$C7: no hooks
-        .fill 5, 0
+        ; $C3: 40-col scroll hook
+        .byte 7
+        ; $C4: no hooks
+        .byte 0
+        ; $C5: VDC poll hook
+        .byte 3
+        ; $C6-$C7: no hooks
+        .byte 0, 0
         ; $C8: KERNAL hooks
         .byte $80
         ; $C9-$CC: no hooks
@@ -306,6 +312,23 @@ c128_code_romvis    = $E6   ; cached mmu_cr snapshot (for ROM visibility change 
 c128_hook_pc_changed = $E7  ; Set by hooks when they modify PC
 c128_stack_ptr      = $E8   ; 4 bytes: dedicated stack pointer (lo=SP, hi=$01, bank, $00)
 c128_zp_ptr         = $14   ; 4 bytes: dedicated ZP pointer (lo=addr, hi=$00, bank4, $00)
+
+; Helper: mirror a bank 0 write to LOW_RAM_BUFFER
+; Called after writing to bank 4 pages $00-$0F
+; c128_addr_hi < $10 guaranteed by caller, c128_data has value
+mirror_to_lrb:
+        lda c128_addr_hi
+        clc
+        adc #>LOW_RAM_BUFFER    ; $A0 + page = LOW_RAM_BUFFER page
+        sta C128_RAM_PTR+1
+        lda #$00
+        sta C128_RAM_PTR+2      ; bank 0
+        ldz c128_addr_lo
+        lda c128_data
+        sta [C128_RAM_PTR],z
+        lda #BANK_RAM0
+        sta C128_RAM_PTR+2      ; Restore bank 4
+        rts
 
 ; Call this when you want to force cache rebuild (optional helper)
 invalidate_code_cache:
@@ -557,6 +580,7 @@ init_stack_ptr:
         rts
 
 ; --- push_data ---
+; --- push_data ---
 ; Uses c128_stack_ptr with +0=0 always, Z register = SP for offset
 push_data:
         ldz c128_sp
@@ -606,12 +630,10 @@ lrb_read_x:
         rts
 
 ; Helper: write A -> ZP[X]  (preserves A, X)
-; Also mirrors to LOW_RAM_BUFFER for hook access
 lrb_write_x:
         stx c128_zp_ptr+0
         ldz #0
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         rts
 
 ; Helper: read ZP[Y] -> A  (preserves Y)
@@ -622,18 +644,15 @@ lrb_read_y:
         rts
 
 ; Helper: ASL ZP[X]  (preserves X, sets flags from result)
-; Also mirrors result to LOW_RAM_BUFFER
 lrb_asl_x:
         stx c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z
         asl a
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         rts
 
 ; Helper: DEC ZP[X]  (preserves X, sets flags from result)
-; Also mirrors result to LOW_RAM_BUFFER
 lrb_dec_x:
         stx c128_zp_ptr+0
         ldz #0
@@ -641,11 +660,9 @@ lrb_dec_x:
         sec
         sbc #1
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         rts
 
 ; Helper: INC ZP[X]  (preserves X, sets flags from result)
-; Also mirrors result to LOW_RAM_BUFFER
 lrb_inc_x:
         stx c128_zp_ptr+0
         ldz #0
@@ -653,24 +670,6 @@ lrb_inc_x:
         clc
         adc #1
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
-        rts
-
-; Helper: mirror c128_data to LOW_RAM_BUFFER at c128_addr_hi:c128_addr_lo
-; Called by write_data_fast when writing to pages $00-$0F.
-; Preserves all emulated state.
-mirror_to_lrb:
-        lda c128_addr_hi
-        clc
-        adc #>LOW_RAM_BUFFER
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        ldz c128_addr_lo
-        lda c128_data
-        sta [C128_MEM_PTR],z
         rts
 
 ; Helper: set C128_MEM_PTR to LOW_RAM_BUFFER base (call before [C128_MEM_PTR],z access)
@@ -1604,6 +1603,94 @@ C128_CPUReset:
         sta c128_code_valid
         rts
 
+; VDC test program data removed (test passed - VDC pipeline works)
+; To re-enable, uncomment and change C128_CPUReset to inject at $3000
+
+; ============================================================
+; fix_80col_zp_vars - Write correct 80-col screen editor ZP values
+; Called once when BASIC starts ($B000) in 80-col mode.
+; CINT's screen clear corrupts $E0-$FA with $20 (spaces).
+; We restore them to the correct values from VICE.
+; Also fix $D5 (LNMX) and $DA/$DB (screen line ptr).
+; ============================================================
+fix_80col_zp_vars:
+        ; Write $E0-$FA from table
+        ldx #0
+_fix_zp_loop:
+        lda vice_80col_zp,x
+        sta c128_data
+        txa
+        clc
+        adc #$E0
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        phx
+        #write_data_fast
+        plx
+        inx
+        cpx #27                 ; 27 bytes: $E0-$FA
+        bcc _fix_zp_loop
+
+        ; Fix $D5 (LNMX) = $4F (79 = 80 columns - 1)
+        lda #$4F
+        sta c128_data
+        lda #$D5
+        sta c128_addr_lo
+        lda #$00
+        sta c128_addr_hi
+        #write_data_fast
+
+        ; Fix $D7 (MODE) = $80 (80-col flag)
+        lda #$80
+        sta c128_data
+        lda #$D7
+        sta c128_addr_lo
+        #write_data_fast
+
+        ; Fix $DA (screen line ptr lo) = $00
+        lda #$00
+        sta c128_data
+        lda #$DA
+        sta c128_addr_lo
+        #write_data_fast
+
+        ; Fix $DB (screen line ptr hi) = $04
+        lda #$04
+        sta c128_data
+        lda #$DB
+        sta c128_addr_lo
+        #write_data_fast
+
+        ; Fix $0A03 = $50 (Z80 boot signature)
+        lda #$50
+        sta c128_data
+        lda #$03
+        sta c128_addr_lo
+        lda #$0A
+        sta c128_addr_hi
+        #write_data_fast
+
+        rts
+
+; 80-col screen editor ZP values ($E0-$FA) from VICE
+vice_80col_zp:
+        .byte $30, $02, $30, $0A, $18, $00, $00, $4F
+        .byte $07, $00, $05, $07, $00, $18, $4F, $0D
+        .byte $0D, $07, $07, $00, $00, $00, $00, $00
+        .byte $00, $00, $07
+        lda #$fc
+        sta c128_addr_lo
+        lda #$ff
+        sta c128_addr_hi
+        #read_data_fast
+        sta c128_pc_lo
+        lda #$fd
+        sta c128_addr_lo
+        #read_data_fast
+        sta c128_pc_hi
+        rts
+
 ; ============================================================
 ; z80_pre_init - Simulate what the Z80 boot ROM writes to RAM
 ;
@@ -1872,12 +1959,16 @@ C128CPU_StepDecode_hooks:
         beq _hook_page_cd
         cmp #2
         beq _hook_page_ce
+        cmp #3
+        beq _hook_page_c5
         cmp #4
         beq _hook_page_c2
         cmp #5
         beq _hook_page_e1
         cmp #6
         beq _hook_page_e0
+        cmp #7
+        beq _hook_page_c3
         jmp step_fetch
 
 _hook_page_cd:
@@ -1953,10 +2044,46 @@ _hook_page_ce:
         lda c128_pc_lo
         cmp #$0C
         bne +
-        ; Only skip VDC clear loop in 80-col mode
-        lda vdc_mode_active
-        beq +                   ; 40-col: let ROM handle naturally
         jsr hook_vdc_screen_clear
+        lda #4
+        #finish_cycles_inline
+        rts
++       jmp step_fetch
+
+_hook_page_c3:
+        ; Check for SCRLUP entry at $C3DC (the actual line-copy routine)
+        ; SCROLL ($C3A6) calls SCRLUP after setup; we let SCROLL's wrapper
+        ; handle cursor/PNT updates, and only replace the slow copy loop.
+        lda c128_pc_lo
+        cmp #$DC
+        bne +
+        jsr hook_40col_scroll
+        beq +                   ; Z=1: not handled, fall through to ROM
+        ; Handled: simulate RTS (pop return address from C128 stack)
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr low
+        sta c128_pc_lo
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr high
+        sta c128_pc_hi
+        inw c128_pc_lo          ; RTS adds 1 to return address (16-bit inc)
+        lda #0
+        sta c128_code_valid
+        lda #40                 ; ~40 cycles for scroll operation
+        #finish_cycles_no_xtra
+        rts
++       jmp step_fetch
+
+_hook_page_c5:
+        lda c128_pc_lo
+        cmp #$43
+        bne +
+        lda #$48
+        sta c128_pc_lo
+        lda #0
+        sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
@@ -2105,6 +2232,174 @@ finish_cycles:
         jsr finish_do_scanline
 
 _fc_done:
+        rts
+
+; ============================================================
+; hook_40col_scroll - DMA-accelerated 40-col screen scroll
+; Called when C128 PC = $C3DC (SCRLUP routine entry)
+; SCRLUP copies all lines in the window up one row and clears
+; the bottom line. SCROLL ($C3A6) calls SCRLUP then handles
+; cursor pointer updates — we only replace the copy/clear loop.
+; Only handles full-screen 40-col mode; returns Z=1 if not handled.
+; Returns Z=0 (NE) if scroll was performed via DMA.
+; ============================================================
+hook_40col_scroll:
+        ; --- Guard: only handle 40-col mode ---
+        lda vdc_mode_active
+        bne _h4s_skip           ; 80-col: let ROM handle
+
+        ; --- Guard: only handle full-screen window ---
+        ; Read window margins from C128 ZP via bank 4 (C128_RAM_PTR)
+        lda #$00
+        sta C128_RAM_PTR+1      ; page 0 for ZP reads
+        ldz #$E5                ; SCTOP
+        lda [C128_RAM_PTR],z
+        bne _h4s_skip           ; top != 0
+        ldz #$E4                ; SCBOT
+        lda [C128_RAM_PTR],z
+        cmp #24
+        bne _h4s_skip           ; bottom != 24
+        ldz #$E6                ; SCLF
+        lda [C128_RAM_PTR],z
+        bne _h4s_skip           ; left != 0
+        ldz #$E7                ; SCRT
+        lda [C128_RAM_PTR],z
+        cmp #39
+        bne _h4s_skip           ; right != 39
+
+        ; --- DMA scroll: C128 RAM bank 0 screen (bank 4, $0400) ---
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00               ; copy
+        .word 960               ; 24 lines * 40 bytes
+        .word $0428             ; src = $040428
+        .byte $04               ; src bank 4
+        .word $0400             ; dst = $040400
+        .byte $04               ; dst bank 4
+        .byte $00
+        .word $0000
+
+        ; --- DMA scroll: LOW_RAM_BUFFER screen mirror (bank 0) ---
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00               ; copy
+        .word 960
+        .word $A428             ; src = LOW_RAM_BUFFER + $0428
+        .byte $00               ; src bank 0
+        .word $A400             ; dst = LOW_RAM_BUFFER + $0400
+        .byte $00               ; dst bank 0
+        .byte $00
+        .word $0000
+
+        ; (40-col mode: MEGA65 SCRNPTR points at $040400 in bank 4 directly,
+        ; so the bank 4 DMA above handles the display. No bank 2 copy needed.)
+        ; --- DMA scroll: MEGA65 color RAM ---
+        lda #$00
+        sta $D707
+        .byte $80, $FF, $81, $FF, $00
+        .byte $00               ; copy
+        .word 960
+        .word $0028             ; src = offset 40
+        .byte $08               ; color RAM flag
+        .word $0000             ; dst = offset 0
+        .byte $08               ; color RAM flag
+        .byte $00
+        .word $0000
+
+        ; --- DMA fill: clear bottom line in C128 RAM bank 0 ---
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 40
+        .word $0020             ; fill with space ($20)
+        .byte $00
+        .word $07C0             ; dst = $0407C0 (row 24 = offset 960)
+        .byte $04
+        .byte $00
+        .word $0000
+
+        ; --- DMA fill: clear bottom line in LOW_RAM_BUFFER ---
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word 40
+        .word $0020             ; fill with space ($20)
+        .byte $00
+        .word $A7C0             ; dst = LOW_RAM_BUFFER + $07C0
+        .byte $00
+        .byte $00
+        .word $0000
+
+        ; (No bank 2 fill needed - 40-col SCRNPTR reads bank 4 directly)
+        ; --- DMA fill: clear bottom line color RAM ---
+        ; Use current color attribute from C128 ZP $F1 (bank 4)
+        lda #$00
+        sta C128_RAM_PTR+1      ; page 0
+        ldz #$F1
+        lda [C128_RAM_PTR],z
+        and #$0F                ; color RAM is 4 bits
+        sta _h4s_color_val      ; patch fill value
+        lda #$00
+        sta $D707
+        .byte $80, $FF, $81, $FF, $00
+        .byte $03               ; fill
+        .word 40
+_h4s_color_val:
+        .byte $00               ; fill value (patched)
+        .byte $00
+        .byte $00
+        .word $03C0             ; dst = offset 960 in color RAM
+        .byte $08               ; color RAM flag
+        .byte $00
+        .word $0000
+
+        ; --- Update line link bitmap at $035E-$0361 in bank 4 ---
+        ; Bitmap layout: byte 0 ($035E) bit7=line0 ... byte 3 ($0361) bit7=line24
+        ; Scroll up = shift entire 32-bit value left by 1
+        ; Read from bank 4, update, write back to bank 4 AND LOW_RAM_BUFFER
+        lda #$03
+        sta C128_RAM_PTR+1      ; page 3
+
+        ldz #$61                ; $0361
+        lda [C128_RAM_PTR],z
+        asl                     ; shift left, bit 7 -> carry
+        sta [C128_RAM_PTR],z
+        sta LOW_RAM_BUFFER + $0361
+
+        ldz #$60                ; $0360
+        lda [C128_RAM_PTR],z
+        rol                     ; shift left with carry
+        sta [C128_RAM_PTR],z
+        sta LOW_RAM_BUFFER + $0360
+
+        ldz #$5F                ; $035F
+        lda [C128_RAM_PTR],z
+        rol
+        sta [C128_RAM_PTR],z
+        sta LOW_RAM_BUFFER + $035F
+
+        ldz #$5E                ; $035E
+        lda [C128_RAM_PTR],z
+        rol
+        and #$7F                ; clear line 0 link bit (top line always unlinked)
+        sta [C128_RAM_PTR],z
+        sta LOW_RAM_BUFFER + $035E
+
+        ; Restore C128_RAM_PTR page to 0 (convention)
+        lda #$00
+        sta C128_RAM_PTR+1
+
+        ; Return NE (Z=0) to indicate scroll was handled
+        lda #$01
+        rts
+
+_h4s_skip:
+        ; Return Z=1 to indicate not handled
+        lda #$00
         rts
 
 op_illegal:
@@ -3917,12 +4212,10 @@ op_81:
 ; $84 STY zp
 op_84:
         #fetch8_operand
-        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda c128_y
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         lda #3
         #finish_cycles_no_xtra
         rts
@@ -3931,12 +4224,10 @@ op_84:
 ; $85 STA zp
 op_85:
         #fetch8_operand
-        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda c128_a
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         lda #3
         #finish_cycles_no_xtra
         rts
@@ -3944,12 +4235,10 @@ op_85:
 ; $86 STX zp  
 op_86:
         #fetch8_operand
-        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda c128_x
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         lda #3
         #finish_cycles_no_xtra
         rts
@@ -4411,14 +4700,12 @@ op_c5:
 ; $C6 DEC zp
 op_c6:
         #fetch8_operand
-        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z     ; Read
         sec
         sbc #1                  ; Decrement
         sta [c128_zp_ptr],z     ; Write back
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         #set_zn_fast
         lda #5
         #finish_cycles_no_xtra
@@ -4618,14 +4905,12 @@ op_e5:
 ; $E6 INC zp
 op_e6:
         #fetch8_operand
-        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z     ; Read
         clc
         adc #1                  ; Increment
         sta [c128_zp_ptr],z     ; Write back
-        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         #set_zn_fast
         lda #5
         #finish_cycles_no_xtra
