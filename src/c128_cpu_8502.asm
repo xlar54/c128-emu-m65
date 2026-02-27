@@ -98,7 +98,29 @@ read_data_fast .macro
         lda c128_addr_hi
         cmp #$40
         bcs _rdf_slow\@
-        ; Fast path: A already has addr_hi, use directly as page
+        ; Fast path: check if we're in the common bank 0 case
+        ldx mmu_ram_bank
+        cpx #BANK_RAM0
+        bne _rdf_bank1\@
+        ; Bank 0 (99% case): direct read from bank 4
+        sta C128_RAM_PTR+1
+        ldz c128_addr_lo
+        lda [C128_RAM_PTR],z
+        bra _rdf_done\@
+_rdf_bank1\@:
+        ; Bank 1 selected: check shared region
+        cmp shared_bottom_mask
+        bcc _rdf_b1_shared\@
+        ; Above shared: read from bank 5
+        sta C128_RAM_PTR+1
+        stx C128_RAM_PTR+2      ; X = BANK_RAM1
+        ldz c128_addr_lo
+        lda [C128_RAM_PTR],z
+        ldx #BANK_RAM0
+        stx C128_RAM_PTR+2      ; Restore bank 4
+        bra _rdf_done\@
+_rdf_b1_shared\@:
+        ; Shared bottom: still bank 4
         sta C128_RAM_PTR+1
         ldz c128_addr_lo
         lda [C128_RAM_PTR],z
@@ -122,11 +144,45 @@ write_data_fast .macro
         cmp c128_code_page_hi
         beq _wdf_inv\@
 _wdf_write\@:
-        ; Direct write: A still has addr_hi
+        ; Check if we're in the common bank 0 case
+        ldx mmu_ram_bank
+        cpx #BANK_RAM0
+        bne _wdf_bank1\@
+        ; Bank 0 (99% case): direct write to bank 4
         sta C128_RAM_PTR+1
         ldz c128_addr_lo
         lda c128_data
         sta [C128_RAM_PTR],z
+        ; Mirror pages $00-$0F to LOW_RAM_BUFFER for hook access
+        lda c128_addr_hi
+        cmp #$10
+        bcs _wdf_done\@
+        jsr mirror_to_lrb
+        bra _wdf_done\@
+_wdf_bank1\@:
+        ; Bank 1 selected: check shared region
+        lda c128_addr_hi
+        cmp shared_bottom_mask
+        bcc _wdf_b1_shared\@
+        ; Above shared: write to bank 5
+        sta C128_RAM_PTR+1
+        stx C128_RAM_PTR+2      ; X = BANK_RAM1
+        ldz c128_addr_lo
+        lda c128_data
+        sta [C128_RAM_PTR],z
+        ldx #BANK_RAM0
+        stx C128_RAM_PTR+2      ; Restore bank 4
+        bra _wdf_done\@         ; No mirror for bank 1
+_wdf_b1_shared\@:
+        ; Shared bottom: write to bank 4, mirror as usual
+        sta C128_RAM_PTR+1
+        ldz c128_addr_lo
+        lda c128_data
+        sta [C128_RAM_PTR],z
+        lda c128_addr_hi
+        cmp #$10
+        bcs _wdf_done\@
+        jsr mirror_to_lrb
         bra _wdf_done\@
 _wdf_inv\@:
         lda #0
@@ -210,12 +266,8 @@ hook_page_flags:
         .fill 25, 0
         ; $C2: keyboard idle hook
         .byte 4
-        ; $C3-$C4: no hooks
-        .byte 0, 0
-        ; $C5: VDC poll hook
-        .byte 3
-        ; $C6-$C7: no hooks
-        .byte 0, 0
+        ; $C3-$C7: no hooks
+        .fill 5, 0
         ; $C8: KERNAL hooks
         .byte $80
         ; $C9-$CC: no hooks
@@ -505,7 +557,6 @@ init_stack_ptr:
         rts
 
 ; --- push_data ---
-; --- push_data ---
 ; Uses c128_stack_ptr with +0=0 always, Z register = SP for offset
 push_data:
         ldz c128_sp
@@ -555,10 +606,12 @@ lrb_read_x:
         rts
 
 ; Helper: write A -> ZP[X]  (preserves A, X)
+; Also mirrors to LOW_RAM_BUFFER for hook access
 lrb_write_x:
         stx c128_zp_ptr+0
         ldz #0
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         rts
 
 ; Helper: read ZP[Y] -> A  (preserves Y)
@@ -569,15 +622,18 @@ lrb_read_y:
         rts
 
 ; Helper: ASL ZP[X]  (preserves X, sets flags from result)
+; Also mirrors result to LOW_RAM_BUFFER
 lrb_asl_x:
         stx c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z
         asl a
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         rts
 
 ; Helper: DEC ZP[X]  (preserves X, sets flags from result)
+; Also mirrors result to LOW_RAM_BUFFER
 lrb_dec_x:
         stx c128_zp_ptr+0
         ldz #0
@@ -585,9 +641,11 @@ lrb_dec_x:
         sec
         sbc #1
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         rts
 
 ; Helper: INC ZP[X]  (preserves X, sets flags from result)
+; Also mirrors result to LOW_RAM_BUFFER
 lrb_inc_x:
         stx c128_zp_ptr+0
         ldz #0
@@ -595,6 +653,24 @@ lrb_inc_x:
         clc
         adc #1
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
+        rts
+
+; Helper: mirror c128_data to LOW_RAM_BUFFER at c128_addr_hi:c128_addr_lo
+; Called by write_data_fast when writing to pages $00-$0F.
+; Preserves all emulated state.
+mirror_to_lrb:
+        lda c128_addr_hi
+        clc
+        adc #>LOW_RAM_BUFFER
+        sta C128_MEM_PTR+1
+        lda #$00
+        sta C128_MEM_PTR+0
+        sta C128_MEM_PTR+2
+        sta C128_MEM_PTR+3
+        ldz c128_addr_lo
+        lda c128_data
+        sta [C128_MEM_PTR],z
         rts
 
 ; Helper: set C128_MEM_PTR to LOW_RAM_BUFFER base (call before [C128_MEM_PTR],z access)
@@ -1528,94 +1604,6 @@ C128_CPUReset:
         sta c128_code_valid
         rts
 
-; VDC test program data removed (test passed - VDC pipeline works)
-; To re-enable, uncomment and change C128_CPUReset to inject at $3000
-
-; ============================================================
-; fix_80col_zp_vars - Write correct 80-col screen editor ZP values
-; Called once when BASIC starts ($B000) in 80-col mode.
-; CINT's screen clear corrupts $E0-$FA with $20 (spaces).
-; We restore them to the correct values from VICE.
-; Also fix $D5 (LNMX) and $DA/$DB (screen line ptr).
-; ============================================================
-fix_80col_zp_vars:
-        ; Write $E0-$FA from table
-        ldx #0
-_fix_zp_loop:
-        lda vice_80col_zp,x
-        sta c128_data
-        txa
-        clc
-        adc #$E0
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        phx
-        #write_data_fast
-        plx
-        inx
-        cpx #27                 ; 27 bytes: $E0-$FA
-        bcc _fix_zp_loop
-
-        ; Fix $D5 (LNMX) = $4F (79 = 80 columns - 1)
-        lda #$4F
-        sta c128_data
-        lda #$D5
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        #write_data_fast
-
-        ; Fix $D7 (MODE) = $80 (80-col flag)
-        lda #$80
-        sta c128_data
-        lda #$D7
-        sta c128_addr_lo
-        #write_data_fast
-
-        ; Fix $DA (screen line ptr lo) = $00
-        lda #$00
-        sta c128_data
-        lda #$DA
-        sta c128_addr_lo
-        #write_data_fast
-
-        ; Fix $DB (screen line ptr hi) = $04
-        lda #$04
-        sta c128_data
-        lda #$DB
-        sta c128_addr_lo
-        #write_data_fast
-
-        ; Fix $0A03 = $50 (Z80 boot signature)
-        lda #$50
-        sta c128_data
-        lda #$03
-        sta c128_addr_lo
-        lda #$0A
-        sta c128_addr_hi
-        #write_data_fast
-
-        rts
-
-; 80-col screen editor ZP values ($E0-$FA) from VICE
-vice_80col_zp:
-        .byte $30, $02, $30, $0A, $18, $00, $00, $4F
-        .byte $07, $00, $05, $07, $00, $18, $4F, $0D
-        .byte $0D, $07, $07, $00, $00, $00, $00, $00
-        .byte $00, $00, $07
-        lda #$fc
-        sta c128_addr_lo
-        lda #$ff
-        sta c128_addr_hi
-        #read_data_fast
-        sta c128_pc_lo
-        lda #$fd
-        sta c128_addr_lo
-        #read_data_fast
-        sta c128_pc_hi
-        rts
-
 ; ============================================================
 ; z80_pre_init - Simulate what the Z80 boot ROM writes to RAM
 ;
@@ -1884,8 +1872,6 @@ C128CPU_StepDecode_hooks:
         beq _hook_page_cd
         cmp #2
         beq _hook_page_ce
-        cmp #3
-        beq _hook_page_c5
         cmp #4
         beq _hook_page_c2
         cmp #5
@@ -1967,20 +1953,10 @@ _hook_page_ce:
         lda c128_pc_lo
         cmp #$0C
         bne +
+        ; Only skip VDC clear loop in 80-col mode
+        lda vdc_mode_active
+        beq +                   ; 40-col: let ROM handle naturally
         jsr hook_vdc_screen_clear
-        lda #4
-        #finish_cycles_inline
-        rts
-+       jmp step_fetch
-
-_hook_page_c5:
-        lda c128_pc_lo
-        cmp #$43
-        bne +
-        lda #$48
-        sta c128_pc_lo
-        lda #0
-        sta c128_code_valid
         lda #4
         #finish_cycles_inline
         rts
@@ -3941,10 +3917,12 @@ op_81:
 ; $84 STY zp
 op_84:
         #fetch8_operand
+        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda c128_y
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         lda #3
         #finish_cycles_no_xtra
         rts
@@ -3953,10 +3931,12 @@ op_84:
 ; $85 STA zp
 op_85:
         #fetch8_operand
+        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda c128_a
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         lda #3
         #finish_cycles_no_xtra
         rts
@@ -3964,10 +3944,12 @@ op_85:
 ; $86 STX zp  
 op_86:
         #fetch8_operand
+        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda c128_x
         sta [c128_zp_ptr],z
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         lda #3
         #finish_cycles_no_xtra
         rts
@@ -4429,12 +4411,14 @@ op_c5:
 ; $C6 DEC zp
 op_c6:
         #fetch8_operand
+        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z     ; Read
         sec
         sbc #1                  ; Decrement
         sta [c128_zp_ptr],z     ; Write back
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         #set_zn_fast
         lda #5
         #finish_cycles_no_xtra
@@ -4634,12 +4618,14 @@ op_e5:
 ; $E6 INC zp
 op_e6:
         #fetch8_operand
+        tax                     ; X = ZP address for mirror
         sta c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z     ; Read
         clc
         adc #1                  ; Increment
         sta [c128_zp_ptr],z     ; Write back
+        sta LOW_RAM_BUFFER,x    ; Mirror to LOW_RAM_BUFFER
         #set_zn_fast
         lda #5
         #finish_cycles_no_xtra

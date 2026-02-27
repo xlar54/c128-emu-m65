@@ -306,6 +306,10 @@ C128_VideoInit:
         sta $D064               ; COLPTR byte 0
         lda #$00
         sta $D065               ; COLPTR byte 1
+        ;lda #$F8
+        ;sta $D066               ; COLPTR[23:16] = $F8
+        ;lda #$0F
+        ;sta $D067               ; COLPTR[31:24] = $0F  -> $0FF80000
 
         ; --- Check 40/80 column mode ---
         lda mmu_mcr
