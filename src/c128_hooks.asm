@@ -78,7 +78,7 @@ ZP_PTRS_COUNT = 10
 ; ------------------------------------------------------------
 ; Directory load configuration
 ; ------------------------------------------------------------
-C128_BANK_RAM     = $04           ; emulated C128 RAM bank 0 in MEGA65 bank 4
+C128_BANK_RAM     = $05           ; emulated C128 RAM lives in MEGA65 bank 5
 
 ; Host-side staging buffer (bank 0 address)
 C128_DIR_BUF      = $6000         ; 4KB staging buffer in bank 0
@@ -418,6 +418,22 @@ _check_f9:
         jmp _done
 
 _check_a8:
+        ; ----- Check for CRUNCH at $430A -----
+        cmp #$43
+        bne _check_a8_gone
+        lda c128_pc_lo
+        cmp #$0A
+        bne _done_fast
+        ; Match - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
+        jsr C128Hook_Crunch
+        jmp _done
+
+_check_a8_gone:
         ; ----- Check for BASIC dispatch at $4B3F -----
         cmp #$4B
         bne _check_a8_load
@@ -940,7 +956,7 @@ _dhl_setup_load:
         jsr SETLFS
         
         ; Set destination bank to 5 (guest RAM)
-        lda #C128_BANK_RAM                ; Guest RAM bank for LOAD destination
+        lda #C128_BANK_RAM                ; Bank 5 for LOAD destination
         ldx #$00                        ; Bank 0 for filename
         jsr SETBNK
         
@@ -996,9 +1012,9 @@ _dhl_load_ok:
         beq _dhl_error_set
 
 _dhl_has_data:
-        ; We loaded directly to guest RAM, so we need to sync LOW_RAM_BUFFER
+        ; We loaded directly to bank 5, so we need to sync LOW_RAM_BUFFER
         ; for addresses $0000-$0FFF if the load touched that area
-        jsr C128Hook_SyncLowRAMFromGuest
+        jsr C128Hook_SyncLowRAMFromBank5
         
         ; Clear KERNAL status
         lda #$00
@@ -1409,7 +1425,7 @@ _dma_g2h_src_lo:
         .byte $00
 _dma_g2h_src_hi:
         .byte $00
-        .byte BANK_RAM                  ; src bank (C128 RAM) (guest RAM)
+        .byte BANK_RAM                  ; src bank 5 (guest RAM)
         .byte <(C128_DIR_BUF+2)           ; dest lo
         .byte >(C128_DIR_BUF+2)           ; dest hi
         .byte $00                       ; dest bank 0 (host RAM)
@@ -1543,7 +1559,7 @@ C128Hook_DMACopyFileToGuest:
         .byte $00                       ; src bank 0
         .byte $00                       ; dest lo
         .byte $00                       ; dest hi  
-        .byte C128_BANK_RAM               ; dest bank (C128 RAM)
+        .byte C128_BANK_RAM               ; dest bank 5
         .byte $00
         .word $0000
 
@@ -1565,7 +1581,7 @@ _dma_fl_dst_lo:
         .byte $00
 _dma_fl_dst_hi:
         .byte $00
-        .byte C128_BANK_RAM               ; dest bank (C128 RAM)
+        .byte C128_BANK_RAM               ; dest bank 5
         .byte $00
         .word $0000
 
@@ -1653,7 +1669,7 @@ _dma_sync_src_lo:
         .byte $00
 _dma_sync_src_hi:
         .byte $00
-        .byte C128_BANK_RAM               ; src bank (C128 RAM)
+        .byte C128_BANK_RAM               ; src bank 5
 _dma_sync_dst_lo:
         .byte $00
 _dma_sync_dst_hi:
@@ -3569,11 +3585,9 @@ _gone_chrget:
         lda _gone_txtptr
         ldz #0
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER + $3D  ; Mirror to LOW_RAM_BUFFER
         lda _gone_txtptr+1
         ldz #1
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER + $3E  ; Mirror to LOW_RAM_BUFFER
 
         ; Set A register to the byte we read
         lda _gone_token
@@ -3713,14 +3727,12 @@ C128Hook_CHRGET:
         clc
         adc #1
         sta [c128_zp_ptr],z     ; write $3D
-        sta LOW_RAM_BUFFER + $3D ; Mirror
         bne _chrget_disabled_no_carry
         ldz #1
         lda [c128_zp_ptr],z     ; read $3E
         clc
         adc #1
         sta [c128_zp_ptr],z     ; write $3E
-        sta LOW_RAM_BUFFER + $3E ; Mirror
 _chrget_disabled_no_carry:
         ; Set PC to CHRGOT ($0386) and let ROM handle the rest
         lda #$86
@@ -3770,11 +3782,9 @@ _chrget_loop:
         lda _chrget_ptr
         ldz #0
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER + $3D  ; Mirror
         lda _chrget_ptr+1
         ldz #1
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER + $3E  ; Mirror
 
         ; --- Set guest registers ---
         lda _chrget_byte
@@ -3876,7 +3886,6 @@ C128Hook_IRQ:
         clc
         adc #1
         sta [c128_zp_ptr],z     ; write $A2
-        sta LOW_RAM_BUFFER + $A2 ; Mirror
         bcc _irq_no_carry1
 
         ; Carry to $A1
@@ -3886,7 +3895,6 @@ C128Hook_IRQ:
         clc
         adc #1
         sta [c128_zp_ptr],z     ; write $A1
-        sta LOW_RAM_BUFFER + $A1 ; Mirror
         bcc _irq_no_carry1
 
         ; Carry to $A0
@@ -3896,7 +3904,6 @@ C128Hook_IRQ:
         clc
         adc #1
         sta [c128_zp_ptr],z     ; write $A0
-        sta LOW_RAM_BUFFER + $A0 ; Mirror
 
 _irq_no_carry1:
         ; Check for 24-hour rollover: 5184000 = $4F1A00
@@ -3921,13 +3928,10 @@ _irq_no_carry1:
         lda #0
         ldz #0
         sta [c128_zp_ptr],z     ; $A0 = 0
-        sta LOW_RAM_BUFFER + $A0 ; Mirror
         ldz #1
         sta [c128_zp_ptr],z     ; $A1 = 0
-        sta LOW_RAM_BUFFER + $A1 ; Mirror
         ldz #2
         sta [c128_zp_ptr],z     ; $A2 = 0
-        sta LOW_RAM_BUFFER + $A2 ; Mirror
 
 _irq_clock_done:
         ; --- Acknowledge CIA1 interrupt ---
@@ -4340,11 +4344,11 @@ _pfov_done:
         rts
 
 ; ============================================================
-; C128Hook_SyncLowRAMFromGuest - Sync LOW_RAM_BUFFER from guest RAM (bank 4)
+; C128Hook_SyncLowRAMFromBank5 - Sync LOW_RAM_BUFFER from bank 5
 ; Called after loading directly to bank 5 to update the cached
-; copy of $0000-$0FFF in LOW_RAM_BUFFER (bank 0)
+; copy of $0000-$0FFF in LOW_RAM_BUFFER
 ; ============================================================
-C128Hook_SyncLowRAMFromGuest:
+C128Hook_SyncLowRAMFromBank5:
         ; Check if load touched low RAM area ($0000-$0FFF)
         ; If dest >= $1000, no need to sync
         lda c128_dir_dest_hi
@@ -4412,7 +4416,7 @@ _sync_b5_calc_len:
         adc #>LOW_RAM_BUFFER
         sta _sync_b5_dma_dst+1
         
-        ; DMA copy from guest RAM to LOW_RAM_BUFFER
+        ; DMA copy from bank 5 to LOW_RAM_BUFFER
         lda #$00
         sta $D702                       ; DMA list bank 0
         lda #>_sync_b5_dma_list
@@ -4436,7 +4440,7 @@ _sync_b5_dma_count:
         .word $0000                     ; Count (filled in)
 _sync_b5_dma_src:
         .word $0000                     ; Source address (filled in)
-        .byte C128_BANK_RAM               ; Source bank (C128 RAM)
+        .byte C128_BANK_RAM               ; Source bank 5
 _sync_b5_dma_dst:
         .word $0000                     ; Dest address (filled in = LOW_RAM_BUFFER + offset)
         .byte $00                       ; Dest bank 0
@@ -4623,7 +4627,8 @@ _crunch_done:
         lda #$00
         sta crunch_output_buf,y
         
-        ; Write tokenized output back to C128 RAM
+        ; Copy output buf back to C128 RAM (bank 4)
+        ; Also mirror to LOW_RAM_BUFFER if in pages $00-$0F
         lda _crunch_save_lo
         sta C128_MEM_PTR+0
         lda _crunch_save_hi
@@ -4633,46 +4638,56 @@ _crunch_done:
         lda #$00
         sta C128_MEM_PTR+3
         
-        ; Copy output buf back
         ldy #0
 -       lda crunch_output_buf,y
         ldz #0
-        sta [C128_MEM_PTR],z
-        beq +                   ; done (wrote null)
+        sta [C128_MEM_PTR],z    ; write to bank 4
+        pha                     ; save char
+        ; Mirror to LOW_RAM_BUFFER: bank 0, addr = $A000 + offset
+        lda C128_MEM_PTR+1
+        cmp #$10
+        bcs _cr_no_lrb          ; skip mirror if page >= $10
+        clc
+        adc #>LOW_RAM_BUFFER    ; $A0 + page
+        sta C128_MEM_PTR+1
+        lda #$00
+        sta C128_MEM_PTR+2      ; bank 0
+        pla
+        pha
+        sta [C128_MEM_PTR],z    ; write to LOW_RAM_BUFFER
+        ; Restore pointer to bank 4
+        lda C128_MEM_PTR+1
+        sec
+        sbc #>LOW_RAM_BUFFER
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+_cr_no_lrb:
+        pla                     ; restore char
+        beq _cr_writeback_done  ; null = done
         inc C128_MEM_PTR+0
         bne _cr_no_carry2
         inc C128_MEM_PTR+1
 _cr_no_carry2:
         iny
         bne -
-+
-        ; Restore text pointer $3D/$3E (ROM does PLA/STA)
-        lda _crunch_save_lo
-        sta c128_zp_ptr+0
+_cr_writeback_done:
+
+        ; Restore text pointer $3D/$3E in C128 ZP (ROM does PLA/STA)
         lda #$3D
         sta c128_zp_ptr+0
         ldz #0
         lda _crunch_save_lo
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER + $3D  ; Mirror
         inz
         lda _crunch_save_hi
         sta [c128_zp_ptr],z
-        sta LOW_RAM_BUFFER + $3E  ; Mirror
         
-        ; Y = length of tokenized output (ROM expects Y to be meaningful)
-        ; Actually ROM sets Y during processing, and caller uses CHRGOT after
-        ; The ROM entry saves/restores $3D/$3E and does RTS
-        ; We just need to do RTS back to caller
+        ; Simulate RTS back to caller of CRUNCH ($430A)
         jsr C128Hook_RTS_Guest
         lda #$01
         sta c128_hook_pc_changed
         rts
-
-; ============================================================
-; _crunch_match_main - try to match main keyword table
-; Input: X = read position in crunch_input_buf
-; Output: C=1 if matched (token in output, X/Y advanced), C=0 if no match
 ; ============================================================
 _crunch_match_main:
         ; Set up pointer to keyword table in C128 ROM bank 1
@@ -4772,7 +4787,6 @@ _cm_next_token:
         inc _crunch_cur_token
         lda _crunch_cur_token
         cmp #$CC                ; end of main table (tokens $80-$CB)
-        bcc _cm_next_keyword
         bcc _cm_next_keyword
         
         clc                     ; no match
