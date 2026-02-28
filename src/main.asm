@@ -246,25 +246,6 @@ start:
         jsr LOAD
 
         ; ============================================================
-        ; Relocate KERNAL $F800-$FFFF to $12000 in bank 1
-        ; The MEGA65 maps color RAM over $1F800-$1FFFF in bank 1,
-        ; so we keep a second copy at $12000 for the emulator to read
-        ; ============================================================
-        lda #$00
-        sta $D707
-        .byte $80, $00          ; src MB = 0
-        .byte $81, $00          ; dst MB = 0
-        .byte $00               ; end options
-        .byte $00               ; copy command
-        .word $0800             ; count = 2048 bytes
-        .word $F800             ; src addr = $F800
-        .byte $00               ; src bank 0 (where KERNAL was loaded)
-        .word $2000             ; dst addr = $2000
-        .byte $01               ; dst bank 1 ($12000)
-        .byte $00               ; command high byte
-        .word $0000             ; modulo
-
-        ; ============================================================
         ; Toggle ROM write-protect off (banks 2-3)
         ; This allows us to use $32000-$35FFF for VDC RAM
         ; Must be AFTER all C65 KERNAL LOAD calls (needs INTERFACE at $2C800)
@@ -317,29 +298,8 @@ _no_print_check:
         jmp main_loop
 
 ; ============================================================
+; ROMS
 ; ============================================================
-; Messages
-; ============================================================
-banner_msg:
-        .byte $93, 27, 52
-        .text "c128 emulator for mega65"
-        .byte $0D, 0
-
-init_msg:
-        .text "initializing c128 memory..."
-        .byte $0D, 0
-
-ready_msg:
-        .text "ready."
-        .byte $0D, 0
-
-press_msg:
-        .text "press any key to start"
-        .byte $0D, 0
-
-loading_msg:
-        .text "loading roms..."
-        .byte $0D, 0
 
 chargen_name:
         .text "chargen.bin"
@@ -356,14 +316,6 @@ basichi_name_end:
 kernal_name:
         .text "kernal.bin"
 kernal_name_end:
-
-roms_ok_msg:
-        .text "roms loaded."
-        .byte $0D, 0
-
-rom_fail_msg:
-        .text "?error loading roms.bin"
-        .byte $0D, 0
 
 ; ============================================================
 ; Include emulator components
