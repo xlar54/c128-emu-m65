@@ -2221,6 +2221,12 @@ _vdc_fill_dst:
         .byte $00               ; command high byte
         .word $0000             ; modulo
 
+        ; Save original R18:R19 before advance (needed for MEGA65 mirror)
+        lda vdc_regs+18
+        sta _vdc_fill_orig_hi
+        lda vdc_regs+19
+        sta _vdc_fill_orig_lo
+
         ; Advance R18:R19 by count (as real VDC hardware would)
         clc
         lda vdc_regs+19
@@ -2236,30 +2242,18 @@ _vdc_fill_dst:
 
         ; --- Also fill MEGA65 screen/color RAM ---
         ; Check if fill destination is screen or attr area
-        ; Use the pre-advance R18 value: recompute from current - count
-        lda vdc_regs+18
-        sec
-        sbc _vdc_fill_count+1
-        sta _vdc_fill_orig_hi
-        lda vdc_regs+19
-        sec
-        sbc _vdc_fill_count
-        ; (don't need lo, just need hi for area check)
-
         lda _vdc_fill_orig_hi
         cmp vdc_regs+20
         bcs _vdc_fill_is_attr
 
         ; Screen area fill: mirror to MEGA65 screen at $020400
         ; Dest offset = original R18:R19 - R12:R13
-        ; Original R19 = current R19 - fill_count (since R18:R19 advanced)
-        lda vdc_regs+19
+        lda _vdc_fill_orig_lo
         sec
-        sbc _vdc_fill_count      ; back to original R19
-        sbc vdc_regs+13          ; subtract screen start lo (borrow propagates)
+        sbc vdc_regs+13
         sta _vdc_scr_fill_dst
         lda _vdc_fill_orig_hi
-        sbc vdc_regs+12          ; subtract screen start hi
+        sbc vdc_regs+12
         clc
         adc #$04                ; +$0400 base
         sta _vdc_scr_fill_dst+1
@@ -2300,6 +2294,7 @@ _wvdc_wc_done:
         rts
 
 _vdc_fill_orig_hi: .byte 0
+_vdc_fill_orig_lo: .byte 0
 
 _vdc_block_copy:
         ; --- Block copy via DMA ---
