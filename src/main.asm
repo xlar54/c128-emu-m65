@@ -2,25 +2,67 @@
 ; main.asm - C128 Emulator for MEGA65
 ; Assembler: 64tass
 ;
-; Memory Layout:
-;   Bank 0:
-;     $08000-$09FFF: Character ROM (C128 chargen, 8KB, stays at staging area)
-;   Bank 1 ($10000-$1FFFF): C128 ROMs
-;     $10000-$11FFF: Character ROM (chargen, 8KB)
-;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF)
-;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF)
-;     $1C000-$1FFFF: KERNAL ROM    (C128 $C000-$FFFF)
-;   Bank 3 ($32000-$35FFF): VDC RAM (16KB, overwrites C65 BASIC, ROM write-protect off)
+; MEGA65 Host Memory Layout:
+;
+;   Bank 0 ($00000-$0FFFF): Host code + staging areas
+;     $02001-$02011: BASIC stub (SYS 8210)
+;     $02012+:       Emulator code (main + included modules)
+;     $06000-$06FFF: Directory staging buffer (4KB)
+;     $08000-$09FFF: Character ROM (chargen, 8KB, VIC-IV reads from here)
+;     $0B000-$0BFFF: LOW_RAM_BUFFER (mirror of C128 RAM $0000-$0FFF)
+;
+;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB used)
+;     $10000-$11FFF: Character ROM (chargen, 8KB, for $D000 mapping)
+;     $12000-$127FF: KERNAL $F800-$FFFF relocated (2KB, avoids color RAM window)
+;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF, 16KB)
+;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF, 16KB)
+;     $1C000-$1F7FF: KERNAL ROM    (C128 $C000-$F7FF, 14KB accessible)
+;     $1F800-$1FFFF: (blocked by MEGA65 color RAM window - see $12000)
+;
+;   Bank 2 ($20000-$2FFFF): Screen + color save buffers
+;     $20400-$207E7: VIC screen RAM staging (1KB)
+;     $2A000-$2A3E7: 40-col color save buffer (1000 bytes)
+;     $2A800-$2AFEF: 80-col color save buffer (2000 bytes)
+;
+;   Bank 3 ($30000-$3FFFF): VDC display RAM
+;     $32000-$35FFF: VDC RAM (16KB, overwrites C65 BASIC, ROM write-protect off)
+;
 ;   Bank 4 ($40000-$4FFFF): C128 RAM Bank 0 (64KB)
 ;   Bank 5 ($50000-$5FFFF): C128 RAM Bank 1 (64KB)
 ;
-;   COLPTR at default $0FF80000 (color RAM accessed via 32-bit pointers)
+;   Color RAM at $0FF80000 (accessed via 32-bit pointers)
+;
+; Host Zero Page Usage ($00-$FF):
+;   $02-$04:  c128_a, c128_x, c128_y (emulated CPU registers)
+;   $05:      c128_sp (emulated stack pointer)
+;   $06:      c128_p (emulated processor flags)
+;   $07-$08:  c128_pc (emulated program counter)
+;   $09-$0A:  c128_addr (address scratch)
+;   $0B:      c128_data (data byte scratch)
+;   $0C-$0D:  c128_vec (vector scratch)
+;   $0E-$0F:  c128_tmp, c128_tmp2
+;   $11:      c128_xtra (page-crossing cycle count)
+;   $12:      c128_dec_a (decimal mode saved A)
+;   $14-$17:  c128_zp_ptr (4-byte ZP pointer: lo, $00, bank, $00)
+;   $19:      c128_irq_pending
+;   $1A-$1B:  c128_inst_pc (instruction PC for hooks)
+;   $1C:      c128_nmi_pending
+;   $E0-$E3:  c128_code_ptr (4-byte code-fetch cache pointer)
+;   $E4:      c128_code_page_hi (cached guest PC page)
+;   $E5:      c128_code_valid (code cache valid flag)
+;   $E6:      c128_code_romvis (cached MMU CR for ROM visibility)
+;   $E7:      c128_hook_pc_changed (set by hooks when PC modified)
+;   $E8-$EB:  c128_stack_ptr (4-byte stack pointer: SP, $01, bank, $00)
+;   $F0-$F3:  C128_MEM_PTR (4-byte general memory pointer)
+;   $F4:      c128_saved_data (temp storage for writes)
+;   $F8-$FB:  C128_RAM_PTR (4-byte fast RAM pointer, dedicated)
+;   $FB:      C128H_STR_PTR / DIR_PTR (2 bytes, shared/context-dependent)
 ;
 ; ROM files on SD card:
-;   kernal.bin   = 318020-05  KERNAL     (16KB -> $1C000)
+;   kernal.bin   = 318020-05  KERNAL     (16KB -> $0C000, DMA to $1C000 + $12000)
 ;   basiclo.bin  = 318018-04  BASIC LO   (16KB -> $14000)
 ;   basichi.bin  = 318019-04  BASIC HI   (16KB -> $18000)
-;   chargen.bin  = 390059-01  CHAR ROM   ( 8KB -> $08000, stays there)
+;   chargen.bin  = 390059-01  CHAR ROM   ( 8KB -> $10000, also at $08000)
 ; ============================================================
 
         .cpu "45gs02"
