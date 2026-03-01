@@ -72,7 +72,7 @@ KERNAL_F800_RELOC_HI = $20             ; hi byte of relocated address ($2000)
 CHARGEN_BASE = $08000                   ; MEGA65 flat address of chargen ROM
 
 ; Low RAM buffer in bank 0 host RAM for fast screen/color mirroring
-LOW_RAM_BUFFER  = $A000                 ; 4KB - C128 low RAM $0000-$0FFF mirror
+LOW_RAM_BUFFER  = $B000                 ; 4KB - C128 low RAM $0000-$0FFF mirror
 
 ; Screen base in low RAM buffer
 C128_SCREEN_BASE = $020400  ; MEGA65 screen at bank 2 (avoids C128 RAM bank 4 overlap)
@@ -397,20 +397,21 @@ clear_low_ram_buffer:
 ; ============================================================
 ; Color RAM save/restore buffers in attic RAM:
 ;   $8010000 = 40-col color save (1000 bytes)
-;   $8012000 = 80-col color save (2000 bytes)
+;   $02A000 = 40-col color save (1000 bytes)
+;   $02A800 = 80-col color save (2000 bytes)
 ; Color RAM is at $0FF80000 = MB $FF, bank $0F, addr $8000
 ; ============================================================
-COLOR_40_ADDR = $0000
-COLOR_40_BANK = $01
-COLOR_40_MB   = $80
-COLOR_80_ADDR = $2000
-COLOR_80_BANK = $01
-COLOR_80_MB   = $80
+COLOR_40_ADDR = $A000
+COLOR_40_BANK = $02
+COLOR_40_MB   = $00
+COLOR_80_ADDR = $A800
+COLOR_80_BANK = $02
+COLOR_80_MB   = $00
 
 ; ============================================================
-; init_color_buffers - Fill 40/80 col color save buffers in attic RAM
-; 40-col: light green (13) x 1000 at $8010000
-; 80-col: white (1) x 2000 at $8012000
+; init_color_buffers - Fill 40/80 col color save buffers
+; 40-col: light green (13) x 1000 at $02A000
+; 80-col: white (1) x 2000 at $02A800
 ; ============================================================
 init_color_buffers:
         ; Fill 40-col buffer with light green (13)
@@ -2083,7 +2084,7 @@ _wvdc_is_attr:
         ; If displaying 40-col, redirect to 80-col save buffer in attic RAM
         lda display_showing_80
         bne _wvdc_attr_live
-        ; 40-col display: write to attic buffer at $8012000 + offset
+        ; 40-col display: write to save buffer at $02A800 + offset
         lda vdc_color_ptr+1
         clc
         adc #>COLOR_80_ADDR     ; + $20

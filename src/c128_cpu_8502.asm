@@ -517,6 +517,13 @@ _f8_slow:
         #read_data_fast
         inw c128_pc_lo
         rts
+        lda c128_pc_lo
+        sta c128_addr_lo
+        lda c128_pc_hi
+        sta c128_addr_hi
+        #read_data_fast
+        inw c128_pc_lo
+        rts
 
 ;===========end new
 
@@ -2747,9 +2754,9 @@ hook_40col_scroll:
         .byte $80, $00, $81, $00, $00
         .byte $00               ; copy
         .word 960
-        .word $A428             ; src = LOW_RAM_BUFFER + $0428
+        .word LOW_RAM_BUFFER + $0428 ; src = LOW_RAM_BUFFER + $0428
         .byte $00               ; src bank 0
-        .word $A400             ; dst = LOW_RAM_BUFFER + $0400
+        .word LOW_RAM_BUFFER + $0400 ; dst = LOW_RAM_BUFFER + $0400
         .byte $00               ; dst bank 0
         .byte $00
         .word $0000
@@ -2790,7 +2797,7 @@ hook_40col_scroll:
         .word 40
         .word $0020             ; fill with space ($20)
         .byte $00
-        .word $A7C0             ; dst = LOW_RAM_BUFFER + $07C0
+        .word LOW_RAM_BUFFER + $07C0 ; dst = LOW_RAM_BUFFER + $07C0
         .byte $00
         .byte $00
         .word $0000
@@ -3650,12 +3657,13 @@ op_illegal:
         dec c128_pc_hi
 +       dec c128_pc_lo
 
-        ; Use C128_MEM_PTR ($F0-$F3) as screen pointer at $020400
+        ; Use C128_MEM_PTR ($F0-$F3) as screen pointer at $040400
+        ; (bank 4 = 40-col VIC screen, visible when display_showing_80=0)
         lda #$00
         sta C128_MEM_PTR+0
         lda #$04
         sta C128_MEM_PTR+1
-        lda #$02
+        lda #$04
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3
@@ -3672,9 +3680,9 @@ op_illegal:
         sta [C128_MEM_PTR],z
         inz
         lda c128_pc_hi
-        jsr _ill_write_hex
+        jsr ill_write_hex
         lda c128_pc_lo
-        jsr _ill_write_hex
+        jsr ill_write_hex
 
         ; " OP="
         lda #$20
@@ -3690,7 +3698,7 @@ op_illegal:
         sta [C128_MEM_PTR],z
         inz
         lda last_opcode
-        jsr _ill_write_hex
+        jsr ill_write_hex
 
         ; " A="
         lda #$20
@@ -3703,7 +3711,7 @@ op_illegal:
         sta [C128_MEM_PTR],z
         inz
         lda c128_a
-        jsr _ill_write_hex
+        jsr ill_write_hex
 
         ; " S="
         lda #$20
@@ -3716,7 +3724,7 @@ op_illegal:
         sta [C128_MEM_PTR],z
         inz
         lda c128_sp
-        jsr _ill_write_hex
+        jsr ill_write_hex
 
         ; " M=" (mmu_cr)
         lda #$20
@@ -3729,7 +3737,7 @@ op_illegal:
         sta [C128_MEM_PTR],z
         inz
         lda mmu_cr
-        jsr _ill_write_hex
+        jsr ill_write_hex
 
         ; " R=" (mmu_basic_lo_rom flag)
         lda #$20
@@ -3742,13 +3750,161 @@ op_illegal:
         sta [C128_MEM_PTR],z
         inz
         lda mmu_basic_lo_rom
-        jsr _ill_write_hex
+        jsr ill_write_hex
+
+        ; --- Line 2: IRQ vector, P flags, stack dump ---
+        ; Move to line 2 of 40-col screen ($040400 + 40 = $040428)
+        lda #$28
+        sta C128_MEM_PTR+0      ; offset $28 = 40
+
+        ldz #0
+        ; "V=" (IRQ vector at $0314/$0315)
+        lda #$16                ; 'V'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        ; Read $0315 (hi byte) from C128 RAM bank 4
+        lda #$00
+        sta C128_RAM_PTR+1
+        lda #BANK_RAM0
+        sta C128_RAM_PTR+2
+        lda #$00
+        sta C128_RAM_PTR+3
+        phz
+        ldz #$15
+        lda #$03
+        sta C128_RAM_PTR+1
+        lda [C128_RAM_PTR],z    ; $0315
+        sta c128_tmp2
+        dez
+        lda [C128_RAM_PTR],z    ; $0314
+        sta c128_tmp
+        plz
+        lda c128_tmp2           ; hi byte first
+        jsr ill_write_hex
+        lda c128_tmp            ; lo byte
+        jsr ill_write_hex
+
+        ; " P="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$10                ; 'P'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_p
+        jsr ill_write_hex
+
+        ; " SK=" (stack dump: 8 bytes from SP+1 upward)
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$13                ; 'S'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$0B                ; 'K'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+
+        ; Dump 8 bytes from stack (SP+1 to SP+8)
+        lda c128_sp
+        sta _ill_sp_save
+        ldx #8
+_ill_stack_loop:
+        inc _ill_sp_save
+        phz
+        phy
+        ldz _ill_sp_save
+        lda #$01
+        sta C128_RAM_PTR+1
+        lda #BANK_RAM0
+        sta C128_RAM_PTR+2
+        lda #$00
+        sta C128_RAM_PTR+3
+        lda [C128_RAM_PTR],z    ; read stack byte
+        ply
+        plz
+        jsr ill_write_hex
+        dex
+        bne _ill_stack_loop
+
+        ; --- Line 3: Code cache state ---
+        lda #$50
+        sta C128_MEM_PTR+0
+
+        ldz #0
+        lda #$03                ; 'C'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$16                ; 'V'
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_code_valid
+        jsr ill_write_hex
+        ; " PG="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$10
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$07
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda c128_code_page_hi
+        jsr ill_write_hex
+        ; " KR="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$0B
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$12
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda mmu_kernal_rom
+        jsr ill_write_hex
+        ; " CR="
+        lda #$20
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$03
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$12
+        sta [C128_MEM_PTR],z
+        inz
+        lda #$3D
+        sta [C128_MEM_PTR],z
+        inz
+        lda mmu_cr
+        jsr ill_write_hex
 
 _ill_halt:
         jmp _ill_halt
 
+_ill_sp_save: .byte 0
+
 ; Helper: write byte in A as 2 hex chars at [C128_MEM_PTR],z; advances Z by 2
-_ill_write_hex:
+ill_write_hex:
         pha
         lsr
         lsr

@@ -360,6 +360,14 @@ _not_ff:
         lda vdc_mode_active
         ora display_showing_80
         bne _do_irq_hook
+
+        ; NEW: Also check C128 $D7 directly
+        lda #$D7
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        bmi _do_irq_hook        ; C128 is in 80-col mode, use fast hook
+
         jmp _done_fast
 _do_irq_hook:
         ; Match - save regs and handle
