@@ -63,16 +63,34 @@ BANK_RAM1   = $05                       ; C128 RAM bank 1 in MEGA65 bank 5
 
 ; KERNAL $F800-$FFFF is relocated to $12000-$127FF in bank 1
 ; because $1F800-$1FFFF is hijacked by the MEGA65 color RAM window
-KERNAL_F800_RELOC_HI = $20             ; hi byte of relocated address ($2000)
+; KERNAL_F800_RELOC_HI = $20           ; (unused - code uses hardcoded sbc #$D8)
 
 ; Character ROM location in bank 0
-; chargen.bin (8KB) loaded at $08000-$09FFF (stays at staging area)
-; First 4KB ($08000-$08FFF) = C64 charset
-; Second 4KB ($09000-$09FFF) = C128 charset
-CHARGEN_BASE = $08000                   ; MEGA65 flat address of chargen ROM
+; chargen.bin (8KB) loaded to bank 1 ($10000-$11FFF)
+; First 4KB ($10000-$10FFF) = C64 charset
+; Second 4KB ($11000-$11FFF) = C128 charset
+;
+; NOTE: Chargen is ONLY in bank 1. It is NOT copied to bank 0.
+; $08000-$09FFF in bank 0 is emulator code - do NOT write there.
+;
+; Emulated CPU reads from $D000-$DFFF use read_from_chargen which
+; reads from bank 1 via 32-bit pointer.
+;
+; VIC-IV CHARPTR points to $009000 (bank 0) for 40-col display.
+; This works because the VIC-IV hardware reads through the ROM
+; shadow mapping, which makes the chargen data visible at $9000
+; in bank 0 even though the physical RAM there contains code.
+; DO NOT change CHARPTR to bank 1 - it breaks VDC text rendering.
+;
+; The _d018_charrom handler also uses bank 0 addresses ($9000/$9800)
+; for the same reason. DO NOT change it to bank 1.
+CHARGEN_BASE = $10000                   ; MEGA65 flat address of chargen ROM (bank 1)
 
 ; Low RAM buffer in bank 0 host RAM for fast screen/color mirroring
-LOW_RAM_BUFFER  = $B000                 ; 4KB - C128 low RAM $0000-$0FFF mirror
+LOW_RAM_BUFFER  = $B000                 ; 4KB - C128 low RAM $0000-$0FFF cache
+; Synced from bank 4 via DMA before hooks that read it.
+; Hook writes use c128_write_status / c128_write_zp_x to update both places.
+; File table writes ($0500+) synced back via C128Hook_SyncLowRAMBack.
 
 ; Screen base in low RAM buffer
 C128_SCREEN_BASE = $020400  ; MEGA65 screen at bank 2 (avoids C128 RAM bank 4 overlap)
@@ -286,7 +304,10 @@ C128_VideoInit:
         lda #$00
         sta $D063               ; SCRNPTR[31:24] = $00 -> $020400
 
-        ; Point charset at C128 character ROM
+        ; Point charset at C128 character ROM via bank 0 ROM shadow
+        ; Chargen is physically in bank 1 ($10000), but VIC-IV sees it
+        ; at $9000 in bank 0 through ROM shadow mapping.
+        ; DO NOT change this to bank 1 - it breaks text rendering.
         lda #$00
         sta $D068               ; CHARPTR LSB
         lda #$90
@@ -1031,23 +1052,24 @@ read_from_basic_hi:
         lda [C128_MEM_PTR],z
         rts
 
-; Read from Character ROM: C128 $D000-$DFFF -> MEGA65 $08000-$09FFF
+; Read from Character ROM: C128 $D000-$DFFF -> MEGA65 $10000-$11FFF (bank 1)
 ; The char ROM is 8KB. C128 address $D000 maps to chargen offset $0000.
-; MEGA65 address = $08000 + (addr - $D000)
-; Since chargen is at $08000 in bank 0, and addr_hi=$D0-$DF:
-;   ptr = $08000 + ((addr_hi - $D0) << 8) + addr_lo
-;       = bank 0, high = $80 + (addr_hi - $D0), low = addr_lo
+; MEGA65 address = $10000 + (addr - $D000)
+; Since chargen is at $10000 in bank 1:
+;   ptr = bank 1, high = (addr_hi - $D0), low = addr_lo
+;
+; NOTE: This is for emulated CPU reads only (e.g. PEEK($D000)).
+; VIC-IV display uses CHARPTR at bank 0 $9000 (ROM shadow) - see VideoInit.
 read_from_chargen:
         lda c128_addr_lo
         sta C128_MEM_PTR
         lda c128_addr_hi
         sec
         sbc #$D0                ; Offset from $D000 base
-        clc
-        adc #$80                ; Add $80 base -> $80xx within bank 0
         sta C128_MEM_PTR+1
-        lda #$00                ; Bank 0
+        lda #$01                ; Bank 1
         sta C128_MEM_PTR+2
+        lda #$00
         sta C128_MEM_PTR+3
         ldz #$00
         lda [C128_MEM_PTR],z
@@ -1485,8 +1507,7 @@ _wr_to_ram:
 ; write_ram_direct - Write to physical RAM via 32-bit pointer
 ; ============================================================
 ; write_ram_direct - Write to C128 RAM using physical bank
-; Also mirrors pages $00-$0F to LOW_RAM_BUFFER so the CPU's
-; fast ZP/stack reads stay in sync
+; LOW_RAM_BUFFER sync is handled by forward DMA before hooks.
 ; ============================================================
 write_ram_direct:
         ; Invalidate code cache if writing to current code page
@@ -1511,23 +1532,6 @@ _wrd_do_write:
         lda #$00
         sta C128_MEM_PTR+3
         ldz #$00
-        lda c128_saved_data
-        sta [C128_MEM_PTR],z
-
-        ; Mirror writes to pages $00-$0F to LOW_RAM_BUFFER (bank 0 only)
-        lda C128_MEM_PTR+2
-        cmp #BANK_RAM0
-        bne _wrd_done
-        lda c128_addr_hi
-        cmp #$10
-        bcs _wrd_done
-        ; Reuse Z=0 from above. Just change bank and page offset.
-        clc
-        adc #>LOW_RAM_BUFFER
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+2      ; bank 0
-        ldz c128_addr_lo
         lda c128_saved_data
         sta [C128_MEM_PTR],z
 _wrd_done:
@@ -1742,8 +1746,8 @@ _wv_d018:
         ; In VIC bank 0 ($0000-$3FFF) or bank 2 ($8000-$BFFF),
         ; charset offsets $1000-$1FFF and $1800-$1FFF read from
         ; character ROM instead of RAM. This is a VIC-II hardware
-        ; feature. We emulate this by pointing CHARPTR at our
-        ; chargen ROM in MEGA65 bank 0 at $0A000.
+        ; feature. We emulate this by pointing CHARPTR at the
+        ; chargen ROM shadow in MEGA65 bank 0 at $09000.
 
         ; --- Update CHARPTR ---
         lda c128_saved_data
@@ -1767,19 +1771,10 @@ _wv_d018:
         sta $D06A
         jmp _d018_screen
 
-;_d018_charrom:
-;        ; Point at chargen in bank 1 at $10000
-;        lda #$00
-;        sta $D068
-;        lda _d018_char_hi
-;        sec
-;        sbc #$10                ; $10 -> $00, $18 -> $08
-;        sta $D069
-;        lda #$01
-;        sta $D06A
-
 _d018_charrom:
-        ; Point at chargen at $9000 in bank 0
+        ; Point CHARPTR at chargen via bank 0 ROM shadow addresses
+        ; Chargen data lives in bank 1, but VIC-IV sees it at bank 0 $9000
+        ; through ROM shadow mapping. DO NOT change to bank 1.
         ; $D018 charset offset $10 -> $9000 (uppercase/graphics)
         ; $D018 charset offset $18 -> $9800 (lowercase/uppercase)
         lda #$00
@@ -1805,14 +1800,6 @@ _d018_screen:
         sta $D061
         lda #BANK_RAM0
         sta $D062
-
-        ; Debug: log D018 writes
-        lda c128_saved_data
-        sta $7750               ; raw D018 value
-        lda _d018_scrn_hi
-        sta $7751               ; computed screen hi byte
-        lda _d018_char_hi
-        sta $7752               ; computed char hi byte
 
         rts
 

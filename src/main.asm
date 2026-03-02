@@ -6,9 +6,8 @@
 ;
 ;   Bank 0 ($00000-$0FFFF): Host code + staging areas
 ;     $02001-$02011: BASIC stub (SYS 8210)
-;     $02012+:       Emulator code (main + included modules)
-;     $06000-$06FFF: Directory staging buffer (4KB)
-;     $08000-$09FFF: Character ROM (chargen, 8KB, VIC-IV reads from here)
+;     $02012-$0A203: Emulator code (main + included modules)
+;     $0A400-$0AFFF: Directory staging buffer (~3KB)
 ;     $0B000-$0BFFF: LOW_RAM_BUFFER (mirror of C128 RAM $0000-$0FFF)
 ;
 ;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB used)
@@ -62,7 +61,8 @@
 ;   kernal.bin   = 318020-05  KERNAL     (16KB -> $0C000, DMA to $1C000 + $12000)
 ;   basiclo.bin  = 318018-04  BASIC LO   (16KB -> $14000)
 ;   basichi.bin  = 318019-04  BASIC HI   (16KB -> $18000)
-;   chargen.bin  = 390059-01  CHAR ROM   ( 8KB -> $10000, also at $08000)
+;   chargen.bin  = 390059-01  CHAR ROM   ( 8KB -> $10000 in bank 1 only)
+;                                         DO NOT copy to bank 0 - $08000 is emulator code
 ; ============================================================
 
         .cpu "45gs02"
@@ -135,9 +135,25 @@ start:
         .word $0000
 
         ; ============================================================
-        ; Load roms.bin (64KB) byte-by-byte into bank 1 ($10000-$1FFFF)
+        ; Clear LOW_RAM_BUFFER ($B000-$BFFF) to match cleared C128 RAM
+        ; This mirrors bank 4 pages $00-$0F for fast ZP/stack access
+        ; ============================================================
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word $1000             ; count = 4KB
+        .word $0000             ; fill with $00
+        .byte $00
+        .word $B000             ; dest = LOW_RAM_BUFFER
+        .byte $00               ; dest bank 0
+        .byte $00
+        .word $0000
+
+        ; ============================================================
+        ; Load ROM files into bank 1 ($10000-$1FFFF)
         ; File layout: chargen@$0000, basiclo@$4000, basichi@$8000, kernal@$C000
-        ; Also copies chargen ($10000-$11FFF) to $08000 for VIC-IV
+        ; Chargen also DMA copied to bank 0 $08000 for VIC-IV + ROM read path
         ; ============================================================
 
         ; kernal
@@ -286,6 +302,11 @@ start:
         ldx #$00
         ldy #$00
         jsr LOAD
+
+        ; Chargen stays in bank 1 at $10000-$11FFF only.
+        ; DO NOT DMA copy to bank 0 - $08000-$09FFF is emulator code.
+        ; VIC-IV CHARPTR uses bank 0 ROM shadow at $9000 (hardware mapping).
+        ; Emulated CPU reads use read_from_chargen which reads bank 1 directly.
 
         ; ============================================================
         ; Toggle ROM write-protect off (banks 2-3)

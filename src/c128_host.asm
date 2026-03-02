@@ -86,10 +86,21 @@ c128h_save_pc_hi: .byte 0
 ; bytes to physical bank 4 so the CPU can read them.
 ; ============================================================
 C128Host_StartPrint:
-        ; Save original bytes from injection point (LOW_RAM_BUFFER copy)
+        ; Save original bytes from injection point in bank 4
+        ; (LOW_RAM_BUFFER may be stale - fast ZP ops bypass mirror)
+        lda #<C128_INJECT_ADDR
+        sta C128_MEM_PTR+0
+        lda #>C128_INJECT_ADDR
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
         ldx #0
 c128h_sp_save_loop:
-        lda LOW_RAM_BUFFER + C128_INJECT_ADDR,x
+        txa
+        taz
+        lda [C128_MEM_PTR],z
         sta c128h_saved_ram,x
         inx
         cpx #C128_INJECT_SIZE

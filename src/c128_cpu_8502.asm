@@ -153,11 +153,6 @@ _wdf_write\@:
         ldz c128_addr_lo
         lda c128_data
         sta [C128_RAM_PTR],z
-        ; Mirror pages $00-$0F to LOW_RAM_BUFFER for hook access
-        lda c128_addr_hi
-        cmp #$10
-        bcs _wdf_done\@
-        jsr mirror_to_lrb
         bra _wdf_done\@
 _wdf_bank1\@:
         ; Bank 1 selected: check shared region
@@ -172,17 +167,13 @@ _wdf_bank1\@:
         sta [C128_RAM_PTR],z
         ldx #BANK_RAM0
         stx C128_RAM_PTR+2      ; Restore bank 4
-        bra _wdf_done\@         ; No mirror for bank 1
+        bra _wdf_done\@
 _wdf_b1_shared\@:
-        ; Shared bottom: write to bank 4, mirror as usual
+        ; Shared bottom: write to bank 4
         sta C128_RAM_PTR+1
         ldz c128_addr_lo
         lda c128_data
         sta [C128_RAM_PTR],z
-        lda c128_addr_hi
-        cmp #$10
-        bcs _wdf_done\@
-        jsr mirror_to_lrb
         bra _wdf_done\@
 _wdf_inv\@:
         lda #0
@@ -317,23 +308,6 @@ c128_hook_pc_changed = $E7  ; Set by hooks when they modify PC
 c128_stack_ptr      = $E8   ; 4 bytes: dedicated stack pointer (lo=SP, hi=$01, bank, $00)
 c128_zp_ptr         = $14   ; 4 bytes: dedicated ZP pointer (lo=addr, hi=$00, bank4, $00)
 
-; Helper: mirror a bank 0 write to LOW_RAM_BUFFER
-; Called after writing to bank 4 pages $00-$0F
-; c128_addr_hi < $10 guaranteed by caller, c128_data has value
-mirror_to_lrb:
-        lda c128_addr_hi
-        clc
-        adc #>LOW_RAM_BUFFER    ; $A0 + page = LOW_RAM_BUFFER page
-        sta C128_RAM_PTR+1
-        lda #$00
-        sta C128_RAM_PTR+2      ; bank 0
-        ldz c128_addr_lo
-        lda c128_data
-        sta [C128_RAM_PTR],z
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2      ; Restore bank 4
-        rts
-
 ; Call this when you want to force cache rebuild (optional helper)
 invalidate_code_cache:
         lda #$00
@@ -363,7 +337,7 @@ _f8op_done\@:
 ; -----------------------------------------------------------------
 ; fetch8_fast: A = mem[PC], PC++
 ; Fast path for:
-;   - $0000-$0FFF via LOW_RAM_BUFFER mirror
+;   - $0000-$0FFF via bank 4 (same as other RAM)
 ;   - $1000-$3FFF via BANK_RAM0/1 (always RAM)
 ;   - $4000-$FFFF via BANK_ROM when ROM mapped, else BANK_RAM
 ; Slow fallback for:
@@ -482,20 +456,6 @@ _f8_build_ram:
         jsr get_physical_bank   ; Returns MEGA65 bank in A
         sta c128_code_ptr+2
         lda #$00
-        sta c128_code_ptr+3
-        lda #$01
-        sta c128_code_valid
-        jmp _f8_do_read
-
-_f8_build_low:
-        lda #$00
-        sta c128_code_ptr+0
-        lda c128_pc_hi
-        clc
-        adc #>LOW_RAM_BUFFER
-        sta c128_code_ptr+1
-        lda #$00
-        sta c128_code_ptr+2
         sta c128_code_ptr+3
         lda #$01
         sta c128_code_valid
@@ -682,27 +642,6 @@ lrb_inc_x:
         adc #1
         sta [c128_zp_ptr],z
         rts
-
-; Helper: set C128_MEM_PTR to LOW_RAM_BUFFER base (call before [C128_MEM_PTR],z access)
-setup_lrb:
-        lda #>LOW_RAM_BUFFER
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        rts
-
-; Macro: inline setup of C128_MEM_PTR to LOW_RAM_BUFFER
-; Clobbers A only
-setup_lrb_inline .macro
-        lda #>LOW_RAM_BUFFER
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        .endm
 
 ; Macro: inline setup of C128_MEM_PTR to bank 4 page 0 (for ZP access)
 setup_bank4_zp .macro
@@ -2748,19 +2687,6 @@ hook_40col_scroll:
         .byte $00
         .word $0000
 
-        ; --- DMA scroll: LOW_RAM_BUFFER screen mirror (bank 0) ---
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00               ; copy
-        .word 960
-        .word LOW_RAM_BUFFER + $0428 ; src = LOW_RAM_BUFFER + $0428
-        .byte $00               ; src bank 0
-        .word LOW_RAM_BUFFER + $0400 ; dst = LOW_RAM_BUFFER + $0400
-        .byte $00               ; dst bank 0
-        .byte $00
-        .word $0000
-
         ; (40-col mode: MEGA65 SCRNPTR points at $040400 in bank 4 directly,
         ; so the bank 4 DMA above handles the display. No bank 2 copy needed.)
         ; --- DMA scroll: MEGA65 color RAM ---
@@ -2786,19 +2712,6 @@ hook_40col_scroll:
         .byte $00
         .word $07C0             ; dst = $0407C0 (row 24 = offset 960)
         .byte $04
-        .byte $00
-        .word $0000
-
-        ; --- DMA fill: clear bottom line in LOW_RAM_BUFFER ---
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03               ; fill
-        .word 40
-        .word $0020             ; fill with space ($20)
-        .byte $00
-        .word LOW_RAM_BUFFER + $07C0 ; dst = LOW_RAM_BUFFER + $07C0
-        .byte $00
         .byte $00
         .word $0000
 
@@ -2828,7 +2741,6 @@ _h4s_color_val:
         ; --- Update line link bitmap at $035E-$0361 in bank 4 ---
         ; Bitmap layout: byte 0 ($035E) bit7=line0 ... byte 3 ($0361) bit7=line24
         ; Scroll up = shift entire 32-bit value left by 1
-        ; Read from bank 4, update, write back to bank 4 AND LOW_RAM_BUFFER
         lda #$03
         sta C128_RAM_PTR+1      ; page 3
 
@@ -2836,26 +2748,22 @@ _h4s_color_val:
         lda [C128_RAM_PTR],z
         asl                     ; shift left, bit 7 -> carry
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $0361
 
         ldz #$60                ; $0360
         lda [C128_RAM_PTR],z
         rol                     ; shift left with carry
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $0360
 
         ldz #$5F                ; $035F
         lda [C128_RAM_PTR],z
         rol
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $035F
 
         ldz #$5E                ; $035E
         lda [C128_RAM_PTR],z
         rol
         and #$7F                ; clear line 0 link bit (top line always unlinked)
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $035E
 
         ; Restore C128_RAM_PTR page to 0 (convention)
         lda #$00
@@ -4393,7 +4301,7 @@ op_05:
 op_06:
         jsr fetch8
         tax
-        ; ASL directly in LOW_RAM_BUFFER
+        ; ASL directly in bank 4 via c128_zp_ptr
         jsr lrb_asl_x
         ; Update carry flag
         lda c128_p
@@ -4539,7 +4447,7 @@ op_16:
         clc
         adc c128_x
         tax
-        ; ASL directly in LOW_RAM_BUFFER
+        ; ASL directly in bank 4 via c128_zp_ptr
         jsr lrb_asl_x
         ; Update carry flag
         lda c128_p
@@ -5728,7 +5636,7 @@ op_94:
 
 ; $95 STA zp,X
 op_95:
-        ; Optimized STA zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized STA zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -5741,7 +5649,7 @@ op_95:
 
 ; $96 STX zp,Y
 op_96:
-        ; Optimized STX zp,Y - direct access to LOW_RAM_BUFFER
+        ; Optimized STX zp,Y - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_y
@@ -5960,7 +5868,7 @@ op_b4:
 
 ; $B5 LDA zp,X
 op_b5:
-        ; Optimized LDA zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized LDA zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -5975,7 +5883,7 @@ op_b5:
 
 ; $B6 LDX zp,Y
 op_b6:
-        ; Optimized LDX zp,Y - direct access to LOW_RAM_BUFFER
+        ; Optimized LDX zp,Y - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_y
@@ -6200,7 +6108,7 @@ op_d5:
 
 ; $D6 DEC zp,X
 op_d6:
-        ; Optimized DEC zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized DEC zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -6405,7 +6313,7 @@ op_f5:
 
 ; $F6 INC zp,X
 op_f6:
-        ; Optimized INC zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized INC zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x

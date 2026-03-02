@@ -81,7 +81,7 @@ ZP_PTRS_COUNT = 10
 C128_BANK_RAM     = $05           ; emulated C128 RAM lives in MEGA65 bank 5
 
 ; Host-side staging buffer (bank 0 address)
-C128_DIR_BUF      = $6000         ; 4KB staging buffer in bank 0
+C128_DIR_BUF      = $A400         ; Staging buffer above code end ($A203), below LOW_RAM_BUFFER ($B000)
 
 ; MEGA65 KERNAL SAVE (may not be in main.asm)
 SAVE            = $FFD8
@@ -228,26 +228,32 @@ _do_setlfs:
         jmp _done
 
 _do_save:
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnSAVE
         jmp _done
 
 _do_open:
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnOPEN
         jmp _done
 
 _do_close:
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnCLOSE
         jmp _done
 
 _do_chkin:
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnCHKIN
         jmp _done
 
 _do_chkout:
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnCHKOUT
         jmp _done
 
 _do_clrchn:
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnCLRCHN
         jmp _done
 
@@ -255,6 +261,7 @@ _do_chrin:
         lda seq_input_slot
         cmp #$FF
         beq _done               ; No file input - let ROM handle
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnCHRIN
         jmp _done
 
@@ -343,6 +350,7 @@ _do_load_direct:
         
 _do_load_monitor:
         ; Monitor or other non-BASIC caller - handle LOAD here
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnLOAD
         jmp _done
 
@@ -422,6 +430,7 @@ _check_f9:
         pha
         tya
         pha
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnDIRECTORY
         jmp _done
 
@@ -469,6 +478,7 @@ _check_a8_load:
         pha
         tya
         pha
+        jsr C128Hook_SyncLowRAM
         jsr C128Hook_OnLOAD
         jmp _done
 
@@ -729,7 +739,7 @@ _load_file_error:
         lda #$04                        ; FILE NOT FOUND
         sta c128_a
         lda #$42
-        sta LOW_RAM_BUFFER + $90        ; Also set STATUS byte!
+        jsr c128_write_status
         
         ; Check if this was a monitor/direct load or BASIC load
         lda c128_monitor_load
@@ -1020,13 +1030,12 @@ _dhl_load_ok:
         beq _dhl_error_set
 
 _dhl_has_data:
-        ; We loaded directly to bank 5, so we need to sync LOW_RAM_BUFFER
-        ; for addresses $0000-$0FFF if the load touched that area
-        jsr C128Hook_SyncLowRAMFromBank5
+        ; Sync loaded data from bank 5 to bank 4 (shared RAM) and LOW_RAM_BUFFER
+        jsr C128Hook_SyncAfterBank5Load
         
         ; Clear KERNAL status
         lda #$00
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         
         ; Set end address in X/Y registers
         clc
@@ -1073,7 +1082,7 @@ _dhl_error_set_status:
         lda #$04                        ; FILE NOT FOUND
         sta c128_a
         lda #$42
-        sta LOW_RAM_BUFFER + $90        ; set STATUS byte
+        jsr c128_write_status
 
 _dhl_set_pc:
         ; Clear file operation flag - allow video mode switching again
@@ -1354,7 +1363,7 @@ _dhs_chkout_error:
 _dhs_ok:
         ; Clear KERNAL status in guest
         lda #$00
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         
         ; Clear carry = success in guest P register
         lda c128_p
@@ -2846,21 +2855,28 @@ _open_copy_done:
         sta LOW_RAM_BUFFER + $0513,x    ; FAT[x] = device
         lda LOW_RAM_BUFFER + $AD        ; SA from SETLFS
         ora #$60                        ; Set bits 5+6 like KERNAL does
-        sta LOW_RAM_BUFFER + $AD        ; Update SETLFS work area too
+        phx
+        ldx #$AD
+        jsr c128_write_zp_x            ; Write $AD to both places
+        plx
         sta LOW_RAM_BUFFER + $051D,x    ; SAT[x] = secondary address
         
         ; Increment file count
-        inc LOW_RAM_BUFFER + $97
+        phx
+        ldx #$97
+        jsr c128_inc_zp_x
+        plx
         
 _open_table_full:
         ; Set success status in guest
         lda #$00
-        sta LOW_RAM_BUFFER + $90        ; Clear status
+        jsr c128_write_status
         lda c128_p
         and #((~P_C) & $FF)             ; Clear carry
         sta c128_p
         
         ; Return via RTS to guest
+        jsr C128Hook_SyncLowRAMBack     ; Flush file tables to bank 4
         jsr C128Hook_RTS_Guest
         rts
 
@@ -2879,10 +2895,11 @@ _open_error_no_file:
         
 _open_set_error:
         sta c128_a
-        sta LOW_RAM_BUFFER + $90        ; Set status
+        jsr c128_write_status
         lda c128_p
         ora #P_C                        ; Set carry
         sta c128_p
+        jsr C128Hook_SyncLowRAMBack     ; Flush file tables to bank 4
         jsr C128Hook_RTS_Guest
         rts
 
@@ -2980,7 +2997,10 @@ _close_find_lat:
 _close_found_lat:
         ; Found at index X - shift subsequent entries down
         ; First decrement file count
-        dec LOW_RAM_BUFFER + $97
+        phx
+        ldx #$97
+        jsr c128_dec_zp_x
+        plx
         
 _close_shift_loop:
         inx
@@ -3012,6 +3032,7 @@ _close_not_open:
         lda c128_p
         and #((~P_C) & $FF)
         sta c128_p
+        jsr C128Hook_SyncLowRAMBack     ; Flush file tables to bank 4
         jsr C128Hook_RTS_Guest
         rts
 
@@ -3067,7 +3088,7 @@ _chkin_not_open:
         ; File not open error
         lda #$03
         sta c128_a
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         lda c128_p
         ora #P_C
         sta c128_p
@@ -3129,7 +3150,7 @@ _chkout_not_open:
         ; File not open error
         lda #$03
         sta c128_a
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         lda c128_p
         ora #P_C
         sta c128_p
@@ -4186,7 +4207,7 @@ C128Hook_OnCHRIN:
         sta seq_slot_status,x
         
         ; Also update guest status byte
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         
         ; Return the byte in guest A
         lda _chrin_byte
@@ -4205,7 +4226,7 @@ _chrin_eof:
         lda #$00
         sta c128_a
         lda #$40
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         lda c128_p
         and #((~P_C) & $FF)
         sta c128_p
@@ -4246,7 +4267,7 @@ C128Hook_OnCHROUT:
         ldx seq_output_slot
         ora seq_slot_status,x
         sta seq_slot_status,x
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         
         ; Clear carry for success
         lda c128_p
@@ -4300,7 +4321,7 @@ C128Hook_OnGETIN:
         sta seq_slot_status,x
         
         ; Also update guest status byte
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         
         ; Return the byte in guest A
         lda _getin_byte
@@ -4319,7 +4340,7 @@ _getin_eof:
         lda #$00
         sta c128_a
         lda #$40
-        sta LOW_RAM_BUFFER + $90
+        jsr c128_write_status
         lda c128_p
         and #((~P_C) & $FF)
         sta c128_p
@@ -4352,19 +4373,110 @@ _pfov_done:
         rts
 
 ; ============================================================
-; C128Hook_SyncLowRAMFromBank5 - Sync LOW_RAM_BUFFER from bank 5
-; Called after loading directly to bank 5 to update the cached
-; copy of $0000-$0FFF in LOW_RAM_BUFFER
+; C128Hook_SyncLowRAM - Sync LOW_RAM_BUFFER from bank 4
+; Called before hook dispatch so hooks read current ZP/low RAM.
+; Fast ZP opcodes (STA zp etc) write directly to bank 4,
+; bypassing the LOW_RAM_BUFFER mirror. This DMA copy brings
+; the mirror up to date.
 ; ============================================================
-C128Hook_SyncLowRAMFromBank5:
+C128Hook_SyncLowRAM:
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = 0
+        .byte $81, $00          ; dst MB = 0
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $1000             ; count = 4KB ($0000-$0FFF)
+        .word $0000             ; src addr = $0000
+        .byte $04               ; src bank 4
+        .word LOW_RAM_BUFFER    ; dst addr = $B000
+        .byte $00               ; dst bank 0
+        .byte $00
+        .word $0000
+        rts
+
+; ============================================================
+; DMA sync: copy LOW_RAM_BUFFER pages 0-5 back to bank 4
+; Called after OPEN/CLOSE which modify file tables at $0500+
+; ============================================================
+C128Hook_SyncLowRAMBack:
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = 0
+        .byte $81, $00          ; dst MB = 0
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $0600             ; count = pages 0-5 (1.5KB)
+        .word LOW_RAM_BUFFER    ; src = $B000
+        .byte $00               ; src bank 0
+        .word $0000             ; dst = $0000
+        .byte $04               ; dst bank 4
+        .byte $00
+        .word $0000
+        rts
+
+; ============================================================
+; Helpers: Write to BOTH LOW_RAM_BUFFER and bank 4
+; Hooks read from LOW_RAM_BUFFER (fast absolute addressing).
+; Emulated CPU reads from bank 4. Both must stay in sync.
+; ============================================================
+
+; Write A to status byte ($0090) in both places
+; Preserves: A, Y
+c128_write_status:
+        sta LOW_RAM_BUFFER + $90
+        phx
+        ldx #$90
+        stx c128_zp_ptr+0
+        ldz #0
+        sta [c128_zp_ptr],z
+        plx
+        rts
+
+; Write A to ZP offset X in both places
+; Preserves: A
+c128_write_zp_x:
+        sta LOW_RAM_BUFFER,x
+        stx c128_zp_ptr+0
+        ldz #0
+        sta [c128_zp_ptr],z
+        rts
+
+; Inc ZP offset X in both places
+; Clobbers: A
+c128_inc_zp_x:
+        inc LOW_RAM_BUFFER,x
+        stx c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        inc a
+        sta [c128_zp_ptr],z
+        rts
+
+; Dec ZP offset X in both places
+; Clobbers: A
+c128_dec_zp_x:
+        dec LOW_RAM_BUFFER,x
+        stx c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        dec a
+        sta [c128_zp_ptr],z
+        rts
+
+; ============================================================
+; C128Hook_SyncAfterBank5Load - Sync after loading to bank 5
+; Copies loaded data from bank 5 to bank 4 (shared low RAM region)
+; and to LOW_RAM_BUFFER, so both the emulated CPU and hooks see it.
+; Only syncs if load destination was in $0000-$0FFF range.
+; ============================================================
+C128Hook_SyncAfterBank5Load:
         ; Check if load touched low RAM area ($0000-$0FFF)
-        ; If dest >= $1000, no need to sync
         lda c128_dir_dest_hi
         cmp #$10
         bcs _sync_b5_done               ; dest >= $1000, nothing to sync
         
         ; Calculate the range to sync
-        ; Start = dest address (clamped to $0000)
         lda c128_dir_dest_lo
         sta _sync_b5_start_lo
         lda c128_dir_dest_hi
@@ -4389,7 +4501,6 @@ C128Hook_SyncLowRAMFromBank5:
         sta _sync_b5_end_hi
         
 _sync_b5_calc_len:
-        ; Calculate length = end - start
         lda _sync_b5_end_lo
         sec
         sbc _sync_b5_start_lo
@@ -4402,35 +4513,52 @@ _sync_b5_calc_len:
         ora _sync_b5_len_lo
         beq _sync_b5_done
         
-        ; Fill in DMA list
-        ; Count
+        ; Fill in DMA lists
         lda _sync_b5_len_lo
         sta _sync_b5_dma_count
+        sta _sync_b5_dma_count2
         lda _sync_b5_len_hi
         sta _sync_b5_dma_count+1
+        sta _sync_b5_dma_count2+1
         
         ; Source address (bank 5)
         lda _sync_b5_start_lo
         sta _sync_b5_dma_src
+        sta _sync_b5_dma_src2
         lda _sync_b5_start_hi
         sta _sync_b5_dma_src+1
+        sta _sync_b5_dma_src2+1
         
-        ; Dest address (LOW_RAM_BUFFER + start offset)
+        ; Dest 1: bank 4 (same address as source)
+        lda _sync_b5_start_lo
+        sta _sync_b5_dma_dst
+        lda _sync_b5_start_hi
+        sta _sync_b5_dma_dst+1
+        
+        ; Dest 2: LOW_RAM_BUFFER + offset
         clc
         lda _sync_b5_start_lo
         adc #<LOW_RAM_BUFFER
-        sta _sync_b5_dma_dst
+        sta _sync_b5_dma_dst2
         lda _sync_b5_start_hi
         adc #>LOW_RAM_BUFFER
-        sta _sync_b5_dma_dst+1
+        sta _sync_b5_dma_dst2+1
         
-        ; DMA copy from bank 5 to LOW_RAM_BUFFER
+        ; DMA 1: bank 5 -> bank 4 (shared RAM)
         lda #$00
-        sta $D702                       ; DMA list bank 0
+        sta $D702
         lda #>_sync_b5_dma_list
-        sta $D701                       ; High byte
+        sta $D701
         lda #<_sync_b5_dma_list
-        sta $D700                       ; Low byte triggers DMA
+        sta $D700
+
+        ; DMA 2: bank 5 -> LOW_RAM_BUFFER
+        lda #$00
+        sta $D702
+        lda #>_sync_b5_dma_list2
+        sta $D701
+        lda #<_sync_b5_dma_list2
+        sta $D700
         
 _sync_b5_done:
         rts
@@ -4442,18 +4570,33 @@ _sync_b5_end_hi:   .byte 0
 _sync_b5_len_lo:   .byte 0
 _sync_b5_len_hi:   .byte 0
 
+; DMA list 1: bank 5 -> bank 4
 _sync_b5_dma_list:
         .byte $00                       ; Command: COPY
 _sync_b5_dma_count:
-        .word $0000                     ; Count (filled in)
+        .word $0000
 _sync_b5_dma_src:
-        .word $0000                     ; Source address (filled in)
-        .byte C128_BANK_RAM               ; Source bank 5
+        .word $0000
+        .byte C128_BANK_RAM             ; Source bank 5
 _sync_b5_dma_dst:
-        .word $0000                     ; Dest address (filled in = LOW_RAM_BUFFER + offset)
+        .word $0000
+        .byte BANK_RAM0                 ; Dest bank 4
+        .byte $00
+        .word $0000
+
+; DMA list 2: bank 5 -> LOW_RAM_BUFFER
+_sync_b5_dma_list2:
+        .byte $00                       ; Command: COPY
+_sync_b5_dma_count2:
+        .word $0000
+_sync_b5_dma_src2:
+        .word $0000
+        .byte C128_BANK_RAM             ; Source bank 5
+_sync_b5_dma_dst2:
+        .word $0000
         .byte $00                       ; Dest bank 0
-        .byte $00                       ; Sub-command
-        .word $0000                     ; Modulo
+        .byte $00
+        .word $0000
 ; ============================================================
 ; C128Hook_Crunch - Native BASIC tokenizer
 ; Called when Crunch Tokens vector ($0304) is hit
