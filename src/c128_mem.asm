@@ -86,7 +86,7 @@ BANK_RAM1   = $05                       ; C128 RAM bank 1 in MEGA65 bank 5
 ; for the same reason. DO NOT change it to bank 1.
 CHARGEN_BASE = $10000                   ; MEGA65 flat address of chargen ROM (bank 1)
 
-; Low RAM buffer in bank 0 host RAM for fast screen/color mirroring
+; Low RAM buffer in bank 0 host RAM, DMA-synced from bank 4 before hooks
 LOW_RAM_BUFFER  = $B000                 ; 4KB - C128 low RAM $0000-$0FFF cache
 ; Synced from bank 4 via DMA before hooks that read it.
 ; Hook writes use c128_write_status / c128_write_zp_x to update both places.
@@ -191,11 +191,11 @@ VDC_RAM_BASE = $2000            ; base offset within bank ($32000)
 ; Video state
 ; ============================================================
 c128_charset_dirty: .byte 0
-c128_video_mode:    .byte 0       ; 0=text, 1=bitmap
 c128_file_op_active: .byte 0
 vdc_mode_active:    .byte 0       ; 0=40-col (no VDC render), 1=80-col (VDC active)
 vdc_screen_dirty:   .byte 1       ; 1=screen RAM changed, needs DMA copy
 vdc_attr_dirty:     .byte 1       ; 1=attribute RAM changed, needs translation
+fco_offset_dirty:   .byte 1       ; 1=attr offset cache invalid (R12/R13/R20/R21 changed)
 
 ; ============================================================
 ; C128_MemInit - Initialize memory system
@@ -1700,13 +1700,8 @@ write_vic_register:
         beq _wv_d020
         cpx #$21
         beq _wv_d021
-        ; Other VIC registers: also write to real VIC-IV
-        ; (sprite regs, scroll, etc.)
-        ;lda c128_saved_data
-        ;sta $D000,x
-        ;rts
-        ; Other VIC registers: also write to real VIC-IV
-        ; (sprite regs, scroll, etc.)
+        ; Other VIC registers: write to real VIC-IV (sprite regs, scroll, etc.)
+        ; Skip $D02F/$D030 (VIC-III/IV extended regs, not present on VIC-II)
         cpx #$2F
         beq _wv_ignore
         cpx #$30
@@ -1988,10 +1983,12 @@ _wvdc_done:
 _wvdc_mark_scr_dirty:
         lda #1
         sta vdc_screen_dirty
+        sta fco_offset_dirty    ; screen start changed, invalidate attr offset cache
         rts
 _wvdc_mark_attr_dirty:
         lda #1
         sta vdc_attr_dirty
+        sta fco_offset_dirty    ; attr start changed, invalidate attr offset cache
         rts
 _wvdc_update_colors:
         ; R26 written: high nibble = FG, low nibble = BG
@@ -2123,27 +2120,6 @@ _wvdc_data_skip:
         bne +
         inc vdc_regs+18
 +       rts
-
-;_wvdc_word_count:
-;        ; R30: Writing word count triggers block copy or fill
-;        ; The VDC copies/fills (count+1) bytes starting at R18:R19
-;        ; Bit 5 of R24 selects copy (0) vs fill (1)
-;        ; For now: just advance R18:R19 by (count+1) so address is correct after
-;        lda c128_saved_data
-;        sta vdc_regs+30
-;        ; Advance address by (value + 1)
-;        clc
-;        lda vdc_regs+19
-;        adc c128_saved_data
-;        sta vdc_regs+19
-;        lda vdc_regs+18
-;        adc #$00
-;        sta vdc_regs+18
-        ; +1 more
-;        inc vdc_regs+19
-;        bne +
-;        inc vdc_regs+18
-;+       rts
 
 
 _wvdc_word_count:
@@ -2460,9 +2436,6 @@ _hex_chars:
 ; ============================================================
 BANK_RAM        = BANK_RAM0             ; Default RAM bank alias
 
-; Stub variable referenced by hooks (bitmap mode not yet implemented)
-c128_gfx_dirty:     .byte 0
-
 ; Stub routines (bitmap/graphics not yet implemented for C128)
 C128Vid_DisableHostBitmap:
         rts
@@ -2535,8 +2508,8 @@ _vdc_dma_scr_bank:
 _vdc_skip_screen_dma:
 
         ; --- Step 2: Translate VDC attribute RAM -> MEGA65 color RAM ---
-        ; DISABLED: Attributes are now translated inline during R31 writes.
-        ; The batch loop is only needed after R30 block fill/copy operations
+        ; Individual R31 writes are translated inline during writes.
+        ; This batch loop only runs after R30 block fill/copy operations
         ; which set vdc_attr_dirty.
         lda vdc_attr_dirty
         beq _vdc_skip_attr

@@ -51,11 +51,6 @@ P_N = %10000000
 ; C128 keyboard state (CIA1-based, no separate selector register)
 c128_kbd_col:        .byte $FF  ; Last keyboard column written to CIA1 $DC00
 
-; Debug trace variables
-c128_trace_enabled:    .byte $00  ; Set to 1 after LOAD to enable tracing
-c128_trace_pos_lo:     .byte $00  ; Screen position low byte
-c128_trace_pos_hi:     .byte $08  ; Screen position high byte ($0800)
-
 ; VIC-II timing constants (PAL)
 VIC_CYCLES_PER_LINE = 63    ; 63 cycles per scanline (VIC-II PAL)
 VIC_LINES_PER_FRAME = 312   ; PAL has 312 lines
@@ -308,12 +303,6 @@ c128_hook_pc_changed = $E7  ; Set by hooks when they modify PC
 c128_stack_ptr      = $E8   ; 4 bytes: dedicated stack pointer (lo=SP, hi=$01, bank, $00)
 c128_zp_ptr         = $14   ; 4 bytes: dedicated ZP pointer (lo=addr, hi=$00, bank4, $00)
 
-; Call this when you want to force cache rebuild (optional helper)
-invalidate_code_cache:
-        lda #$00
-        sta c128_code_valid
-        rts
-
 ; -----------------------------------------------------------------
 ; fetch8_operand: Inline operand fetch when cache is likely valid.
 ; Must check code_valid since I/O pages ($D0-$DF, $FF) are never cached.
@@ -477,17 +466,6 @@ _f8_slow:
         #read_data_fast
         inw c128_pc_lo
         rts
-        lda c128_pc_lo
-        sta c128_addr_lo
-        lda c128_pc_hi
-        sta c128_addr_hi
-        #read_data_fast
-        inw c128_pc_lo
-        rts
-
-;===========end new
-
-
 
 
 ; --- fetch16_to_addr ---
@@ -1484,11 +1462,9 @@ cpu_take_nmi:
         rts
 
 ; --- Reset/Step ---
-C128CPU_Reset:
 C128_CPUReset:
         ; Reset video mode first
         lda #0
-        sta c128_video_mode
         sta c128_file_op_active
         
         ; Re-initialize memory system (MMU, VIC, CIA shadows)
@@ -1898,9 +1874,10 @@ C128CPU_StepDecode_hooks:
         ; Instead of linear chain of comparisons, use lookup table
         ; --------------------------------------------------------
         lda c128_pc_hi
+        cmp #$03
+        beq _hook_chrget       ; Page $03: CHRGET/CHRGOT
         cmp #$40
         bcc step_fetch         ; Skip all hooks if PC < $4000 (RAM)
-
         ; Table lookup: 1 load + 1 branch for non-hooked pages
         tax
         lda hook_page_flags,x
@@ -2556,8 +2533,364 @@ _hook_vdc_poll_skip:
         #finish_cycles_inline
         rts
 
+; ============================================================
+; Inline CHRGET/CHRGOT hook
+; CHRGET at $0380: increment text pointer, skip spaces, load byte, set flags
+; CHRGOT at $0386: load byte at text pointer, set flags (no increment)
+;
+; BASIC calls CHRGET 5-20 times per token. Each call is ~10 emulated
+; 8502 instructions. This hook replaces all of them with native code.
+;
+; Flag contract (matches real C128 ROM behavior):
+;   $00:         Z=1, C=1  (end of line)
+;   $3A (colon): Z=1, C=1  (end of statement)
+;   $30-$39:     Z=0, C=0  (digit)
+;   All others:  Z=0, C=1  (token/operator/letter)
+; ============================================================
+
+_hook_chrget:
+        lda c128_pc_lo
+        cmp #$80
+        beq _hcg_do_chrget     ; CHRGET: increment first
+        cmp #$86
+        beq _hcg_do_chrgot     ; CHRGOT: just load and classify
+        jmp step_fetch         ; Other page $03 address, not hooked
+
+_hcg_do_chrget:
+        ; Increment text pointer $3D in bank 4
+        lda #$3D
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z    ; load $3D
+        clc
+        adc #1
+        sta [c128_zp_ptr],z    ; store $3D+1
+        bne _hcg_do_chrgot     ; no page crossing
+        ; Increment $3E (high byte)
+        lda #$3E
+        sta c128_zp_ptr
+        lda [c128_zp_ptr],z
+        clc
+        adc #1
+        sta [c128_zp_ptr],z
+
+_hcg_do_chrgot:
+        ; Read text pointer $3D/$3E from bank 4
+        lda #$3D
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z    ; $3D = text pointer lo
+        sta C128_MEM_PTR+0
+        lda #$3E
+        sta c128_zp_ptr
+        lda [c128_zp_ptr],z    ; $3E = text pointer hi
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        lda [C128_MEM_PTR],z   ; load byte at text pointer
+
+        ; Skip spaces: if $20, increment pointer and retry
+        cmp #$20
+        bne _hcg_classify
+        lda #$3D
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
+        clc
+        adc #1
+        sta [c128_zp_ptr],z
+        bne _hcg_do_chrgot
+        lda #$3E
+        sta c128_zp_ptr
+        lda [c128_zp_ptr],z
+        clc
+        adc #1
+        sta [c128_zp_ptr],z
+        bra _hcg_do_chrgot
+
+_hcg_classify:
+        ; A = byte at text pointer (not a space)
+        sta c128_a
+        lda #0
+        sta c128_y              ; Y=0 per CHRGET contract
+
+        ; --- Flag computation matching real CHRGET ROM ---
+        ; First do CMP #$3A (sets Z and C for >= $3A case)
+        lda c128_a
+        cmp #$3A
+        bcs _hcg_ge3a          ; >= $3A: flags from CMP are final
+
+        ; < $3A: ROM does SEC/SBC #$30/SEC/SBC #$D0 for digit detection
+        ; $30-$39 (digits): C=0 after sequence
+        ; $00 (EOL): Z=1, C=1 after sequence
+        ; $01-$2F: C=1
+        lda c128_a
+        sec
+        sbc #$30
+        sec
+        sbc #$D0
+        ; Flags now set by the SBC result
+        php
+        pla
+        and #$83               ; N, Z, C (bits 7, 1, 0)
+        bra _hcg_merge_p
+
+_hcg_ge3a:
+        ; >= $3A: use flags from CMP #$3A directly
+        php
+        pla
+        and #$83               ; N, Z, C
+
+_hcg_merge_p:
+        sta _hcg_tmp_flags
+        lda c128_p
+        and #$7C               ; clear N, Z, C (keep I, D, V, B)
+        ora _hcg_tmp_flags
+        sta c128_p
+
+        ; Pop return address from guest stack (JSR $0380 or JSR $0386)
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr lo
+        sta _hcg_tmp_ret
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr hi
+        sta _hcg_tmp_ret+1
+
+        ; Set PC = return address + 1
+        clc
+        lda _hcg_tmp_ret
+        adc #1
+        sta c128_pc_lo
+        lda _hcg_tmp_ret+1
+        adc #0
+        sta c128_pc_hi
+
+        lda #0
+        sta c128_code_valid     ; invalidate cache (page changed)
+        lda #12                 ; ~12 cycles for CHRGET
+        #finish_cycles_no_xtra
+
+_hcg_tmp_flags:  .byte 0
+_hcg_tmp_ret:    .word 0
+
 _hook_chain_kernal_only:
         ; From table dispatch: X = c128_pc_hi, A = table flag ($80)
+        ;
+        ; Fast inline CHROUT: $FFD2 is the hottest KERNAL call in 80-col mode.
+        ; Check for it FIRST before the CMP chain to avoid ~40 instructions
+        ; of dispatch overhead per printable character.
+        cpx #$FF
+        bne _ic_bail_notff
+        lda c128_pc_lo
+        cmp #$D2
+        bne _ic_bail
+
+        ; --- Inline CHROUT fast path for 80-col printable chars ---
+        ; Check: screen output (not file), 80-col mode, printable char
+        lda seq_output_slot
+        cmp #$FF
+        bne _ic_bail            ; file output: use full handler
+        lda #$D7
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z     ; C128 $D7: $00=40-col, $80=80-col
+        bpl _ic_bail            ; 40-col: use ROM
+        lda c128_a
+        cmp #$20
+        bcc _ic_bail            ; control codes: use ROM
+        cmp #$80
+        bcc _inline_chrout_go   ; $20-$7F: printable
+        cmp #$A0
+        bcc _ic_bail            ; $80-$9F: control codes
+        ; $A0-$FF: printable, fall through
+        bra _inline_chrout_go
+
+        ; Near bail-out trampolines (keep within branch range of checks above)
+_ic_bail:
+        jmp _hook_chain_kernal_not_chrout
+_ic_bail_notff:
+        jmp _hook_chain_kernal_not_ff
+
+_inline_chrout_go:
+        ; Read column $EC
+        lda #$EC
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
+        cmp #79
+        bcs _ic_bail2           ; col >= 79: let ROM handle wrap
+        sta fco_old_col
+        bra _ic_do_print        ; skip trampoline
+
+_ic_bail2:
+        jmp _hook_chain_kernal_not_chrout
+
+_ic_do_print:
+
+        ; Convert PETSCII to screen code
+        lda c128_a
+        jsr fco_petscii_to_screen
+
+        ; Write to VDC RAM at R14:R15
+        pha                     ; save screen code
+        lda vdc_regs+15
+        sta C128_MEM_PTR+0
+        lda vdc_regs+14
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        pla                     ; screen code
+        pha
+        sta [C128_MEM_PTR],z
+
+        ; Write to MEGA65 screen ($020400 + offset)
+        lda vdc_regs+15
+        sec
+        sbc vdc_regs+13
+        sta C128_MEM_PTR+0
+        sta fco_scr_offset
+        lda vdc_regs+14
+        sbc vdc_regs+12
+        sta fco_scr_offset+1
+        clc
+        adc #$04
+        sta C128_MEM_PTR+1
+        lda #$02
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        pla                     ; screen code
+        sta [C128_MEM_PTR],z
+
+        ; Read text color $F1
+        lda #$F1
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
+        sta fco_vdc_attr
+
+        ; Write VDC attr at R14:R15 + attr_offset
+        lda fco_offset_dirty
+        beq _ic_offset_ok
+        lda vdc_regs+21
+        sec
+        sbc vdc_regs+13
+        sta fco_attr_offset
+        lda vdc_regs+20
+        sbc vdc_regs+12
+        sta fco_attr_offset+1
+        lda #0
+        sta fco_offset_dirty
+_ic_offset_ok:
+        lda vdc_regs+15
+        clc
+        adc fco_attr_offset
+        sta C128_MEM_PTR+0
+        lda vdc_regs+14
+        adc fco_attr_offset+1
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda fco_vdc_attr
+        sta [C128_MEM_PTR],z
+
+        ; Write color to MEGA65 color RAM
+        lda fco_vdc_attr
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta fco_vic_color
+        lda display_showing_80
+        beq _ic_color_buf
+        lda fco_scr_offset
+        sta vdc_color_ptr+0
+        lda fco_scr_offset+1
+        sta vdc_color_ptr+1
+        lda #$F8
+        sta vdc_color_ptr+2
+        lda #$0F
+        sta vdc_color_ptr+3
+        bra _ic_color_write
+_ic_color_buf:
+        lda fco_scr_offset
+        sta vdc_color_ptr+0
+        lda fco_scr_offset+1
+        clc
+        adc #>COLOR_80_ADDR
+        sta vdc_color_ptr+1
+        lda #COLOR_80_BANK
+        sta vdc_color_ptr+2
+        lda #COLOR_80_MB
+        sta vdc_color_ptr+3
+_ic_color_write:
+        ldz #0
+        lda fco_vic_color
+        sta [vdc_color_ptr],z
+
+        ; Advance VDC cursor
+        inc vdc_regs+15
+        bne +
+        inc vdc_regs+14
++
+        ; Update column $EC = old_col + 1
+        lda #$EC
+        sta c128_zp_ptr
+        ldz #0
+        lda fco_old_col
+        clc
+        adc #1
+        sta [c128_zp_ptr],z
+
+        ; Clear C128 carry flag
+        lda c128_p
+        and #$FE
+        sta c128_p
+
+        ; Inline RTS: pop return address from guest stack
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z
+        sta fco_tmp
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z
+        sta fco_tmp+1
+        clc
+        lda fco_tmp
+        adc #1
+        sta c128_pc_lo
+        lda fco_tmp+1
+        adc #0
+        sta c128_pc_hi
+
+        lda #0
+        sta c128_code_valid
+        lda #8
+        #finish_cycles_no_xtra
+        ; (never reaches here - macro jumps to finish_and_loop)
+
+_hook_chain_kernal_not_chrout:
+        txa                     ; X still has c128_pc_hi = $FF
+        bra _hook_chain_kernal_check
+
+_hook_chain_kernal_not_ff:
         txa                     ; Restore pc_hi into A
         bra _hook_chain_kernal_check
 
@@ -2930,56 +3263,6 @@ _crunch_done:
 
         ; Return: Y = write index (tokenized output length)
         ldy _crunch_wi
-        rts
-_dbg_z_save: .byte 0
-_dbg_byte:   .byte 0
-; Screen codes for hex digits 0-F
-_hex_scr: .byte $30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$01,$02,$03,$04,$05,$06
-
-; Helper: write A as 2-digit hex to screen at [C128_RAM_PTR]+Z, Z+=3
-; Assumes C128_RAM_PTR points to $0400 screen, bank 4
-_dbg_write_hex:
-        stz _dbg_z_save         ; save Z position to memory
-        sta _dbg_byte           ; save original byte
-        lsr
-        lsr
-        lsr
-        lsr
-        tax
-        lda _hex_scr,x
-        ldz _dbg_z_save
-        sta [C128_RAM_PTR],z
-        inz
-        lda _dbg_byte
-        and #$0F
-        tax
-        lda _hex_scr,x
-        sta [C128_RAM_PTR],z
-        inz
-        lda #$20                ; space
-        sta [C128_RAM_PTR],z
-        inz
-        rts
-
-; Helper: write A as 2-digit hex at screen position Z
-_dbg_write_hex_at:
-        pha
-        lsr
-        lsr
-        lsr
-        lsr
-        tax
-        lda _hex_scr,x
-        sta [C128_RAM_PTR],z
-        inz
-        pla
-        and #$0F
-        tax
-        lda _hex_scr,x
-        sta [C128_RAM_PTR],z
-        inz
-        lda #$20
-        sta [C128_RAM_PTR],z
         rts
 
 ; --- Helper: read byte at [src + ri] from bank 4 ---

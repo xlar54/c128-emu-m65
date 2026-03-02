@@ -8,7 +8,7 @@
 ;     $02001-$02011: BASIC stub (SYS 8210)
 ;     $02012-$0A203: Emulator code (main + included modules)
 ;     $0A400-$0AFFF: Directory staging buffer (~3KB)
-;     $0B000-$0BFFF: LOW_RAM_BUFFER (mirror of C128 RAM $0000-$0FFF)
+;     $0B000-$0BFFF: LOW_RAM_BUFFER (cache of C128 RAM $0000-$0FFF, DMA-synced before hooks)
 ;
 ;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB used)
 ;     $10000-$11FFF: Character ROM (chargen, 8KB, for $D000 mapping)
@@ -136,7 +136,7 @@ start:
 
         ; ============================================================
         ; Clear LOW_RAM_BUFFER ($B000-$BFFF) to match cleared C128 RAM
-        ; This mirrors bank 4 pages $00-$0F for fast ZP/stack access
+        ; DMA-synced from bank 4 before hooks that read it
         ; ============================================================
         lda #$00
         sta $D707
@@ -153,7 +153,7 @@ start:
         ; ============================================================
         ; Load ROM files into bank 1 ($10000-$1FFFF)
         ; File layout: chargen@$0000, basiclo@$4000, basichi@$8000, kernal@$C000
-        ; Chargen also DMA copied to bank 0 $08000 for VIC-IV + ROM read path
+        ; Chargen stays in bank 1 only. VIC-IV CHARPTR uses bank 0 ROM shadow at $9000.
         ; ============================================================
 
         ; kernal

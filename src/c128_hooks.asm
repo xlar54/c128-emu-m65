@@ -283,7 +283,25 @@ _do_chrout:
         lda c128_p
         and #$FE                ; clear bit 0 (carry)
         sta c128_p
-        jsr C128Hook_RTS_Guest
+        ; Fast inline RTS: pop return address from guest stack
+        ; c128_stack_ptr is pre-set to bank 4 page $01
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr low
+        sta fco_tmp
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr high
+        sta fco_tmp+1
+        clc
+        lda fco_tmp
+        adc #1
+        sta c128_pc_lo
+        lda fco_tmp+1
+        adc #0
+        sta c128_pc_hi
+        lda #1
+        sta c128_hook_pc_changed
         jmp _done
 _do_chrout_file:
         jsr C128Hook_OnCHROUT
@@ -865,17 +883,11 @@ _cf_error:
 c128_prg_header_lo: .byte 0
 c128_prg_header_hi: .byte 0
 
-; Saved video mode across host file operations (for error recovery)
-c128_prev_video_mode: .byte 0
-
 C128Hook_DoHostLoad:
         ; Mark file operation in progress (prevents video mode switching)
         lda #1
         sta c128_file_op_active
 
-        ; Remember current C128 video mode (for error recovery)
-        lda c128_video_mode
-        sta c128_prev_video_mode
         
         ; Set up host KERNAL for file operations
         lda #$00
@@ -1224,9 +1236,6 @@ C128Hook_DoHostSave:
         lda #1
         sta c128_file_op_active
 
-        ; Remember current C128 video mode (for error recovery)
-        lda c128_video_mode
-        sta c128_prev_video_mode
         
         ; Calculate data length
         lda c128_save_end_lo
@@ -1795,9 +1804,6 @@ C128Hook_OnDIRECTORY:
         ; and fall back to $00 if needed on the host filesystem.
         ; ------------------------------------------------------------
 
-        ; Reset any stale bitmap mode flags to prevent graphics glitch
-        lda #0
-        sta c128_gfx_dirty
         
         ; Ensure host KERNAL I/O uses bank 0
         lda #$00
@@ -2360,12 +2366,12 @@ C128Hook_FastCHROUT:
 fco_printable:
         pha                     ; Save PETSCII
 
-        ; Read current column ($EC) - bail if would wrap
+        ; Read current column ($EC) via direct ZP pointer
+        ; c128_zp_ptr is pre-set: +1=$00, +2=BANK_RAM0, +3=$00
         lda #$EC
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        jsr C128_Read
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
         cmp #79
         bcs fco_rom_pop        ; Column >= 79: would wrap, let ROM handle
         sta fco_old_col
@@ -2412,15 +2418,13 @@ fco_printable:
         lda fco_scrcode
         sta [C128_MEM_PTR],z
 
-        ; Get text color from C128 ZP $F1
+        ; Get text color from C128 ZP $F1 via direct ZP pointer
         ; In 80-col mode, $F1 holds VDC attribute byte:
         ;   low nibble = VDC RGBI color, high nibble = attributes
-        ; Default: $07 = light cyan, no attributes
         lda #$F1
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        jsr C128_ReadFast
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
         sta fco_vdc_attr        ; full byte for VDC attr write
         ; Translate low nibble (VDC color) to VIC color for MEGA65 color RAM
         and #$0F
@@ -2429,20 +2433,27 @@ fco_printable:
         sta fco_vic_color
 
         ; Write VDC attribute at cursor position in attr RAM
-        ; VDC attr address = R14:R15 + (R20:R21 - R12:R13)
+        ; VDC attr address = R14:R15 + attr_offset
+        ; attr_offset = R20:R21 - R12:R13, cached and invalidated on reg changes
+        lda fco_offset_dirty
+        beq _fco_offset_cached
+        ; Recompute attr offset
         lda vdc_regs+21
         sec
         sbc vdc_regs+13
-        sta fco_tmp
+        sta fco_attr_offset
         lda vdc_regs+20
         sbc vdc_regs+12
-        sta fco_tmp+1
+        sta fco_attr_offset+1
+        lda #0
+        sta fco_offset_dirty
+_fco_offset_cached:
         lda vdc_regs+15
         clc
-        adc fco_tmp
+        adc fco_attr_offset
         sta C128_MEM_PTR+0
         lda vdc_regs+14
-        adc fco_tmp+1
+        adc fco_attr_offset+1
         and #$3F
         clc
         adc #>VDC_RAM_BASE
@@ -2492,18 +2503,18 @@ _fco_color_write:
         bne +
         inc vdc_regs+14
 +
-        ; Update KERNAL column $EC = old + 1
+        ; Update KERNAL column $EC via direct ZP pointer
         lda fco_old_col
         clc
         adc #1
-        sta c128_data
+        pha                     ; save new column
         lda #$EC
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        jsr C128_Write
+        sta c128_zp_ptr
+        pla
+        ldz #0
+        sta [c128_zp_ptr],z
 
-        pla                     ; Clean stack
+        pla                     ; Clean stack (PETSCII char)
         clc
         rts
 
@@ -2512,10 +2523,9 @@ fco_cr:
         ; Only handle ourselves if at bottom row (scroll)
         ; Otherwise let ROM handle (line links, screen editor state)
         lda #$EB
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        jsr C128_Read
+        sta c128_zp_ptr
+        ldz #0
+        lda [c128_zp_ptr],z
         cmp #24
         bcs fco_scroll         ; Row >= 24: we handle scroll
         sec                    ; Row < 24: let ROM handle CR
@@ -2526,35 +2536,30 @@ fco_scroll:
         ; Use shared scroll routine
         jsr scroll_screen_up
 
-        ; Update KERNAL ZP: row=24, col=0
-        lda #24
-        sta c128_data
+        ; Update KERNAL ZP via direct pointer: row=24, col=0
         lda #$EB
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        jsr C128_Write
-        lda #0
-        sta c128_data
+        sta c128_zp_ptr
+        ldz #0
+        lda #24
+        sta [c128_zp_ptr],z
         lda #$EC
-        sta c128_addr_lo
-        jsr C128_Write
+        sta c128_zp_ptr
+        lda #0
+        sta [c128_zp_ptr],z
 
         ; Update PNT ($E0/$E1) to point to row 24 in VDC RAM
         ; Row 24 * 80 = 1920 = $0780
+        lda #$E0
+        sta c128_zp_ptr
         lda vdc_regs+13
         clc
         adc #<1920
-        sta c128_data
-        lda #$E0
-        sta c128_addr_lo
-        jsr C128_Write
+        sta [c128_zp_ptr],z
+        lda #$E1
+        sta c128_zp_ptr
         lda vdc_regs+12
         adc #>1920
-        sta c128_data
-        lda #$E1
-        sta c128_addr_lo
-        jsr C128_Write
+        sta [c128_zp_ptr],z
 
         ; Update VDC cursor to row 24, col 0
         lda vdc_regs+13
@@ -2607,6 +2612,7 @@ fco_r16:       .word 0
 fco_vic_color: .byte 0
 fco_vdc_attr:  .byte 0
 fco_scr_offset: .word 0
+fco_attr_offset: .word 0           ; Cached (R20:R21 - R12:R13), invalidated by fco_offset_dirty
 
 ; VIC-II -> VDC RGBI color reverse lookup table
 ; VIC: 0=blk 1=wht 2=red 3=cyn 4=pur 5=grn 6=blu 7=yel
@@ -2650,9 +2656,6 @@ C128Hook_OnOPEN:
         rts
 
 _open_disk:
-        ; Reset stale graphics flags before file operations
-        lda #0
-        sta c128_gfx_dirty
         
         ; Check filename length
         ; Empty filename (length 0) is allowed for command channel reads
@@ -3723,123 +3726,6 @@ _chrget_disabled_no_carry:
         lda #1
         sta c128_hook_pc_changed
         rts
-        lda #$3D
-        sta c128_zp_ptr
-        ldz #0
-        lda [c128_zp_ptr],z     ; $3D
-        sta _chrget_ptr
-        ldz #1
-        lda [c128_zp_ptr],z     ; $3E
-        sta _chrget_ptr+1
-
-_chrget_loop:
-        ; Increment text pointer
-        inc _chrget_ptr
-        bne +
-        inc _chrget_ptr+1
-+
-        ; Read byte from C128 bank 0 RAM
-        lda _chrget_ptr
-        sta C128_MEM_PTR+0
-        lda _chrget_ptr+1
-        sta C128_MEM_PTR+1
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-
-        ; Skip spaces
-        cmp #$20
-        beq _chrget_loop
-
-        ; Save the byte
-        sta _chrget_byte
-
-        ; --- Write back text pointer ---
-        lda #$3D
-        sta c128_zp_ptr
-        lda _chrget_ptr
-        ldz #0
-        sta [c128_zp_ptr],z
-        lda _chrget_ptr+1
-        ldz #1
-        sta [c128_zp_ptr],z
-
-        ; --- Set guest registers ---
-        lda _chrget_byte
-        sta c128_a
-
-        ; Y = 0
-        lda #0
-        sta c128_y
-
-        ; --- Set flags like CHRGET does ---
-        ; CHRGET ends with:
-        ;   CMP #$3A    → C=1 if A >= $3A, Z=1 if A == $3A
-        ;   BCS done    → if >= $3A, return with those flags
-        ;   CMP #$20    → (already handled - spaces skipped)
-        ;   SEC
-        ;   SBC #$30
-        ;   SEC
-        ;   SBC #$D0    → C=0 if digit ($30-$39), C=1 otherwise
-        ;   RTS
-        ;
-        ; The important outcomes:
-        ;   $00: Z=1, C=0
-        ;   $01-$2F: Z=0, C=0 (after SBC sequence)
-        ;   $30-$39 (digits): Z=0, C=0
-        ;   $3A (colon): Z=1, C=1
-        ;   $3B-$FF: Z=0, C=1
-
-        lda _chrget_byte
-        cmp #$3A
-        bcs _chrget_ge3a
-
-        ; < $3A: do the SBC sequence to detect digits
-        ; SEC; SBC #$30; SEC; SBC #$D0
-        ; For digits $30-$39: result is $00-$09, carry clear
-        ; For $00: result wraps, carry... let's just do it
-        lda _chrget_byte
-        sec
-        sbc #$30
-        sec
-        sbc #$D0
-        ; Now: C=0 for digits ($30-$39), C=1 for others
-        ; Z reflects the result (Z=1 only if byte was $00 after wrapping)
-        ; Actually for $00: $00-$30=$D0, $D0-$D0=$00, Z=1, C=1
-        ; Hmm, let me just use the native 6502 flags
-        php
-        pla
-        and #$C3                ; N, Z, C flags
-        sta _chrget_tmp
-        lda c128_p
-        and #$3C                ; preserve I, D, V, B
-        ora _chrget_tmp
-        sta c128_p
-        bra _chrget_do_rts
-
-_chrget_ge3a:
-        ; >= $3A: set C=1, Z=1 if $3A
-        php
-        pla
-        and #$C3
-        sta _chrget_tmp
-        lda c128_p
-        and #$3C
-        ora _chrget_tmp
-        sta c128_p
-
-_chrget_do_rts:
-        ; --- Do RTS: pop return address from guest stack ---
-        jsr C128Hook_RTS_Guest
-
-        rts
-
-_chrget_ptr:  .word 0
-_chrget_byte: .byte 0
-_chrget_tmp:  .byte 0
 
 ; ============================================================
 ; C128Hook_IRQ - Fast IRQ handler
@@ -4127,9 +4013,6 @@ _attr_clr_dst:
 
 C128Hook_OnCHRIN:
 
-        ; Reset stale graphics flags before file operations
-        lda #0
-        sta c128_gfx_dirty
         
         ; We're reading from a file
         ldx seq_input_slot
@@ -4194,9 +4077,6 @@ _chrin_status: .byte 0
 C128Hook_OnCHROUT:
         ; We're writing to a file (dispatcher already verified seq_output_slot != $FF)
         
-        ; Reset stale graphics flags before file operations
-        lda #0
-        sta c128_gfx_dirty
         
         
         ; Get byte from guest A
@@ -4233,9 +4113,6 @@ C128Hook_OnCHROUT:
 ; ============================================================
 C128Hook_OnGETIN:
 
-        ; Reset stale graphics flags before file operations
-        lda #0
-        sta c128_gfx_dirty
         
         ; We're reading from a file - same as CHRIN
         ldx seq_input_slot
@@ -4305,7 +4182,6 @@ C128Hook_PostFileOpVideoFix:
 
         ; Error: force text mode
         lda #0
-        sta c128_video_mode
         jsr C128Vid_DisableHostBitmap
         jsr C128_VideoInit
 
@@ -4734,7 +4610,7 @@ _crunch_done:
         ldz #0
         sta [C128_MEM_PTR],z    ; write to bank 4
         pha                     ; save char
-        ; Mirror to LOW_RAM_BUFFER: bank 0, addr = $A000 + offset
+        ; Mirror to LOW_RAM_BUFFER if in pages $00-$0F
         lda C128_MEM_PTR+1
         cmp #$10
         bcs _cr_no_lrb          ; skip mirror if page >= $10
