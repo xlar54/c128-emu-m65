@@ -616,7 +616,7 @@ _load_no_setnam:
         sta $FB
         clc
         lda LOW_RAM_BUFFER + $B0        ; Pointer hi ($02)
-        adc #>LOW_RAM_BUFFER            ; Add $A0 -> $A2
+        adc #>LOW_RAM_BUFFER            ; Add $B0 -> offset into LOW_RAM_BUFFER
         sta $FC
         
         ; Copy filename bytes
@@ -787,7 +787,7 @@ C128Hook_CopyFilename:
         sta $FB
         clc
         lda c128_setnam_ptr_hi
-        adc #>LOW_RAM_BUFFER            ; Add $A0
+        adc #>LOW_RAM_BUFFER            ; Offset into LOW_RAM_BUFFER
         sta $FC
         
         ldy #0
@@ -802,7 +802,7 @@ _cf_low_loop:
         bra _cf_done
         
 _cf_bank5:
-        ; Set up 32-bit pointer to read from Bank 5 (guest RAM)
+        ; Set up 32-bit pointer to read from guest RAM (bank 4)
         ; C128_MEM_PTR is at $F0-$F3
         lda c128_setnam_ptr_lo
         sta C128_MEM_PTR
@@ -819,7 +819,7 @@ _cf_loop:
         cpy c128_fl_len
         beq _cf_done
         
-        ; Read from [C128_MEM_PTR],y - this reads from Bank 5 directly
+        ; Read from [C128_MEM_PTR],z - reads from guest RAM bank 4
         ldz #0
         tya
         taz                             ; Z = Y (offset)
@@ -921,7 +921,6 @@ C128Hook_DoHostLoad:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhl_do_load_after_header
 
 _dhl_header_error:
@@ -929,7 +928,6 @@ _dhl_header_chkin_error:
         jsr CLRCHN
         lda #$0F
         jsr CLOSE
-        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhl_error_set
 
 _dhl_do_load_after_header:
@@ -999,7 +997,6 @@ _dhl_setup_load:
         ldx #$00
         jsr SETBNK
         
-        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         
         plp                             ; Restore carry flag from LOAD
         bcc _dhl_load_ok
@@ -1060,7 +1057,6 @@ _dhl_error_set:
         lda #$00
         ldx #$00
         jsr SETBNK                      ; Reset to bank 0
-        jsr C128Hook_UnlockVIC
         
         ; Print appropriate error message based on caller
         lda c128_monitor_load
@@ -1159,7 +1155,7 @@ _save_check_setnam:
         sta $FB
         clc
         lda LOW_RAM_BUFFER + $B0        ; Pointer hi ($02)
-        adc #>LOW_RAM_BUFFER            ; Add $A0 -> $A2
+        adc #>LOW_RAM_BUFFER            ; Add $B0 -> offset into LOW_RAM_BUFFER
         sta $FC
         
         ; Copy filename bytes
@@ -1348,7 +1344,6 @@ _save_loop_done:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
-        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         
         jmp _dhs_ok
 
@@ -1357,7 +1352,6 @@ _dhs_chkout_error:
         jsr CLRCHN
         lda #$01
         jsr CLOSE
-        jsr C128Hook_UnlockVIC            ; Just re-unlock VIC, don't change mode
         jmp _dhs_error
 
 _dhs_ok:
@@ -2055,7 +2049,6 @@ _dir_done:
         jsr C128_CLOSE
 
         ; Re-unlock VIC-IV after file operations (don't reset video mode)
-        jsr C128Hook_UnlockVIC
         
         ; Return to BASIC via RTS
         jsr C128Hook_RTS_Guest
@@ -2066,7 +2059,6 @@ _tmplinectr:
 
 _dir_open_fail:
         ; Couldn't open directory channel. Just return to BASIC.
-        jsr C128Hook_UnlockVIC
         jsr C128Hook_RTS_Guest
         rts
 
@@ -2639,38 +2631,6 @@ vic_to_vdc_color:
 ; VIC State Save/Restore for Host KERNAL Calls
 ; ============================================================
 ; The MEGA65 host KERNAL can change VIC-IV registers during file
-; operations. We just re-unlock VIC-IV after each call.
-
-C128Hook_SaveVIC:
-        rts
-
-C128Hook_RestoreVIC:
-        ; Just re-unlock VIC-IV, don't reinitialize entire video
-        jsr C128Hook_UnlockVIC
-        rts
-
-; Lighter version - just re-unlock VIC-IV without changing mode
-; Use this when we want to preserve graphics mode
-C128Hook_UnlockVIC:
-        ; Re-unlock VIC-III
-        lda #$A5
-        sta $D02F
-        lda #$96
-        sta $D02F
-        ; Re-unlock VIC-IV
-        lda #$47
-        sta $D02F
-        lda #$53
-        sta $D02F
-        
-        ; Restore border/background colors from VIC-II shadow registers
-        lda vic_regs+$20
-        sta $D020
-        lda vic_regs+$21
-        sta $D021
-        
-        rts
-
 
 ; ============================================================
 ; C128Hook_OnOPEN - Handle OPEN command
@@ -2743,7 +2703,7 @@ _open_found_slot:
         sta $FB
         clc
         lda LOW_RAM_BUFFER + $B0
-        adc #>LOW_RAM_BUFFER            ; Add $A0
+        adc #>LOW_RAM_BUFFER            ; Offset into LOW_RAM_BUFFER
         sta $FC
         
         ldy #0
@@ -2807,15 +2767,11 @@ _open_copy_done:
         ldy LOW_RAM_BUFFER + $AD        ; Secondary address from guest
         jsr SETLFS
         
-        ; Save VIC state before host KERNAL call
-        jsr C128Hook_SaveVIC
         
         ; Call host OPEN
         jsr OPEN
         php                             ; Save carry (error flag)
         
-        ; Restore VIC state after host call
-        jsr C128Hook_RestoreVIC
         
         plp                             ; Restore carry
         bcs _open_error_host
@@ -2937,8 +2893,6 @@ _close_found:
         lda seq_slot_open,x
         beq _close_not_open
         
-        ; Save VIC state before host KERNAL call
-        jsr C128Hook_SaveVIC
         
         ; Clear host channels before closing
         jsr CLRCHN
@@ -2949,8 +2903,6 @@ _close_found:
         adc #SEQ_LFN_BASE
         jsr CLOSE
         
-        ; Restore VIC state after host call
-        jsr C128Hook_RestoreVIC
         
         ; Clear slot
         ldx _close_slot
@@ -4187,15 +4139,11 @@ C128Hook_OnCHRIN:
         and #$40                        ; EOF flag
         bne _chrin_eof
         
-        ; Save VIC state before host KERNAL call
-        jsr C128Hook_SaveVIC
         
         ; Read from host
         jsr CHRIN
         sta _chrin_byte
         
-        ; Restore VIC state after host KERNAL call
-        jsr C128Hook_RestoreVIC
         
         ; Check host status
         jsr READST
@@ -4250,8 +4198,6 @@ C128Hook_OnCHROUT:
         lda #0
         sta c128_gfx_dirty
         
-        ; Save VIC state before host KERNAL call
-        jsr C128Hook_SaveVIC
         
         ; Get byte from guest A
         lda c128_a
@@ -4259,8 +4205,6 @@ C128Hook_OnCHROUT:
         ; Write to host
         jsr CHROUT
         
-        ; Restore VIC state after host call
-        jsr C128Hook_RestoreVIC
         
         ; Check status
         jsr READST
@@ -4301,15 +4245,11 @@ C128Hook_OnGETIN:
         and #$40                        ; EOF flag
         bne _getin_eof
         
-        ; Save VIC state before host KERNAL call
-        jsr C128Hook_SaveVIC
         
         ; Read from host using CHRIN (GETIN uses same mechanism for files)
         jsr CHRIN
         sta _getin_byte
         
-        ; Restore VIC state after host KERNAL call
-        jsr C128Hook_RestoreVIC
         
         ; Check host status
         jsr READST
@@ -4799,7 +4739,7 @@ _crunch_done:
         cmp #$10
         bcs _cr_no_lrb          ; skip mirror if page >= $10
         clc
-        adc #>LOW_RAM_BUFFER    ; $A0 + page
+        adc #>LOW_RAM_BUFFER    ; $B0 + page = LOW_RAM_BUFFER page
         sta C128_MEM_PTR+1
         lda #$00
         sta C128_MEM_PTR+2      ; bank 0
