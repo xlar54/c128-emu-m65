@@ -6,23 +6,20 @@
 ;
 ;   Bank 0 ($00000-$0FFFF): Host code + staging areas
 ;     $02001-$02011: BASIC stub (SYS 8210)
-;     $02012+:       Emulator code (main + included modules)
-;     $06000-$06FFF: Directory staging buffer (4KB)
-;     $08000-$09FFF: Character ROM (chargen, 8KB, VIC-IV reads from here)
-;     $0B000-$0BFFF: LOW_RAM_BUFFER (mirror of C128 RAM $0000-$0FFF)
+;     $02012-$07FFF: Emulator code (must end before $8000 for KERNAL MAP)
+;     $09400-$09FFF: Directory staging buffer (~3KB)
+;     $0A000-$0AFFF: LOW_RAM_BUFFER (cache of C128 RAM $0000-$0FFF, DMA-synced before hooks)
 ;
 ;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB used)
-;     $10000-$11FFF: Character ROM (chargen, 8KB, for $D000 mapping)
+;     $10000-$11FFF: RESERVED - C65 KERNAL DOS variables (do not use!)
 ;     $12000-$127FF: KERNAL $F800-$FFFF relocated (2KB, avoids color RAM window)
 ;     $14000-$17FFF: BASIC LO ROM  (C128 $4000-$7FFF, 16KB)
 ;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF, 16KB)
 ;     $1C000-$1F7FF: KERNAL ROM    (C128 $C000-$F7FF, 14KB accessible)
 ;     $1F800-$1FFFF: (blocked by MEGA65 color RAM window - see $12000)
 ;
-;   Bank 2 ($20000-$2FFFF): Screen + color save buffers
-;     $20400-$207E7: VIC screen RAM staging (1KB)
-;     $2A000-$2A3E7: 40-col color save buffer (1000 bytes)
-;     $2A800-$2AFEF: 80-col color save buffer (2000 bytes)
+;   Bank 2 ($20000-$2FFFF): C65 ROM (write-protect off after boot)
+;     $2A000-$2BFFF: Character ROM (chargen, 8KB, loaded last)
 ;
 ;   Bank 3 ($30000-$3FFFF): VDC display RAM
 ;     $32000-$35FFF: VDC RAM (16KB, overwrites C65 BASIC, ROM write-protect off)
@@ -53,16 +50,18 @@
 ;   $E6:      c128_code_romvis (cached MMU CR for ROM visibility)
 ;   $E7:      c128_hook_pc_changed (set by hooks when PC modified)
 ;   $E8-$EB:  c128_stack_ptr (4-byte stack pointer: SP, $01, bank, $00)
+;   $EC-$EF:  vdc_color_ptr / _crunch_kw_ptr (shared)
 ;   $F0-$F3:  C128_MEM_PTR (4-byte general memory pointer)
 ;   $F4:      c128_saved_data (temp storage for writes)
-;   $F8-$FB:  C128_RAM_PTR (4-byte fast RAM pointer, dedicated)
-;   $FB:      C128H_STR_PTR / DIR_PTR (2 bytes, shared/context-dependent)
+;   $F5-$F6:  DIR_PTR / C128H_STR_PTR (2 bytes, shared, never simultaneous)
+;   $F8-$FB:  C128_RAM_PTR (4-byte fast RAM pointer, dedicated - DO NOT alias $FB)
 ;
 ; ROM files on SD card:
 ;   kernal.bin   = 318020-05  KERNAL     (16KB -> $0C000, DMA to $1C000 + $12000)
 ;   basiclo.bin  = 318018-04  BASIC LO   (16KB -> $14000)
 ;   basichi.bin  = 318019-04  BASIC HI   (16KB -> $18000)
-;   chargen.bin  = 390059-01  CHAR ROM   ( 8KB -> $10000, also at $08000)
+;   chargen.bin  = 390059-01  CHAR ROM   ( 8KB -> $10000 in bank 1 only)
+;                                         DO NOT copy to bank 0 - $08000 is emulator code
 ; ============================================================
 
         .cpu "45gs02"
@@ -102,6 +101,9 @@ DMA_REG = $D707
 ; Entry point
 ; ============================================================
 start:
+        lda #65         ; 40mhz mode
+        sta $00
+
         ; ============================================================
         ; Clear C128 RAM Bank 0 (MEGA65 bank 4) via DMA fill
         ; ============================================================
@@ -120,24 +122,40 @@ start:
         .word $0000             ; modulo (ignored)
 
         ; ============================================================
-        ; Clear C128 RAM Bank 1 (MEGA65 bank 5) via DMA fill
+        ; Clear C128 RAM Bank 1 (attic $8050000) via DMA fill
         ; ============================================================
         lda #$00
         sta $D707
-        .byte $80, $00, $81, $00, $00
+        .byte $80, $00, $81, $80, $00
         .byte $03               ; fill
         .word $FFFF
         .word $0000
         .byte $00
         .word $0000
-        .byte $05               ; dest bank 5
+        .byte $05               ; dest bank 5 in MB $80 = attic
         .byte $00
         .word $0000
 
         ; ============================================================
-        ; Load roms.bin (64KB) byte-by-byte into bank 1 ($10000-$1FFFF)
+        ; Clear LOW_RAM_BUFFER ($A000-$AFFF) to match cleared C128 RAM
+        ; DMA-synced from bank 4 before hooks that read it
+        ; ============================================================
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $03               ; fill
+        .word $1000             ; count = 4KB
+        .word $0000             ; fill with $00
+        .byte $00
+        .word $A000             ; dest = LOW_RAM_BUFFER
+        .byte $00               ; dest bank 0
+        .byte $00
+        .word $0000
+
+        ; ============================================================
+        ; Load ROM files into bank 1 ($10000-$1FFFF)
         ; File layout: chargen@$0000, basiclo@$4000, basichi@$8000, kernal@$C000
-        ; Also copies chargen ($10000-$11FFF) to $08000 for VIC-IV
+        ; Chargen stays in bank 1 only (except chargen which is in bank 2).
         ; ============================================================
 
         ; kernal
@@ -247,16 +265,15 @@ start:
         lda #$00
         sta C128_MEM_PTR+3
         
-        ; Hook 1: GONE dispatch at $4B3F (Execute/Trace Statement)
-        ; Original byte at $4B3F: BEQ $4B3E (opcode $F0)
-        ; Replace with $02 (trap)
-        lda #$3F
-        sta C128_MEM_PTR+0
-        lda #$4B
-        sta C128_MEM_PTR+1
-        lda #$02                ; trap opcode
-        ldz #0
-        sta [C128_MEM_PTR],z
+        ; Hook 1: GONE dispatch - DISABLED to reduce code size
+        ; BASIC runs natively through ROM
+;        lda #$3F
+;        sta C128_MEM_PTR+0
+;        lda #$4B
+;        sta C128_MEM_PTR+1
+;        lda #$02                ; trap opcode
+;        ldz #0
+;        sta [C128_MEM_PTR],z
         
         ; Hook 2: Crunch Tokens at $430D - DISABLED (tokenizer has bugs)
         ; TODO: Fix in-place tokenization to match ROM contract
@@ -268,11 +285,20 @@ start:
 ;        ldz #0
 ;        sta [C128_MEM_PTR],z
 
-        ; chargen
+        ; chargen - MUST BE LAST FILE LOAD
+        ; Loaded to bank 2 at $A000 ($02A000).
+        ; Bank 2 requires ROM write-protect off (trap $70).
+        ; This disables further KERNAL file operations,
+        ; so chargen must be the last file loaded at boot.
 
-        lda #$01
+        ; Disable ROM write-protect for bank 2
+        lda #$70
+        sta $D640
+        clv
+
+        lda #$02
         ldx #$00
-        jsr SETBNK
+        jsr SETBNK              ; Load to bank 2
         lda #$00
         ldx #$08
         ldy #$00
@@ -284,31 +310,30 @@ start:
         jsr SETNAM
         lda #$40
         ldx #$00
-        ldy #$00
-        jsr LOAD
+        ldy #$A0
+        jsr LOAD                ; Load chargen to $A000 in bank 2 = $02A000
+
+        ; Chargen stays in bank 1 at $10000-$11FFF only.
+        ; DO NOT DMA copy to bank 0 - $08000-$09FFF is emulator code.
+        ; VIC-IV CHARPTR points directly to bank 2 chargen at $02A000.
+        ; Emulated CPU reads use read_from_chargen which reads bank 1 directly.
+
+        ; Banks 2-3 untouched - C65 KERNAL/DOS stays resident
+
+        ; No ROM write-protect toggle needed - banks 2-3 not used
 
         ; ============================================================
-        ; Toggle ROM write-protect off (banks 2-3)
-        ; This allows us to use $32000-$35FFF for VDC RAM
-        ; Must be AFTER all C65 KERNAL LOAD calls (needs INTERFACE at $2C800)
-        ; ============================================================
-        lda #$70
-        sta $D640
-        clv
-
-        ; ============================================================
-        ; Clear VDC RAM ($32000-$35FFF, 16KB) via DMA fill
-        ; Overwrites C65 BASIC in bank 3 (not needed by C128 emulator)
+        ; Clear display area in bank 5 (VDC RAM + screen + color saves)
         ; ============================================================
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00
         .byte $03               ; fill
-        .word $4000             ; count = 16KB (16384 bytes)
+        .word $0000             ; count = 64KB (entire bank 5)
         .word $0000             ; fill with $00
         .byte $00
-        .word $2000             ; dest start = $2000 in bank 3 = $32000
-        .byte $03               ; dest bank 3
+        .word $0000             ; dest start = $0000 in bank 5 = $50000
+        .byte $05               ; dest bank 5
         .byte $00
         .word $0000
 

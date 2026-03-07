@@ -51,11 +51,6 @@ P_N = %10000000
 ; C128 keyboard state (CIA1-based, no separate selector register)
 c128_kbd_col:        .byte $FF  ; Last keyboard column written to CIA1 $DC00
 
-; Debug trace variables
-c128_trace_enabled:    .byte $00  ; Set to 1 after LOAD to enable tracing
-c128_trace_pos_lo:     .byte $00  ; Screen position low byte
-c128_trace_pos_hi:     .byte $08  ; Screen position high byte ($0800)
-
 ; VIC-II timing constants (PAL)
 VIC_CYCLES_PER_LINE = 63    ; 63 cycles per scanline (VIC-II PAL)
 VIC_LINES_PER_FRAME = 312   ; PAL has 312 lines
@@ -111,13 +106,8 @@ _rdf_bank1\@:
         ; Bank 1 selected: check shared region
         cmp shared_bottom_mask
         bcc _rdf_b1_shared\@
-        ; Above shared: read from bank 5
-        sta C128_RAM_PTR+1
-        stx C128_RAM_PTR+2      ; X = BANK_RAM1
-        ldz c128_addr_lo
-        lda [C128_RAM_PTR],z
-        ldx #BANK_RAM0
-        stx C128_RAM_PTR+2      ; Restore bank 4
+        ; Above shared: read from bank 1 (attic) via DMA
+        jsr attic_read_byte     ; A=page already, returns byte in A
         bra _rdf_done\@
 _rdf_b1_shared\@:
         ; Shared bottom: still bank 4
@@ -153,36 +143,21 @@ _wdf_write\@:
         ldz c128_addr_lo
         lda c128_data
         sta [C128_RAM_PTR],z
-        ; Mirror pages $00-$0F to LOW_RAM_BUFFER for hook access
-        lda c128_addr_hi
-        cmp #$10
-        bcs _wdf_done\@
-        jsr mirror_to_lrb
         bra _wdf_done\@
 _wdf_bank1\@:
         ; Bank 1 selected: check shared region
         lda c128_addr_hi
         cmp shared_bottom_mask
         bcc _wdf_b1_shared\@
-        ; Above shared: write to bank 5
-        sta C128_RAM_PTR+1
-        stx C128_RAM_PTR+2      ; X = BANK_RAM1
-        ldz c128_addr_lo
-        lda c128_data
-        sta [C128_RAM_PTR],z
-        ldx #BANK_RAM0
-        stx C128_RAM_PTR+2      ; Restore bank 4
-        bra _wdf_done\@         ; No mirror for bank 1
+        ; Above shared: write to bank 1 (attic) via DMA
+        jsr attic_write_byte    ; A=page already, c128_data set
+        bra _wdf_done\@
 _wdf_b1_shared\@:
-        ; Shared bottom: write to bank 4, mirror as usual
+        ; Shared bottom: write to bank 4
         sta C128_RAM_PTR+1
         ldz c128_addr_lo
         lda c128_data
         sta [C128_RAM_PTR],z
-        lda c128_addr_hi
-        cmp #$10
-        bcs _wdf_done\@
-        jsr mirror_to_lrb
         bra _wdf_done\@
 _wdf_inv\@:
         lda #0
@@ -262,8 +237,12 @@ hook_page_flags:
         .byte 8
         ; $44-$7F: no hooks (rest of BASIC ROM)
         .fill 60, 0
-        ; $80-$A7: no hooks
-        .fill 40, 0
+        ; $80-$9F: no hooks
+        .fill 32, 0
+        ; $A0: DIRECTORY hook
+        .byte $80
+        ; $A1-$A7: no hooks
+        .fill 7, 0
         ; $A8: KERNAL hooks (LOAD etc)
         .byte $80
         ; $A9-$C1: no hooks
@@ -317,29 +296,6 @@ c128_hook_pc_changed = $E7  ; Set by hooks when they modify PC
 c128_stack_ptr      = $E8   ; 4 bytes: dedicated stack pointer (lo=SP, hi=$01, bank, $00)
 c128_zp_ptr         = $14   ; 4 bytes: dedicated ZP pointer (lo=addr, hi=$00, bank4, $00)
 
-; Helper: mirror a bank 0 write to LOW_RAM_BUFFER
-; Called after writing to bank 4 pages $00-$0F
-; c128_addr_hi < $10 guaranteed by caller, c128_data has value
-mirror_to_lrb:
-        lda c128_addr_hi
-        clc
-        adc #>LOW_RAM_BUFFER    ; $A0 + page = LOW_RAM_BUFFER page
-        sta C128_RAM_PTR+1
-        lda #$00
-        sta C128_RAM_PTR+2      ; bank 0
-        ldz c128_addr_lo
-        lda c128_data
-        sta [C128_RAM_PTR],z
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2      ; Restore bank 4
-        rts
-
-; Call this when you want to force cache rebuild (optional helper)
-invalidate_code_cache:
-        lda #$00
-        sta c128_code_valid
-        rts
-
 ; -----------------------------------------------------------------
 ; fetch8_operand: Inline operand fetch when cache is likely valid.
 ; Must check code_valid since I/O pages ($D0-$DF, $FF) are never cached.
@@ -363,7 +319,7 @@ _f8op_done\@:
 ; -----------------------------------------------------------------
 ; fetch8_fast: A = mem[PC], PC++
 ; Fast path for:
-;   - $0000-$0FFF via LOW_RAM_BUFFER mirror
+;   - $0000-$0FFF via bank 4 (same as other RAM)
 ;   - $1000-$3FFF via BANK_RAM0/1 (always RAM)
 ;   - $4000-$FFFF via BANK_ROM when ROM mapped, else BANK_RAM
 ; Slow fallback for:
@@ -479,23 +435,11 @@ _f8_build_ram:
         sta c128_code_ptr+1
         ; get_physical_bank uses c128_addr_hi, so set it to PC page
         sta c128_addr_hi
-        jsr get_physical_bank   ; Returns MEGA65 bank in A
+        jsr get_physical_bank   ; Returns MEGA65 bank in A, MB in X
         sta c128_code_ptr+2
+        ; NOTE: code execution from attic RAM bank 1 not yet supported
+        ; (45GS02 [bp],z only supports 28-bit addressing)
         lda #$00
-        sta c128_code_ptr+3
-        lda #$01
-        sta c128_code_valid
-        jmp _f8_do_read
-
-_f8_build_low:
-        lda #$00
-        sta c128_code_ptr+0
-        lda c128_pc_hi
-        clc
-        adc #>LOW_RAM_BUFFER
-        sta c128_code_ptr+1
-        lda #$00
-        sta c128_code_ptr+2
         sta c128_code_ptr+3
         lda #$01
         sta c128_code_valid
@@ -517,17 +461,6 @@ _f8_slow:
         #read_data_fast
         inw c128_pc_lo
         rts
-        lda c128_pc_lo
-        sta c128_addr_lo
-        lda c128_pc_hi
-        sta c128_addr_hi
-        #read_data_fast
-        inw c128_pc_lo
-        rts
-
-;===========end new
-
-
 
 
 ; --- fetch16_to_addr ---
@@ -633,6 +566,75 @@ lrb_ptr_init:
         sta c128_zp_ptr+2       ; Bank 4
         rts
 
+
+; ============================================================
+; Attic RAM byte access via DMA (C128 RAM bank 1)
+; Attic RAM at $8050000 is not accessible via 32-bit ZP pointers
+; (45GS02 only supports 28-bit addressing). DMA is required.
+; ============================================================
+
+attic_staging:  .byte 0         ; Staging byte for DMA transfers
+
+
+; attic_read_byte - Read 1 byte from attic C128 RAM bank 1
+; Input: A = address high byte, c128_addr_lo set
+; Output: A = byte read
+attic_read_byte:
+        ; Patch source address in inline DMA list
+        sta attic_rd_src+1     ; addr high
+        ldx c128_addr_lo
+        stx attic_rd_src       ; addr low
+        ; Trigger enhanced DMA with inline list
+        lda #$00
+        sta $D707
+        ; --- inline DMA list follows ---
+        .byte $80, BANK_RAM1_MB ; src MB = $80 (attic)
+        .byte $81, $00          ; dst MB = $00 (chip RAM)
+        .byte $0b               ; option: use F018B list format
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $0001             ; count = 1 byte
+attic_rd_src:
+        .word $0000             ; src addr (patched)
+        .byte BANK_RAM1         ; src bank
+        .word attic_staging     ; dst addr
+        .byte $00               ; dst bank 0
+        .byte $00               ; command high
+        .word $0000             ; modulo
+        ; --- end of DMA list ---
+        lda attic_staging       ; read result
+        rts
+
+; attic_write_byte - Write 1 byte to attic C128 RAM bank 1
+; Input: A = address high byte, c128_addr_lo set, c128_data set
+; Output: nothing
+attic_write_byte:
+        ; Patch dest address in inline DMA list
+        sta attic_wr_dst+1     ; addr high
+        ldx c128_addr_lo
+        stx attic_wr_dst       ; addr low
+        lda c128_data
+        sta attic_staging       ; stage the byte
+        ; Trigger enhanced DMA with inline list
+        lda #$00
+        sta $D707
+        ; --- inline DMA list follows ---
+        .byte $80, $00          ; src MB = $00 (chip RAM)
+        .byte $81, BANK_RAM1_MB ; dst MB = $80 (attic)
+        .byte $0b               ; option: use F018B list format
+        .byte $00               ; end options
+        .byte $00               ; copy command
+        .word $0001             ; count = 1 byte
+        .word attic_staging     ; src addr
+        .byte $00               ; src bank 0
+attic_wr_dst:
+        .word $0000             ; dst addr (patched)
+        .byte BANK_RAM1         ; dst bank
+        .byte $00               ; command high
+        .word $0000             ; modulo
+        ; --- end of DMA list ---
+        rts
+
 ; Helper: read ZP[X] -> A  (preserves X)
 lrb_read_x:
         stx c128_zp_ptr+0
@@ -682,27 +684,6 @@ lrb_inc_x:
         adc #1
         sta [c128_zp_ptr],z
         rts
-
-; Helper: set C128_MEM_PTR to LOW_RAM_BUFFER base (call before [C128_MEM_PTR],z access)
-setup_lrb:
-        lda #>LOW_RAM_BUFFER
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        rts
-
-; Macro: inline setup of C128_MEM_PTR to LOW_RAM_BUFFER
-; Clobbers A only
-setup_lrb_inline .macro
-        lda #>LOW_RAM_BUFFER
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        .endm
 
 ; Macro: inline setup of C128_MEM_PTR to bank 4 page 0 (for ZP access)
 setup_bank4_zp .macro
@@ -1127,20 +1108,34 @@ _mode_check_done:
         jsr VDC_RenderFrame
 _skip_vdc_render:
 
-        ; Cursor blink (only when displaying 80-col)
+        ; Brief delay when in 40-col mode to reduce emulation speed
+        lda display_showing_80
+        bne +                   ; skip delay in 80-col mode
+        
+        ldx #$FF
+        ldy #$FF        ; outer loop - tweak this
+-       dex
+        bne -
+        ldx #$FF
+        dey
+        bne -
+
++
+        ; Cursor blink phase toggle (every 16 frames)
         lda display_showing_80
         beq _frame_done
 
         inc c128_cur_div
         lda c128_cur_div
-        cmp #8
-        bcc _frame_done
-
+        cmp #110
+        bcc _cur_redraw
         lda #0
         sta c128_cur_div
         lda c128_cur_phase
         eor #1
         sta c128_cur_phase
+_cur_redraw:
+        ; Redraw cursor every frame (after VDC DMA overwrites it)
         jsr VDC_UpdateCursor
 
 _frame_done:
@@ -1263,8 +1258,8 @@ hook_vdc_screen_clear:
         .word 2000              ; count = 2000 bytes
         .word $0020             ; fill value = $20 (space char)
         .byte $00               ; src bank (ignored for fill)
-        .word $2000             ; dst addr = $2000 ($32000 = VDC screen)
-        .byte $03               ; dst bank = 3
+        .word $0000             ; dst addr = $0000 ($50000 = VDC screen)
+        .byte $05               ; dst bank = 5
         .byte $00               ; command high byte
         .word $0000             ; modulo
 
@@ -1278,8 +1273,8 @@ hook_vdc_screen_clear:
         .word 2000              ; count = 80*25
         .word $0020             ; fill with $20 (space)
         .byte $00               ; unused
-        .word $0400             ; dst = $0400
-        .byte $02               ; dst bank 2 ($020400)
+        .word $4000             ; dst = $4000
+        .byte $05               ; dst bank 5 ($054000)
         .byte $00
         .word $0000
 
@@ -1294,8 +1289,8 @@ hook_vdc_screen_clear:
         .word 2000              ; count = 2000 bytes
         .word $0007             ; fill value = $07 (cyan, no flags)
         .byte $00               ; src bank (ignored for fill)
-        .word $2800             ; dst addr = $2800 ($32800 = VDC attrs)
-        .byte $03               ; dst bank = 3
+        .word $0800             ; dst addr = $0800 ($50800 = VDC attrs)
+        .byte $05               ; dst bank = 5
         .byte $00               ; command high byte
         .word $0000             ; modulo
 
@@ -1415,21 +1410,6 @@ write_milestone:
         sta [C128_MEM_PTR],z
         rts
 
-; write_loop_counter - Increment byte at $0FE0E
-; Shows how many times the VDC init loop at E1DC iterates
-write_loop_counter:
-        lda #$0E
-        sta C128_MEM_PTR+0
-        lda #$FE
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z
-        inc a
-        sta [C128_MEM_PTR],z
-        rts
 
 ; ============================================================
 ; CIA1 Timer State
@@ -1545,11 +1525,9 @@ cpu_take_nmi:
         rts
 
 ; --- Reset/Step ---
-C128CPU_Reset:
 C128_CPUReset:
         ; Reset video mode first
         lda #0
-        sta c128_video_mode
         sta c128_file_op_active
         
         ; Re-initialize memory system (MMU, VIC, CIA shadows)
@@ -2069,79 +2047,7 @@ _hook_page_ce:
 +       jmp step_fetch
 
 _hook_page_43:
-        ; Check for CRUNCH entry at $430A
-        lda c128_pc_lo
-        cmp #$0A
-        bne _h43_skip
-
-        ; --- Replicate ROM CRUNCH ($430D-$43A7) behavior exactly ---
-        
-        ; ROM $430D-$4312: LDA $3D / PHA / LDA $3E / PHA
-        ; Push TXTPTR onto C128 stack
-        lda #$00
-        sta C128_RAM_PTR+1      ; page 0
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2
-        ldz #$3D
-        lda [C128_RAM_PTR],z    ; read C128 $3D (TXTPTR lo)
-        sta c128_data
-        jsr push_data
-        lda #$00
-        sta C128_RAM_PTR+1
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2
-        ldz #$3E
-        lda [C128_RAM_PTR],z    ; read C128 $3E (TXTPTR hi)
-        sta c128_data
-        jsr push_data
-
-        ; --- Tokenize ---
-        jsr hook_crunch_tokenize
-        ; Returns with _crunch_wi = output length (including null)
-
-        ; --- ROM $43A1-$43A5: PLA / STA $3E / PLA / STA $3D ---
-        ; Restore TXTPTR from C128 stack
-        jsr pull_to_a           ; A = saved $3E (TXTPTR hi)
-        pha
-        lda #$00
-        sta C128_RAM_PTR+1
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2
-        pla
-        ldz #$3E
-        sta [C128_RAM_PTR],z    ; write to C128 $3E
-
-        jsr pull_to_a           ; A = saved $3D (TXTPTR lo)
-        pha
-        lda #$00
-        sta C128_RAM_PTR+1
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2
-        pla
-        ldz #$3D
-        sta [C128_RAM_PTR],z    ; write to C128 $3D
-
-        ; Set c128_y = output length (ROM leaves Y = tokenized length)
-        ; hook_crunch_tokenize returned wi in Y
-        sty c128_y
-
-        ; --- ROM $43A7: RTS ---
-        inc c128_sp
-        ldz c128_sp
-        lda [c128_stack_ptr],z  ; return addr low
-        sta c128_pc_lo
-        inc c128_sp
-        ldz c128_sp
-        lda [c128_stack_ptr],z  ; return addr high
-        sta c128_pc_hi
-        inw c128_pc_lo          ; RTS adds 1
-
-        ; Finalize
-        lda #0
-        sta c128_code_valid
-        lda #20
-        #finish_cycles_no_xtra
-        rts
+        ; Crunch disabled - skip
 _h43_skip:
         jmp step_fetch
 
@@ -2358,7 +2264,7 @@ _hook_delete_80col:
         sbc #0
         sta _del_dma_dst+1
 
-        ; Trigger DMA copy (bank 3 to bank 3)
+        ; Trigger DMA copy (bank 5 to bank 5, VDC RAM)
         lda #$00
         sta $D707
         .byte $80, $00          ; src MB = $00
@@ -2369,10 +2275,10 @@ _del_dma_count:
         .word $0000
 _del_dma_src:
         .word $0000
-        .byte $03               ; src bank = 3
+        .byte $05               ; src bank = 5 (VDC RAM)
 _del_dma_dst:
         .word $0000
-        .byte $03               ; dst bank = 3
+        .byte $05               ; dst bank = 5 (VDC RAM)
         .byte $00               ; command high
         .word $0000             ; modulo
 
@@ -2412,10 +2318,10 @@ _del_dma_count2:
         .word $0000
 _del_dma_src2:
         .word $0000
-        .byte $03
+        .byte $05               ; src bank 5 (VDC RAM)
 _del_dma_dst2:
         .word $0000
-        .byte $03
+        .byte $05               ; dst bank 5 (VDC RAM)
         .byte $00
         .word $0000
 
@@ -2618,7 +2524,14 @@ _hook_vdc_poll_skip:
         rts
 
 _hook_chain_kernal_only:
-        ; From table dispatch: X = c128_pc_hi, A = table flag ($80)
+        ; Inline CHROUT removed to reduce code size.
+        ; ROM handles all character output natively.
+        txa                     ; X has c128_pc_hi
+_hook_chain_kernal_not_chrout:
+        txa                     ; X still has c128_pc_hi = $FF
+        bra _hook_chain_kernal_check
+
+_hook_chain_kernal_not_ff:
         txa                     ; Restore pc_hi into A
         bra _hook_chain_kernal_check
 
@@ -2637,6 +2550,8 @@ _hook_chain_kernal_check:
         cmp #$C8
         beq _hook_do_check
         cmp #$A8
+        beq _hook_do_check
+        cmp #$A0
         beq _hook_do_check
         cmp #$4B
         beq _hook_do_check
@@ -2748,19 +2663,6 @@ hook_40col_scroll:
         .byte $00
         .word $0000
 
-        ; --- DMA scroll: LOW_RAM_BUFFER screen mirror (bank 0) ---
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00               ; copy
-        .word 960
-        .word LOW_RAM_BUFFER + $0428 ; src = LOW_RAM_BUFFER + $0428
-        .byte $00               ; src bank 0
-        .word LOW_RAM_BUFFER + $0400 ; dst = LOW_RAM_BUFFER + $0400
-        .byte $00               ; dst bank 0
-        .byte $00
-        .word $0000
-
         ; (40-col mode: MEGA65 SCRNPTR points at $040400 in bank 4 directly,
         ; so the bank 4 DMA above handles the display. No bank 2 copy needed.)
         ; --- DMA scroll: MEGA65 color RAM ---
@@ -2786,19 +2688,6 @@ hook_40col_scroll:
         .byte $00
         .word $07C0             ; dst = $0407C0 (row 24 = offset 960)
         .byte $04
-        .byte $00
-        .word $0000
-
-        ; --- DMA fill: clear bottom line in LOW_RAM_BUFFER ---
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03               ; fill
-        .word 40
-        .word $0020             ; fill with space ($20)
-        .byte $00
-        .word LOW_RAM_BUFFER + $07C0 ; dst = LOW_RAM_BUFFER + $07C0
-        .byte $00
         .byte $00
         .word $0000
 
@@ -2828,7 +2717,6 @@ _h4s_color_val:
         ; --- Update line link bitmap at $035E-$0361 in bank 4 ---
         ; Bitmap layout: byte 0 ($035E) bit7=line0 ... byte 3 ($0361) bit7=line24
         ; Scroll up = shift entire 32-bit value left by 1
-        ; Read from bank 4, update, write back to bank 4 AND LOW_RAM_BUFFER
         lda #$03
         sta C128_RAM_PTR+1      ; page 3
 
@@ -2836,26 +2724,22 @@ _h4s_color_val:
         lda [C128_RAM_PTR],z
         asl                     ; shift left, bit 7 -> carry
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $0361
 
         ldz #$60                ; $0360
         lda [C128_RAM_PTR],z
         rol                     ; shift left with carry
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $0360
 
         ldz #$5F                ; $035F
         lda [C128_RAM_PTR],z
         rol
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $035F
 
         ldz #$5E                ; $035E
         lda [C128_RAM_PTR],z
         rol
         and #$7F                ; clear line 0 link bit (top line always unlinked)
         sta [C128_RAM_PTR],z
-        sta LOW_RAM_BUFFER + $035E
 
         ; Restore C128_RAM_PTR page to 0 (convention)
         lda #$00
@@ -2870,780 +2754,9 @@ _h4s_skip:
         lda #$00
         rts
 
-; ============================================================
-; hook_crunch_tokenize - Fast BASIC 7.0 tokenizer
-; Replaces CRUNCH ($430A) for native-speed tokenization.
-; Reads input from TXTPTR ($3D/$3E), tokenizes in-place.
-; Returns Z=0 if handled, Z=1 if not.
-;
-; The C128 CRUNCH routine:
-; 1. Reads text from buffer pointed to by $3D/$3E
-; 2. Replaces keywords with token bytes
-; 3. Handles quotes (no tokenization inside)
-; 4. After REM: rest of line copied literally
-; 5. After DATA: literal until colon, then resume
-; 6. '?' is shorthand for PRINT ($99)
-; 7. Restores $3D/$3E to saved values on exit
-; ============================================================
-hook_crunch_tokenize:
-        ; Read TXTPTR ($3D/$3E) from C128 ZP (bank 4)
-        ; Convention: C128_RAM_PTR+0 must stay 0, use Z as low byte
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2
-        lda #$00
-        sta C128_RAM_PTR+1      ; page 0 for ZP
-        ldz #$3D
-        lda [C128_RAM_PTR],z
-        sta _crunch_src
-        sta _crunch_dst
-        ldz #$3E
-        lda [C128_RAM_PTR],z
-        sta _crunch_src+1
-        sta _crunch_dst+1
+; Crunch tokenizer and keyword tables removed to reduce code size
+; (BASIC tokenizer runs natively through ROM)
 
-        ; Initialize read/write indices
-        lda #0
-        sta _crunch_ri
-        sta _crunch_wi
-
-_crunch_loop:
-        ; Read next input character
-        jsr _crunch_read_src
-        beq _crunch_done        ; $00 = end of line
-
-        ; Check for quote
-        cmp #$22                ; '"'
-        beq _crunch_quote
-
-        ; Check for '?' -> PRINT shorthand
-        cmp #$3F                ; '?'
-        bne _crunch_not_q
-        lda #$99                ; PRINT token
-        jsr _crunch_write_dst
-        inc _crunch_ri
-        jmp _crunch_loop
-
-_crunch_not_q:
-        ; Check if already a token (>= $80)
-        cmp #$80
-        bcc _crunch_try_keyword
-        ; Already a token or PETSCII $80+: just copy
-        cmp #$FF
-        bne _crunch_copy_char
-        ; Pi character $FF - the ROM keeps it as-is in tokenized form
-        jmp _crunch_copy_char
-
-_crunch_try_keyword:
-        ; Try to match a keyword at current position
-        ; Try main table first (single-byte tokens $80-$CB)
-        ldx #0                  ; keyword table index
-_crunch_kw_loop:
-        lda _kw_main_table_lo,x
-        ora _kw_main_table_hi,x
-        beq _crunch_no_match    ; end of table (null pointer)
-        jsr _crunch_try_one_keyword
-        bcc _crunch_kw_next     ; no match
-        ; Match! Token is in A, keyword length consumed in _crunch_ri
-        jsr _crunch_write_dst
-        ; Check for REM or DATA
-        cmp #$8F                ; REM?
-        beq _crunch_rem
-        cmp #$83                ; DATA?
-        beq _crunch_data
-        jmp _crunch_loop
-_crunch_kw_next:
-        inx
-        bne _crunch_kw_loop     ; loop (max 256 entries)
-
-_crunch_no_match:
-        ; No keyword matched - copy character as-is
-_crunch_copy_char:
-        jsr _crunch_read_src    ; re-read current char
-        jsr _crunch_write_dst
-        inc _crunch_ri
-        jmp _crunch_loop
-
-_crunch_quote:
-        ; Inside quotes: copy everything until closing quote or end of line
-        jsr _crunch_write_dst   ; write the opening quote
-        inc _crunch_ri
-_crunch_quote_loop:
-        jsr _crunch_read_src
-        beq _crunch_done        ; end of line inside quotes
-        jsr _crunch_write_dst
-        inc _crunch_ri
-        cmp #$22                ; closing quote?
-        bne _crunch_quote_loop
-        jmp _crunch_loop        ; resume tokenizing
-
-_crunch_data:
-        ; After DATA: copy literally until colon or end of line
-        jsr _crunch_read_src
-        beq _crunch_done
-        cmp #$3A                ; colon?
-        beq _crunch_copy_char   ; copy the colon and resume tokenizing
-        jsr _crunch_write_dst
-        inc _crunch_ri
-        jmp _crunch_data
-
-_crunch_rem:
-        ; After REM: copy rest of line literally
-        jsr _crunch_read_src
-        beq _crunch_done
-        jsr _crunch_write_dst
-        inc _crunch_ri
-        jmp _crunch_rem
-
-_crunch_done:
-        ; Write terminating zero
-        lda #$00
-        jsr _crunch_write_dst
-
-        ; Restore TXTPTR ($3D/$3E) - CRUNCH restores saved values
-        ; The saved values are on the C128 stack (pushed at $430D-$4312)
-        ; We need to pop them and restore. Actually, CRUNCH pushes $3D then $3E,
-        ; and at exit pops them back. Since we're simulating the entire CRUNCH,
-        ; we need to pop those two bytes from the stack and restore $3D/$3E.
-        ; $430D: LDA $3D / PHA / LDA $3E / PHA
-        ; $43A1: PLA / STA $3E / PLA / STA $3D
-        ; We didn't push them, so we just leave $3D/$3E as-is.
-        ; Actually - we DIDN'T execute the prologue! CRUNCH starts with:
-        ;   $430A: JMP ($0304)  -> goes to $430D
-        ;   $430D: LDA $3D / PHA / LDA $3E / PHA
-        ; We intercepted at $430A before the prologue ran.
-        ; So the stack doesn't have the pushed values.
-        ; CRUNCH's epilogue ($43A1) pops and restores $3D/$3E.
-        ; Since we didn't push, we skip the epilogue too (our RTS in dispatch).
-        ; The net effect: $3D/$3E is unchanged. This matches what CRUNCH does
-        ; (push then pop = restore original value). Perfect.
-
-        ; Ensure C128_RAM_PTR+0 = 0 (emulator convention)
-        ; +1 and +2 are set fresh by read/write_data_fast before each use
-
-        ; Return: Y = write index (tokenized output length)
-        ldy _crunch_wi
-        rts
-_dbg_z_save: .byte 0
-_dbg_byte:   .byte 0
-; Screen codes for hex digits 0-F
-_hex_scr: .byte $30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$01,$02,$03,$04,$05,$06
-
-; Helper: write A as 2-digit hex to screen at [C128_RAM_PTR]+Z, Z+=3
-; Assumes C128_RAM_PTR points to $0400 screen, bank 4
-_dbg_write_hex:
-        stz _dbg_z_save         ; save Z position to memory
-        sta _dbg_byte           ; save original byte
-        lsr
-        lsr
-        lsr
-        lsr
-        tax
-        lda _hex_scr,x
-        ldz _dbg_z_save
-        sta [C128_RAM_PTR],z
-        inz
-        lda _dbg_byte
-        and #$0F
-        tax
-        lda _hex_scr,x
-        sta [C128_RAM_PTR],z
-        inz
-        lda #$20                ; space
-        sta [C128_RAM_PTR],z
-        inz
-        rts
-
-; Helper: write A as 2-digit hex at screen position Z
-_dbg_write_hex_at:
-        pha
-        lsr
-        lsr
-        lsr
-        lsr
-        tax
-        lda _hex_scr,x
-        sta [C128_RAM_PTR],z
-        inz
-        pla
-        and #$0F
-        tax
-        lda _hex_scr,x
-        sta [C128_RAM_PTR],z
-        inz
-        lda #$20
-        sta [C128_RAM_PTR],z
-        rts
-
-; --- Helper: read byte at [src + ri] from bank 4 ---
-_crunch_read_src:
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2      ; ensure bank 4
-        ; Keep +0 = 0, use Z = low byte, +1 = page
-        lda _crunch_ri
-        clc
-        adc _crunch_src         ; low byte = src_lo + ri
-        taz                     ; Z = low byte
-        lda _crunch_src+1
-        adc #$00                ; page with carry
-        sta C128_RAM_PTR+1
-        lda [C128_RAM_PTR],z
-        rts
-; --- Helper: write byte A at [dst + wi], advance wi ---
-_crunch_write_dst:
-        pha
-        lda #BANK_RAM0
-        sta C128_RAM_PTR+2      ; ensure bank 4
-        ; Keep +0 = 0, use Z = low byte, +1 = page
-        lda _crunch_wi
-        clc
-        adc _crunch_dst         ; low byte = dst_lo + wi
-        taz                     ; Z = low byte
-        lda _crunch_dst+1
-        adc #$00                ; page with carry
-        sta C128_RAM_PTR+1
-        pla
-        sta [C128_RAM_PTR],z
-        inc _crunch_wi
-        rts
-
-; --- Helper: try matching keyword X against input at ri ---
-; Returns C=1 if match (A=token, _crunch_ri advanced past keyword)
-; Returns C=0 if no match (_crunch_ri unchanged)
-_crunch_try_one_keyword:
-        ; Get keyword string pointer
-        lda _kw_main_table_lo,x
-        sta _crunch_kw_ptr
-        lda _kw_main_table_hi,x
-        sta _crunch_kw_ptr+1
-
-        ; Save current read index
-        lda _crunch_ri
-        sta _crunch_ri_save
-
-        ; Compare characters
-        ldy #0                  ; keyword index
-_crunch_cmp_loop:
-        lda (_crunch_kw_ptr),y
-        beq _crunch_kw_matched  ; $00 = end of keyword -> match!
-        ; Compare with input
-        pha
-        tya
-        clc
-        adc _crunch_ri_save     ; input offset = ri_save + y
-        sta _crunch_ri
-        jsr _crunch_read_src
-        sta _crunch_tmp
-        pla                     ; keyword char
-        cmp _crunch_tmp
-        bne _crunch_kw_no
-        iny
-        bne _crunch_cmp_loop    ; always (keywords < 256 chars)
-
-_crunch_kw_matched:
-        ; Match! Update ri to past the keyword
-        tya
-        clc
-        adc _crunch_ri_save
-        sta _crunch_ri
-        ; Get token value: it's stored after the keyword string ($00 terminated)
-        lda (_crunch_kw_ptr),y  ; Y points at the $00
-        iny
-        lda (_crunch_kw_ptr),y  ; token byte 1
-        sta _crunch_tmp
-        iny
-        lda (_crunch_kw_ptr),y  ; token byte 2 (or $00 for single-byte)
-        beq _crunch_kw_single
-        ; Two-byte token: write prefix first
-        pha
-        lda _crunch_tmp         ; prefix ($FE or $CE)
-        jsr _crunch_write_dst
-        pla                     ; second byte
-        sec                     ; C=1 = match
-        rts
-_crunch_kw_single:
-        lda _crunch_tmp         ; single token byte
-        sec                     ; C=1 = match
-        rts
-
-_crunch_kw_no:
-        ; No match - restore ri
-        lda _crunch_ri_save
-        sta _crunch_ri
-        clc                     ; C=0 = no match
-        rts
-
-; --- Tokenizer variables ---
-_crunch_src:      .word 0       ; source buffer address
-_crunch_dst:      .word 0       ; dest buffer address (same as src for in-place)
-_crunch_ri:       .byte 0       ; read index
-_crunch_wi:       .byte 0       ; write index
-_crunch_ri_save:  .byte 0       ; saved ri for backtrack
-_crunch_tmp:      .byte 0       ; temp byte
-_crunch_save_ptr0: .byte 0      ; saved C128_RAM_PTR bytes
-_crunch_save_ptr1: .byte 0
-_crunch_save_ptr2: .byte 0
-_crunch_save_ptr3: .byte 0
-; _crunch_kw_ptr uses ZP location $EC-$ED (2-byte pointer, bank 0)
-_crunch_kw_ptr    = $EC          ; 2 bytes in ZP for (ptr),y indirect
-
-; ============================================================
-; BASIC 7.0 Keyword Table
-; Format: keyword string (PETSCII, $00 terminated), token byte(s), $00 end
-; For single-byte tokens: string, $00, token, $00
-; For two-byte tokens: string, $00, prefix ($FE/$CE), second_byte
-; Keywords are ordered with longer matches first where ambiguous
-; (e.g., INPUT# before INPUT, PRINT# before PRINT)
-; ============================================================
-        .enc "none"             ; raw ASCII = PETSCII uppercase
-
-; Keyword string data
-_kw_s_end:       .text "end"
-                 .byte 0,$80,0
-_kw_s_for:       .text "for"
-                 .byte 0,$81,0
-_kw_s_next:      .text "next"
-                 .byte 0,$82,0
-_kw_s_data:      .text "data"
-                 .byte 0,$83,0
-_kw_s_inputn:    .text "input#"
-                 .byte 0,$84,0
-_kw_s_input:     .text "input"
-                 .byte 0,$85,0
-_kw_s_dim:       .text "dim"
-                 .byte 0,$86,0
-_kw_s_read:      .text "read"
-                 .byte 0,$87,0
-_kw_s_let:       .text "let"
-                 .byte 0,$88,0
-_kw_s_goto:      .text "goto"
-                 .byte 0,$89,0
-_kw_s_run:       .text "run"
-                 .byte 0,$8A,0
-_kw_s_if:        .text "if"
-                 .byte 0,$8B,0
-_kw_s_restore:   .text "restore"
-                 .byte 0,$8C,0
-_kw_s_gosub:     .text "gosub"
-                 .byte 0,$8D,0
-_kw_s_return:    .text "return"
-                 .byte 0,$8E,0
-_kw_s_rem:       .text "rem"
-                 .byte 0,$8F,0
-_kw_s_stop:      .text "stop"
-                 .byte 0,$90,0
-_kw_s_on:        .text "on"
-                 .byte 0,$91,0
-_kw_s_wait:      .text "wait"
-                 .byte 0,$92,0
-_kw_s_load:      .text "load"
-                 .byte 0,$93,0
-_kw_s_save:      .text "save"
-                 .byte 0,$94,0
-_kw_s_verify:    .text "verify"
-                 .byte 0,$95,0
-_kw_s_def:       .text "def"
-                 .byte 0,$96,0
-_kw_s_poke:      .text "poke"
-                 .byte 0,$97,0
-_kw_s_printn:    .text "print#"
-                 .byte 0,$98,0
-_kw_s_print:     .text "print"
-                 .byte 0,$99,0
-_kw_s_cont:      .text "cont"
-                 .byte 0,$9A,0
-_kw_s_list:      .text "list"
-                 .byte 0,$9B,0
-_kw_s_clr:       .text "clr"
-                 .byte 0,$9C,0
-_kw_s_cmd:       .text "cmd"
-                 .byte 0,$9D,0
-_kw_s_sys:       .text "sys"
-                 .byte 0,$9E,0
-_kw_s_open:      .text "open"
-                 .byte 0,$9F,0
-_kw_s_close:     .text "close"
-                 .byte 0,$A0,0
-_kw_s_get:       .text "get"
-                 .byte 0,$A1,0
-_kw_s_new:       .text "new"
-                 .byte 0,$A2,0
-_kw_s_tab:       .text "tab("
-                 .byte 0,$A3,0
-_kw_s_to:        .text "to"
-                 .byte 0,$A4,0
-_kw_s_fn:        .text "fn"
-                 .byte 0,$A5,0
-_kw_s_spc:       .text "spc("
-                 .byte 0,$A6,0
-_kw_s_then:      .text "then"
-                 .byte 0,$A7,0
-_kw_s_not:       .text "not"
-                 .byte 0,$A8,0
-_kw_s_step:      .text "step"
-                 .byte 0,$A9,0
-_kw_s_and:       .text "and"
-                 .byte 0,$AF,0
-_kw_s_or:        .text "or"
-                 .byte 0,$B0,0
-_kw_s_sgn:       .text "sgn"
-                 .byte 0,$B4,0
-_kw_s_int:       .text "int"
-                 .byte 0,$B5,0
-_kw_s_abs:       .text "abs"
-                 .byte 0,$B6,0
-_kw_s_usr:       .text "usr"
-                 .byte 0,$B7,0
-_kw_s_fre:       .text "fre"
-                 .byte 0,$B8,0
-_kw_s_pos:       .text "pos"
-                 .byte 0,$B9,0
-_kw_s_sqr:       .text "sqr"
-                 .byte 0,$BA,0
-_kw_s_rnd:       .text "rnd"
-                 .byte 0,$BB,0
-_kw_s_log:       .text "log"
-                 .byte 0,$BC,0
-_kw_s_exp:       .text "exp"
-                 .byte 0,$BD,0
-_kw_s_cos:       .text "cos"
-                 .byte 0,$BE,0
-_kw_s_sin:       .text "sin"
-                 .byte 0,$BF,0
-_kw_s_tan:       .text "tan"
-                 .byte 0,$C0,0
-_kw_s_atn:       .text "atn"
-                 .byte 0,$C1,0
-_kw_s_peek:      .text "peek"
-                 .byte 0,$C2,0
-_kw_s_len:       .text "len"
-                 .byte 0,$C3,0
-_kw_s_strd:      .text "str$"
-                 .byte 0,$C4,0
-_kw_s_val:       .text "val"
-                 .byte 0,$C5,0
-_kw_s_asc:       .text "asc"
-                 .byte 0,$C6,0
-_kw_s_chrd:      .text "chr$"
-                 .byte 0,$C7,0
-_kw_s_leftd:     .text "left$"
-                 .byte 0,$C8,0
-_kw_s_rightd:    .text "right$"
-                 .byte 0,$C9,0
-_kw_s_midd:      .text "mid$"
-                 .byte 0,$CA,0
-_kw_s_go:        .text "go"
-                 .byte 0,$CB,0
-; C128-specific single byte tokens ($CC-$FD)
-_kw_s_rgr:       .text "rgr"
-                 .byte 0,$CC,0
-_kw_s_rclr:      .text "rclr"
-                 .byte 0,$CD,0
-; $CE = function extender prefix (not a keyword)
-_kw_s_joy:       .text "joy"
-                 .byte 0,$CF,0
-_kw_s_rdot:      .text "rdot"
-                 .byte 0,$D0,0
-_kw_s_dec:       .text "dec"
-                 .byte 0,$D1,0
-_kw_s_hexd:      .text "hex$"
-                 .byte 0,$D2,0
-_kw_s_errd:      .text "err$"
-                 .byte 0,$D3,0
-_kw_s_instr:     .text "instr"
-                 .byte 0,$D4,0
-_kw_s_else:      .text "else"
-                 .byte 0,$D5,0
-_kw_s_resume:    .text "resume"
-                 .byte 0,$D6,0
-_kw_s_trap:      .text "trap"
-                 .byte 0,$D7,0
-_kw_s_tron:      .text "tron"
-                 .byte 0,$D8,0
-_kw_s_troff:     .text "troff"
-                 .byte 0,$D9,0
-_kw_s_sound:     .text "sound"
-                 .byte 0,$DA,0
-_kw_s_vol:       .text "vol"
-                 .byte 0,$DB,0
-_kw_s_auto:      .text "auto"
-                 .byte 0,$DC,0
-_kw_s_pudef:     .text "pudef"
-                 .byte 0,$DD,0
-_kw_s_graphic:   .text "graphic"
-                 .byte 0,$DE,0
-_kw_s_paint:     .text "paint"
-                 .byte 0,$DF,0
-_kw_s_char:      .text "char"
-                 .byte 0,$E0,0
-_kw_s_box:       .text "box"
-                 .byte 0,$E1,0
-_kw_s_circle:    .text "circle"
-                 .byte 0,$E2,0
-_kw_s_gshape:    .text "gshape"
-                 .byte 0,$E3,0
-_kw_s_sshape:    .text "sshape"
-                 .byte 0,$E4,0
-_kw_s_draw:      .text "draw"
-                 .byte 0,$E5,0
-_kw_s_locate:    .text "locate"
-                 .byte 0,$E6,0
-_kw_s_color:     .text "color"
-                 .byte 0,$E7,0
-_kw_s_scnclr:    .text "scnclr"
-                 .byte 0,$E8,0
-_kw_s_scale:     .text "scale"
-                 .byte 0,$E9,0
-_kw_s_help:      .text "help"
-                 .byte 0,$EA,0
-_kw_s_do:        .text "do"
-                 .byte 0,$EB,0
-_kw_s_loop:      .text "loop"
-                 .byte 0,$EC,0
-_kw_s_exit:      .text "exit"
-                 .byte 0,$ED,0
-_kw_s_directory: .text "directory"
-                 .byte 0,$EE,0
-_kw_s_dsave:     .text "dsave"
-                 .byte 0,$EF,0
-_kw_s_dload:     .text "dload"
-                 .byte 0,$F0,0
-_kw_s_header:    .text "header"
-                 .byte 0,$F1,0
-_kw_s_scratch:   .text "scratch"
-                 .byte 0,$F2,0
-_kw_s_collect:   .text "collect"
-                 .byte 0,$F3,0
-_kw_s_copy:      .text "copy"
-                 .byte 0,$F4,0
-_kw_s_rename:    .text "rename"
-                 .byte 0,$F5,0
-_kw_s_backup:    .text "backup"
-                 .byte 0,$F6,0
-_kw_s_delete:    .text "delete"
-                 .byte 0,$F7,0
-_kw_s_renumber:  .text "renumber"
-                 .byte 0,$F8,0
-_kw_s_key:       .text "key"
-                 .byte 0,$F9,0
-_kw_s_monitor:   .text "monitor"
-                 .byte 0,$FA,0
-_kw_s_using:     .text "using"
-                 .byte 0,$FB,0
-_kw_s_until:     .text "until"
-                 .byte 0,$FC,0
-_kw_s_while:     .text "while"
-                 .byte 0,$FD,0
-; Extended statements ($FE + second byte)
-_kw_s_bank:      .text "bank"
-                 .byte 0,$FE,$02
-_kw_s_filter:    .text "filter"
-                 .byte 0,$FE,$03
-_kw_s_play:      .text "play"
-                 .byte 0,$FE,$04
-_kw_s_tempo:     .text "tempo"
-                 .byte 0,$FE,$05
-_kw_s_movspr:    .text "movspr"
-                 .byte 0,$FE,$06
-_kw_s_sprite:    .text "sprite"
-                 .byte 0,$FE,$07
-_kw_s_sprcolor:  .text "sprcolor"
-                 .byte 0,$FE,$08
-_kw_s_rreg:      .text "rreg"
-                 .byte 0,$FE,$09
-_kw_s_envelope:  .text "envelope"
-                 .byte 0,$FE,$0A
-_kw_s_sleep:     .text "sleep"
-                 .byte 0,$FE,$0B
-_kw_s_catalog:   .text "catalog"
-                 .byte 0,$FE,$0C
-_kw_s_dopen:     .text "dopen"
-                 .byte 0,$FE,$0D
-_kw_s_append:    .text "append"
-                 .byte 0,$FE,$0E
-_kw_s_dclose:    .text "dclose"
-                 .byte 0,$FE,$0F
-_kw_s_bsave:     .text "bsave"
-                 .byte 0,$FE,$10
-_kw_s_bload:     .text "bload"
-                 .byte 0,$FE,$11
-_kw_s_record:    .text "record"
-                 .byte 0,$FE,$12
-_kw_s_concat:    .text "concat"
-                 .byte 0,$FE,$13
-_kw_s_dverify:   .text "dverify"
-                 .byte 0,$FE,$14
-_kw_s_dclear:    .text "dclear"
-                 .byte 0,$FE,$15
-_kw_s_sprsav:    .text "sprsav"
-                 .byte 0,$FE,$16
-_kw_s_collision: .text "collision"
-                 .byte 0,$FE,$17
-_kw_s_begin:     .text "begin"
-                 .byte 0,$FE,$18
-_kw_s_bend:      .text "bend"
-                 .byte 0,$FE,$19
-_kw_s_window:    .text "window"
-                 .byte 0,$FE,$1A
-_kw_s_boot:      .text "boot"
-                 .byte 0,$FE,$1B
-_kw_s_width:     .text "width"
-                 .byte 0,$FE,$1C
-_kw_s_sprdef:    .text "sprdef"
-                 .byte 0,$FE,$1D
-_kw_s_quit:      .text "quit"
-                 .byte 0,$FE,$1E
-_kw_s_stash:     .text "stash"
-                 .byte 0,$FE,$1F
-_kw_s_fetch:     .text "fetch"
-                 .byte 0,$FE,$21
-_kw_s_swap:      .text "swap"
-                 .byte 0,$FE,$23
-_kw_s_off:       .text "off"
-                 .byte 0,$FE,$24
-_kw_s_fast:      .text "fast"
-                 .byte 0,$FE,$25
-_kw_s_slow:      .text "slow"
-                 .byte 0,$FE,$26
-; Extended functions ($CE + second byte)
-_kw_s_pot:       .text "pot"
-                 .byte 0,$CE,$02
-_kw_s_bump:      .text "bump"
-                 .byte 0,$CE,$03
-_kw_s_pen:       .text "pen"
-                 .byte 0,$CE,$04
-_kw_s_rsppos:    .text "rsppos"
-                 .byte 0,$CE,$05
-_kw_s_rsprite:   .text "rsprite"
-                 .byte 0,$CE,$06
-_kw_s_rspcolor:  .text "rspcolor"
-                 .byte 0,$CE,$07
-_kw_s_xor:       .text "xor"
-                 .byte 0,$CE,$08
-_kw_s_rwindow:   .text "rwindow"
-                 .byte 0,$CE,$09
-_kw_s_pointer:   .text "pointer"
-                 .byte 0,$CE,$0A
-
-; Single-character operator tokens
-_kw_s_plus:      .text "+"
-                 .byte 0,$AA,0
-_kw_s_minus:     .text "-"
-                 .byte 0,$AB,0
-_kw_s_star:      .text "*"
-                 .byte 0,$AC,0
-_kw_s_slash:     .text "/"
-                 .byte 0,$AD,0
-_kw_s_power:     .byte $5E
-                 .byte 0,$AE,0
-_kw_s_greater:   .text ">"
-                 .byte 0,$B1,0
-_kw_s_equal:     .text "="
-                 .byte 0,$B2,0
-_kw_s_less:      .text "<"
-                 .byte 0,$B3,0
-
-; Keyword pointer table (lo/hi pairs)
-; Order matters: longer keywords first where prefix conflicts exist
-; e.g., INPUT# before INPUT, PRINT# before PRINT, GOSUB before GO, etc.
-_kw_main_table_lo:
-        .byte <_kw_s_inputn, <_kw_s_input, <_kw_s_printn, <_kw_s_print
-        .byte <_kw_s_directory, <_kw_s_dverify, <_kw_s_dclose, <_kw_s_dclear
-        .byte <_kw_s_dopen, <_kw_s_dload, <_kw_s_dsave
-        .byte <_kw_s_collision, <_kw_s_collect, <_kw_s_concat
-        .byte <_kw_s_sprcolor, <_kw_s_sprsav, <_kw_s_sprdef, <_kw_s_sprite
-        .byte <_kw_s_envelope, <_kw_s_renumber, <_kw_s_rspcolor
-        .byte <_kw_s_rsprite, <_kw_s_rwindow, <_kw_s_rsppos
-        .byte <_kw_s_restore, <_kw_s_return, <_kw_s_resume, <_kw_s_record
-        .byte <_kw_s_rename, <_kw_s_rightd, <_kw_s_pointer
-        .byte <_kw_s_graphic, <_kw_s_gshape, <_kw_s_gosub, <_kw_s_goto
-        .byte <_kw_s_monitor, <_kw_s_movspr
-        .byte <_kw_s_scnclr, <_kw_s_scratch, <_kw_s_sshape
-        .byte <_kw_s_catalog, <_kw_s_circle
-        .byte <_kw_s_leftd, <_kw_s_locate, <_kw_s_backup, <_kw_s_begin
-        .byte <_kw_s_filter, <_kw_s_header, <_kw_s_delete
-        .byte <_kw_s_verify, <_kw_s_window
-        .byte <_kw_s_append, <_kw_s_instr
-        .byte <_kw_s_color, <_kw_s_close, <_kw_s_troff, <_kw_s_sleep
-        .byte <_kw_s_stash, <_kw_s_scale, <_kw_s_sound, <_kw_s_width
-        .byte <_kw_s_while, <_kw_s_until, <_kw_s_using, <_kw_s_fetch
-        .byte <_kw_s_bsave, <_kw_s_bload, <_kw_s_midd
-        .byte <_kw_s_tron, <_kw_s_trap, <_kw_s_tempo, <_kw_s_then
-        .byte <_kw_s_errd, <_kw_s_else, <_kw_s_exit
-        .byte <_kw_s_next, <_kw_s_data, <_kw_s_read, <_kw_s_poke
-        .byte <_kw_s_cont, <_kw_s_list, <_kw_s_open, <_kw_s_step
-        .byte <_kw_s_peek, <_kw_s_strd, <_kw_s_chrd, <_kw_s_hexd
-        .byte <_kw_s_pudef, <_kw_s_paint, <_kw_s_draw, <_kw_s_help
-        .byte <_kw_s_loop, <_kw_s_copy, <_kw_s_play, <_kw_s_fast
-        .byte <_kw_s_slow, <_kw_s_swap, <_kw_s_bend, <_kw_s_boot
-        .byte <_kw_s_rreg, <_kw_s_rclr, <_kw_s_rdot, <_kw_s_bump
-        .byte <_kw_s_auto, <_kw_s_char, <_kw_s_save, <_kw_s_load
-        .byte <_kw_s_wait, <_kw_s_stop, <_kw_s_dim
-        .byte <_kw_s_for, <_kw_s_end, <_kw_s_rem, <_kw_s_let
-        .byte <_kw_s_run, <_kw_s_new, <_kw_s_clr, <_kw_s_cmd
-        .byte <_kw_s_sys, <_kw_s_def, <_kw_s_tab, <_kw_s_spc
-        .byte <_kw_s_and, <_kw_s_not, <_kw_s_sgn, <_kw_s_abs
-        .byte <_kw_s_usr, <_kw_s_fre, <_kw_s_pos, <_kw_s_sqr
-        .byte <_kw_s_rnd, <_kw_s_log, <_kw_s_exp, <_kw_s_cos
-        .byte <_kw_s_sin, <_kw_s_tan, <_kw_s_atn, <_kw_s_len
-        .byte <_kw_s_val, <_kw_s_asc, <_kw_s_rgr, <_kw_s_joy
-        .byte <_kw_s_dec, <_kw_s_vol, <_kw_s_key, <_kw_s_box
-        .byte <_kw_s_pen, <_kw_s_xor, <_kw_s_pot, <_kw_s_off
-        .byte <_kw_s_get, <_kw_s_if, <_kw_s_on, <_kw_s_or
-        .byte <_kw_s_to, <_kw_s_fn, <_kw_s_go, <_kw_s_do
-        .byte <_kw_s_quit
-        .byte <_kw_s_plus, <_kw_s_minus, <_kw_s_star, <_kw_s_slash
-        .byte <_kw_s_power, <_kw_s_greater, <_kw_s_equal, <_kw_s_less
-        .byte 0                 ; end of table
-
-_kw_main_table_hi:
-        .byte >_kw_s_inputn, >_kw_s_input, >_kw_s_printn, >_kw_s_print
-        .byte >_kw_s_directory, >_kw_s_dverify, >_kw_s_dclose, >_kw_s_dclear
-        .byte >_kw_s_dopen, >_kw_s_dload, >_kw_s_dsave
-        .byte >_kw_s_collision, >_kw_s_collect, >_kw_s_concat
-        .byte >_kw_s_sprcolor, >_kw_s_sprsav, >_kw_s_sprdef, >_kw_s_sprite
-        .byte >_kw_s_envelope, >_kw_s_renumber, >_kw_s_rspcolor
-        .byte >_kw_s_rsprite, >_kw_s_rwindow, >_kw_s_rsppos
-        .byte >_kw_s_restore, >_kw_s_return, >_kw_s_resume, >_kw_s_record
-        .byte >_kw_s_rename, >_kw_s_rightd, >_kw_s_pointer
-        .byte >_kw_s_graphic, >_kw_s_gshape, >_kw_s_gosub, >_kw_s_goto
-        .byte >_kw_s_monitor, >_kw_s_movspr
-        .byte >_kw_s_scnclr, >_kw_s_scratch, >_kw_s_sshape
-        .byte >_kw_s_catalog, >_kw_s_circle
-        .byte >_kw_s_leftd, >_kw_s_locate, >_kw_s_backup, >_kw_s_begin
-        .byte >_kw_s_filter, >_kw_s_header, >_kw_s_delete
-        .byte >_kw_s_verify, >_kw_s_window
-        .byte >_kw_s_append, >_kw_s_instr
-        .byte >_kw_s_color, >_kw_s_close, >_kw_s_troff, >_kw_s_sleep
-        .byte >_kw_s_stash, >_kw_s_scale, >_kw_s_sound, >_kw_s_width
-        .byte >_kw_s_while, >_kw_s_until, >_kw_s_using, >_kw_s_fetch
-        .byte >_kw_s_bsave, >_kw_s_bload, >_kw_s_midd
-        .byte >_kw_s_tron, >_kw_s_trap, >_kw_s_tempo, >_kw_s_then
-        .byte >_kw_s_errd, >_kw_s_else, >_kw_s_exit
-        .byte >_kw_s_next, >_kw_s_data, >_kw_s_read, >_kw_s_poke
-        .byte >_kw_s_cont, >_kw_s_list, >_kw_s_open, >_kw_s_step
-        .byte >_kw_s_peek, >_kw_s_strd, >_kw_s_chrd, >_kw_s_hexd
-        .byte >_kw_s_pudef, >_kw_s_paint, >_kw_s_draw, >_kw_s_help
-        .byte >_kw_s_loop, >_kw_s_copy, >_kw_s_play, >_kw_s_fast
-        .byte >_kw_s_slow, >_kw_s_swap, >_kw_s_bend, >_kw_s_boot
-        .byte >_kw_s_rreg, >_kw_s_rclr, >_kw_s_rdot, >_kw_s_bump
-        .byte >_kw_s_auto, >_kw_s_char, >_kw_s_save, >_kw_s_load
-        .byte >_kw_s_wait, >_kw_s_stop, >_kw_s_dim
-        .byte >_kw_s_for, >_kw_s_end, >_kw_s_rem, >_kw_s_let
-        .byte >_kw_s_run, >_kw_s_new, >_kw_s_clr, >_kw_s_cmd
-        .byte >_kw_s_sys, >_kw_s_def, >_kw_s_tab, >_kw_s_spc
-        .byte >_kw_s_and, >_kw_s_not, >_kw_s_sgn, >_kw_s_abs
-        .byte >_kw_s_usr, >_kw_s_fre, >_kw_s_pos, >_kw_s_sqr
-        .byte >_kw_s_rnd, >_kw_s_log, >_kw_s_exp, >_kw_s_cos
-        .byte >_kw_s_sin, >_kw_s_tan, >_kw_s_atn, >_kw_s_len
-        .byte >_kw_s_val, >_kw_s_asc, >_kw_s_rgr, >_kw_s_joy
-        .byte >_kw_s_dec, >_kw_s_vol, >_kw_s_key, >_kw_s_box
-        .byte >_kw_s_pen, >_kw_s_xor, >_kw_s_pot, >_kw_s_off
-        .byte >_kw_s_get, >_kw_s_if, >_kw_s_on, >_kw_s_or
-        .byte >_kw_s_to, >_kw_s_fn, >_kw_s_go, >_kw_s_do
-        .byte >_kw_s_quit
-        .byte >_kw_s_plus, >_kw_s_minus, >_kw_s_star, >_kw_s_slash
-        .byte >_kw_s_power, >_kw_s_greater, >_kw_s_equal, >_kw_s_less
-        .byte 0
 
 op_illegal:
         ; ILLEGAL OPCODE - show diagnostic info
@@ -4303,23 +3416,23 @@ op_00:
         lda #$07                ; yellow border
         sta $D020
 
-        ; Dump BRK diagnostic info at $7050
+        ; Dump BRK diagnostic info at $A110 (safe area)
         lda c128_pc_hi
-        sta $7050               ; PC hi (points past BRK opcode)
+        sta $A110               ; PC hi (points past BRK opcode)
         lda c128_pc_lo
-        sta $7051               ; PC lo
+        sta $A111               ; PC lo
         lda c128_sp
-        sta $7052
+        sta $A112
         lda c128_a
-        sta $7053
+        sta $A113
         lda c128_x
-        sta $7054
+        sta $A114
         lda c128_y
-        sta $7055
+        sta $A115
         lda c128_p
-        sta $7056
+        sta $A116
         lda mmu_cr
-        sta $7057
+        sta $A117
 
         ; Standard BRK sequence
         ; BRK: increment PC past signature byte
@@ -4393,7 +3506,7 @@ op_05:
 op_06:
         jsr fetch8
         tax
-        ; ASL directly in LOW_RAM_BUFFER
+        ; ASL directly in bank 4 via c128_zp_ptr
         jsr lrb_asl_x
         ; Update carry flag
         lda c128_p
@@ -4539,7 +3652,7 @@ op_16:
         clc
         adc c128_x
         tax
-        ; ASL directly in LOW_RAM_BUFFER
+        ; ASL directly in bank 4 via c128_zp_ptr
         jsr lrb_asl_x
         ; Update carry flag
         lda c128_p
@@ -5728,7 +4841,7 @@ op_94:
 
 ; $95 STA zp,X
 op_95:
-        ; Optimized STA zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized STA zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -5741,7 +4854,7 @@ op_95:
 
 ; $96 STX zp,Y
 op_96:
-        ; Optimized STX zp,Y - direct access to LOW_RAM_BUFFER
+        ; Optimized STX zp,Y - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_y
@@ -5960,7 +5073,7 @@ op_b4:
 
 ; $B5 LDA zp,X
 op_b5:
-        ; Optimized LDA zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized LDA zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -5975,7 +5088,7 @@ op_b5:
 
 ; $B6 LDX zp,Y
 op_b6:
-        ; Optimized LDX zp,Y - direct access to LOW_RAM_BUFFER
+        ; Optimized LDX zp,Y - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_y
@@ -6200,7 +5313,7 @@ op_d5:
 
 ; $D6 DEC zp,X
 op_d6:
-        ; Optimized DEC zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized DEC zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -6405,7 +5518,7 @@ op_f5:
 
 ; $F6 INC zp,X
 op_f6:
-        ; Optimized INC zp,X - direct access to LOW_RAM_BUFFER
+        ; Optimized INC zp,X - direct access to bank 4 via c128_zp_ptr
         jsr fetch8
         clc
         adc c128_x
@@ -6541,12 +5654,8 @@ op_02:
         lda c128_pc_lo
         cmp #$40                ; $4B3F + 1 = $4B40
         bne _op02_illegal
-        ; It's the GONE trap - back up PC to $4B3F for the hook
-        dec c128_pc_lo          ; $4B40 → $4B3F
-        jsr C128Hook_GONE
-        lda #$01
-        sta c128_hook_pc_changed
-        jmp finish_and_loop
+        ; GONE trap disabled - treat as illegal opcode
+        jmp op_illegal
 _op02_illegal:
         jmp op_illegal
 
@@ -6559,12 +5668,8 @@ op_12:
         lda c128_pc_lo
         cmp #$0E                ; $430D + 1 = $430E
         bne _op12_illegal
-        ; It's the Crunch trap
-        dec c128_pc_lo          ; $430E → $430D
-        jsr C128Hook_Crunch
-        lda #$01
-        sta c128_hook_pc_changed
-        jmp finish_and_loop
+        ; Crunch trap disabled - treat as illegal opcode
+        jmp op_illegal
 _op12_illegal:
         jmp op_illegal
 
