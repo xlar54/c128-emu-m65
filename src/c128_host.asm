@@ -46,7 +46,7 @@ C128_INJECT_SIZE  = 8             ; Save/restore 8 bytes to be safe
 C128_CHROUT       = $FFD2
 
 ; Zero page pointer for string printing
-C128H_STR_PTR     = $FB           ; 2 bytes
+C128H_STR_PTR     = $F5           ; 2 bytes (shared with DIR_PTR, never used simultaneously)
 
 
 ; ============================================================
@@ -275,19 +275,16 @@ c128h_sync_inject_to_bank4:
 ; Use this from hook code that needs to print immediately.
 ; ============================================================
 C128Host_PrintCharSync:
+        ; Direct output - no code injection, no CPU stepping.
         sta c128h_print_char
-        lda #1
-        sta c128h_print_pending
         
-        ; Start the print
-        jsr C128Host_StartPrint
+        ; Save emulated A register
+        lda c128_a
+        sta c128h_save_a
         
-        ; Run emulator until print completes
-c128h_pcs_loop:
-        jsr C128CPU_Step
-        jsr C128Host_CheckPrintDone
-        bcc c128h_pcs_loop                ; C=0 means not done yet
-        
+        ; FastCHROUT removed - just restore A and return
+        lda c128h_save_a
+        sta c128_a
         rts
 
 ; Alias for compatibility
