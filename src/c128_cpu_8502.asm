@@ -1108,6 +1108,19 @@ _mode_check_done:
         jsr VDC_RenderFrame
 _skip_vdc_render:
 
+        ; Brief delay when in 40-col mode to reduce emulation speed
+        lda display_showing_80
+        bne +                   ; skip delay in 80-col mode
+        
+        ldx #$FF
+        ldy #$FF        ; outer loop - tweak this
+-       dex
+        bne -
+        ldx #$FF
+        dey
+        bne -
+
++
         ; Cursor blink phase toggle (every 16 frames)
         lda display_showing_80
         beq _frame_done

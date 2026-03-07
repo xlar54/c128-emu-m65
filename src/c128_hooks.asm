@@ -376,6 +376,11 @@ _chrget_disabled_no_carry:
 ; Keyboard/cursor already handled natively by MEGA65.
 ; ============================================================
 C128Hook_IRQ:
+        ; Slow down 40-col cursor blink (ZP $CC = blink speed)
+        lda #$28
+        ldx #$CC
+        jsr c128_write_zp_x
+
         ; --- Update jiffy clock at $A0-$A2 ---
         ; $A2 = low byte, $A1 = mid, $A0 = high
         ; Increment the 3-byte counter

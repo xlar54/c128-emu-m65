@@ -968,6 +968,202 @@ _load_msg_fnf:
 ;       via RTS_Guest.
 ; ============================================================
 C128Hook_OnSAVE:
+        ; Only intercept device 8
+        lda c128_setlfs_dev
+        cmp #$08
+        beq _save_check
+        rts
+
+_save_check:
+        ; Check for valid filename
+        lda c128_fl_len
+        bne _save_have_name
+        ; No filename
+        lda c128_p
+        ora #P_C
+        sta c128_p
+        lda #$08
+        sta c128_a
+        jsr c128_write_status
+        jsr C128Hook_RTS_Guest
+        rts
+
+_save_have_name:
+        ; Get end address from X/Y
+        lda c128_x
+        sta c128_save_end_lo
+        lda c128_y
+        sta c128_save_end_hi
+
+        ; Get start address from ZP pointer in A
+        lda c128_a
+        tax
+        lda LOW_RAM_BUFFER,x
+        sta c128_save_start_lo
+        inx
+        lda LOW_RAM_BUFFER,x
+        sta c128_save_start_hi
+
+        ; Calculate data length
+        lda c128_save_end_lo
+        sec
+        sbc c128_save_start_lo
+        sta c128_dir_len_lo
+        lda c128_save_end_hi
+        sbc c128_save_start_hi
+        sta c128_dir_len_hi
+
+        ; Check for zero or negative length
+        bmi _save_error
+        lda c128_dir_len_lo
+        ora c128_dir_len_hi
+        beq _save_error
+
+        ; Mark file operation active
+        lda #1
+        sta c128_file_op_active
+
+        ; Print "SAVING " + filename
+        lda #<C128Host_Msg_Saving
+        ldx #>C128Host_Msg_Saving
+        jsr emu_print_string
+
+        ldy #0
+_save_print_name:
+        cpy c128_fl_len
+        beq _save_print_done
+        lda c128_fl_buf,y
+        phy
+        jsr emu_chrout
+        ply
+        iny
+        bne _save_print_name
+_save_print_done:
+
+        ; DMA copy from guest RAM (bank 4) to staging buffer+2
+        ; First 2 bytes = PRG load address header
+        lda c128_save_start_lo
+        sta C128_DIR_BUF
+        lda c128_save_start_hi
+        sta C128_DIR_BUF+1
+
+        lda c128_dir_len_lo
+        sta _save_dma_len
+        lda c128_dir_len_hi
+        sta _save_dma_len+1
+        lda c128_save_start_lo
+        sta _save_dma_src
+        lda c128_save_start_hi
+        sta _save_dma_src+1
+        lda #$00
+        sta $D707
+        .byte $80, $00, $81, $00, $00
+        .byte $00               ; copy
+_save_dma_len:
+        .word $0000
+_save_dma_src:
+        .word $0000
+        .byte BANK_RAM0         ; src bank 4
+        .word C128_DIR_BUF+2    ; dst
+        .byte $00               ; dst bank 0
+        .byte $00
+        .word $0000
+
+        ; Set up host KERNAL
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
+        ldx #<c128_fl_buf
+        ldy #>c128_fl_buf
+        lda c128_fl_len
+        jsr SETNAM
+
+        lda #$01
+        ldx #$08
+        ldy #$01
+        jsr SETLFS
+
+        jsr OPEN
+        bcs _save_open_error
+
+        ldx #$01
+        jsr CHKOUT
+        bcs _save_chkout_error
+
+        ; Total = data + 2 byte header
+        clc
+        lda c128_dir_len_lo
+        adc #2
+        sta _save_total_lo
+        lda c128_dir_len_hi
+        adc #0
+        sta _save_total_hi
+
+        ; Output all bytes
+        lda #<C128_DIR_BUF
+        sta DIR_PTR
+        lda #>C128_DIR_BUF
+        sta DIR_PTR+1
+
+        ldy #0
+_save_loop:
+        lda _save_total_lo
+        ora _save_total_hi
+        beq _save_loop_done
+
+        lda (DIR_PTR),y
+        jsr CHROUT
+
+        iny
+        bne +
+        inc DIR_PTR+1
++
+        lda _save_total_lo
+        bne +
+        dec _save_total_hi
++       dec _save_total_lo
+        bra _save_loop
+
+_save_loop_done:
+        jsr CLRCHN
+        lda #$01
+        jsr CLOSE
+
+        ; Success
+        lda #$00
+        jsr c128_write_status
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        lda #$00
+        sta c128_a
+        jmp _save_return
+
+_save_open_error:
+_save_chkout_error:
+        jsr CLRCHN
+        lda #$01
+        jsr CLOSE
+
+_save_error:
+        lda c128_p
+        ora #P_C
+        sta c128_p
+        lda #$05
+        sta c128_a
+        jsr c128_write_status
+
+_save_return:
+        lda #0
+        sta c128_file_op_active
+        sta c128_fl_len
+        jsr C128Hook_RTS_Guest
+        rts
+
+_save_total_lo: .byte 0
+_save_total_hi: .byte 0
+
 ; ============================================================
 ; emu_chrout - Print a PETSCII character to the emulated screen
 ; Input: A = PETSCII character
