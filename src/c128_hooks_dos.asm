@@ -1560,7 +1560,159 @@ _dir_leading_zero:  .byte 0
 ;       carry clear on success.
 ; ============================================================
 C128Hook_OnOPEN:
+        ; Check if this is device 8
+        lda LOW_RAM_BUFFER + $BA        ; Device number
+        cmp #$08
+        beq _open_disk
+        ; Not disk - let ROM handle it
         rts
+
+_open_disk:
+        ; Use filename already captured by OnSETNAM
+        lda c128_fl_len
+        cmp #17
+        bcs _open_error_no_file         ; Too long
+        sta seq_filename_len
+        bne _open_has_filename
+
+        ; Empty filename - only allowed for SA >= $0F (command channel)
+        lda LOW_RAM_BUFFER + $B9
+        and #$0F
+        cmp #$0F
+        bne _open_error_no_file
+
+_open_has_filename:
+        ; Get guest LFN
+        lda LOW_RAM_BUFFER + $B8
+        sta _open_guest_lfn
+
+        ; Find a free slot
+        ldx #0
+_open_find_slot:
+        lda seq_slot_lfn,x
+        cmp #$FF
+        beq _open_found_slot
+        cmp _open_guest_lfn
+        beq _open_error_file_open
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _open_find_slot
+        jmp _open_error_no_file         ; No free slots
+
+_open_found_slot:
+        stx _open_slot
+
+        ; Copy filename from c128_fl_buf to seq_filename
+        ldy #0
+_open_copy_name:
+        cpy c128_fl_len
+        beq _open_copy_done
+        lda c128_fl_buf,y
+        sta seq_filename,y
+        iny
+        cpy #17
+        bcc _open_copy_name
+_open_copy_done:
+        lda #0
+        sta seq_filename,y              ; Null terminate
+
+        ; Set up host KERNAL
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
+        ; Set filename for host
+        ldx #<seq_filename
+        ldy #>seq_filename
+        lda seq_filename_len
+        jsr SETNAM
+
+        ; Calculate host LFN = SEQ_LFN_BASE + slot
+        lda _open_slot
+        clc
+        adc #SEQ_LFN_BASE
+        sta _open_host_lfn
+
+        ; SETLFS for host: host_lfn, device 8, guest SA
+        lda _open_host_lfn
+        ldx #$08
+        ldy LOW_RAM_BUFFER + $B9        ; Secondary address
+        jsr SETLFS
+
+        ; Call host OPEN
+        jsr OPEN
+        bcs _open_error_host
+
+        ; Success - record in slot table
+        ldx _open_slot
+        lda _open_guest_lfn
+        sta seq_slot_lfn,x
+        lda #$08
+        sta seq_slot_dev,x
+        lda LOW_RAM_BUFFER + $B9
+        sta seq_slot_sa,x
+        lda #0
+        sta seq_slot_status,x
+        lda #1
+        sta seq_slot_open,x
+
+        ; Update C128 KERNAL file tables
+        ; LDTND at $98, LAT at $0362, FAT at $036C, SAT at $0376
+        ldx LOW_RAM_BUFFER + $98        ; Current file count
+        cpx #10
+        bcs _open_table_full
+
+        lda _open_guest_lfn
+        sta LOW_RAM_BUFFER + $0362,x    ; LAT[x] = LFN
+        lda #$08
+        sta LOW_RAM_BUFFER + $036C,x    ; FAT[x] = device
+        lda LOW_RAM_BUFFER + $B9        ; SA
+        ora #$60                        ; Set bits 5+6 like KERNAL does
+        sta LOW_RAM_BUFFER + $B9        ; Update ZP too
+        sta LOW_RAM_BUFFER + $0376,x    ; SAT[x] = SA | $60
+
+        ; Increment file count
+        inc LOW_RAM_BUFFER + $98
+
+_open_table_full:
+        ; Sync updated tables back to bank 4
+        jsr C128Hook_SyncLowRAMBack
+
+        ; Set success status
+        lda #$00
+        jsr c128_write_status
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+
+        jsr C128Hook_RTS_Guest
+        rts
+
+_open_error_host:
+        lda _open_host_lfn
+        jsr CLOSE
+        jmp _open_error_no_file
+
+_open_error_file_open:
+        lda #$02                        ; FILE ALREADY OPEN
+        jmp _open_set_error
+
+_open_error_no_file:
+        lda #$04                        ; FILE NOT FOUND
+
+_open_set_error:
+        sta c128_a
+        jsr c128_write_status
+        lda c128_p
+        ora #P_C
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_open_guest_lfn: .byte 0
+_open_host_lfn:  .byte 0
+_open_slot:      .byte 0
+
 
 
 ; ============================================================
@@ -1574,7 +1726,113 @@ C128Hook_OnOPEN:
 ;       entries down, decrement LDTND), return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCLOSE:
+        ; Get LFN from guest A
+        lda c128_a
+        sta _close_lfn
+
+        ; Find slot with this LFN
+        ldx #0
+_close_find:
+        lda seq_slot_lfn,x
+        cmp _close_lfn
+        beq _close_found
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _close_find
+        ; Not found in our table - let ROM handle (might be non-disk)
         rts
+
+_close_found:
+        stx _close_slot
+
+        ; Check if it's actually open
+        lda seq_slot_open,x
+        beq _close_not_open
+
+        ; Clear host channels before closing
+        jsr CLRCHN
+
+        ; Close on host
+        lda _close_slot
+        clc
+        adc #SEQ_LFN_BASE
+        jsr CLOSE
+
+        ; Clear slot
+        ldx _close_slot
+        lda #$FF
+        sta seq_slot_lfn,x
+        lda #0
+        sta seq_slot_open,x
+        sta seq_slot_status,x
+
+        ; If this was current input/output, clear that too
+        cpx seq_input_slot
+        bne +
+        lda #$FF
+        sta seq_input_slot
++       cpx seq_output_slot
+        bne +
+        lda #$FF
+        sta seq_output_slot
++
+        ; Remove entry from C128 KERNAL file tables
+        ; LDTND=$98, LAT=$0362, FAT=$036C, SAT=$0376
+        ldx #0
+        lda LOW_RAM_BUFFER + $98
+        beq _close_table_done
+
+_close_find_lat:
+        lda LOW_RAM_BUFFER + $0362,x    ; LAT[x]
+        cmp _close_lfn
+        beq _close_found_lat
+        inx
+        cpx LOW_RAM_BUFFER + $98
+        bcc _close_find_lat
+        bra _close_table_done
+
+_close_found_lat:
+        ; Found at index X - shift subsequent entries down
+        dec LOW_RAM_BUFFER + $98
+
+_close_shift_loop:
+        inx
+        cpx LOW_RAM_BUFFER + $98
+        beq _close_copy_last
+        bcs _close_table_done
+
+        ; Copy entry X to X-1
+        lda LOW_RAM_BUFFER + $0362,x
+        sta LOW_RAM_BUFFER + $0361,x    ; LAT[x-1] = LAT[x]
+        lda LOW_RAM_BUFFER + $036C,x
+        sta LOW_RAM_BUFFER + $036B,x    ; FAT[x-1] = FAT[x]
+        lda LOW_RAM_BUFFER + $0376,x
+        sta LOW_RAM_BUFFER + $0375,x    ; SAT[x-1] = SAT[x]
+        bra _close_shift_loop
+
+_close_copy_last:
+        lda LOW_RAM_BUFFER + $0362,x
+        sta LOW_RAM_BUFFER + $0361,x
+        lda LOW_RAM_BUFFER + $036C,x
+        sta LOW_RAM_BUFFER + $036B,x
+        lda LOW_RAM_BUFFER + $0376,x
+        sta LOW_RAM_BUFFER + $0375,x
+
+_close_table_done:
+        ; Sync tables back to bank 4
+        jsr C128Hook_SyncLowRAMBack
+
+_close_not_open:
+        ; Success
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_close_lfn:  .byte 0
+_close_slot: .byte 0
+
 
 
 ; ============================================================
@@ -1588,7 +1846,57 @@ C128Hook_OnCLOSE:
 ;       return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCHKIN:
+        ; Get LFN from guest X
+        lda c128_x
+        sta _chkin_lfn
+
+        ; Find slot with this LFN
+        ldx #0
+_chkin_find:
+        lda seq_slot_lfn,x
+        cmp _chkin_lfn
+        beq _chkin_found
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _chkin_find
+        ; Not in our table - let ROM handle
         rts
+
+_chkin_found:
+        ; Check if open
+        lda seq_slot_open,x
+        beq _chkin_not_open
+
+        ; Set as current input
+        stx seq_input_slot
+
+        ; Also set on host side
+        txa
+        clc
+        adc #SEQ_LFN_BASE
+        tax
+        jsr CHKIN
+
+        ; Success
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_chkin_not_open:
+        ; File not open error
+        lda #$03
+        sta c128_a
+        jsr c128_write_status
+        lda c128_p
+        ora #P_C
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_chkin_lfn: .byte 0
+
 
 
 ; ============================================================
@@ -1602,7 +1910,60 @@ C128Hook_OnCHKIN:
 ;       return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCHKOUT:
+        ; Get LFN from guest X
+        lda c128_x
+        sta _chkout_lfn
+
+        ; LFN 0 = screen (let ROM handle)
+        beq _chkout_rom
+
+        ; Find slot with this LFN
+        ldx #0
+_chkout_find:
+        lda seq_slot_lfn,x
+        cmp _chkout_lfn
+        beq _chkout_found
+        inx
+        cpx #MAX_SEQ_FILES
+        bcc _chkout_find
+        ; Not in our table - let ROM handle
+_chkout_rom:
         rts
+
+_chkout_found:
+        ; Check if open
+        lda seq_slot_open,x
+        beq _chkout_not_open
+
+        ; Set as current output
+        stx seq_output_slot
+
+        ; Also set on host side
+        txa
+        clc
+        adc #SEQ_LFN_BASE
+        tax
+        jsr CHKOUT
+
+        ; Success
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_chkout_not_open:
+        lda #$03
+        sta c128_a
+        jsr c128_write_status
+        lda c128_p
+        ora #P_C
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_chkout_lfn: .byte 0
+
 
 
 ; ============================================================
@@ -1614,7 +1975,22 @@ C128Hook_OnCHKOUT:
 ;       to $FF. Let ROM also run to reset its state.
 ; ============================================================
 C128Hook_OnCLRCHN:
+        ; Check if we have any active channels
+        lda seq_input_slot
+        cmp #$FF
+        beq _clrchn_check_out
+        ; We had input channel - clear on host too
+        jsr CLRCHN
+
+_clrchn_check_out:
+        ; Clear our tracking
+        lda #$FF
+        sta seq_input_slot
+        sta seq_output_slot
+
+        ; Let ROM also run to reset its state
         rts
+
 
 
 ; ============================================================
@@ -1628,7 +2004,64 @@ C128Hook_OnCLRCHN:
 ;       return byte in guest A, return via RTS_Guest.
 ; ============================================================
 C128Hook_OnBASIN:
+        ; Check if we have an active input channel
+        lda seq_input_slot
+        cmp #$FF
+        beq _basin_rom
+
+        ; We're reading from a file
+        ldx seq_input_slot
+
+        ; Check status - if EOF already, return with status
+        lda seq_slot_status,x
+        and #$40
+        bne _basin_eof
+
+        ; Read from host
+        jsr CHRIN
+        sta _basin_byte
+
+        ; Check host status
+        jsr READST
+        sta _basin_status
+
+        ; Update our status
+        ldx seq_input_slot
+        ora seq_slot_status,x
+        sta seq_slot_status,x
+
+        ; Update guest status byte
+        jsr c128_write_status
+
+        ; Return the byte in guest A
+        lda _basin_byte
+        sta c128_a
+
+        ; Clear carry for success
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+
+        jsr C128Hook_RTS_Guest
         rts
+
+_basin_eof:
+        lda #$00
+        sta c128_a
+        lda #$40
+        jsr c128_write_status
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_basin_rom:
+        rts
+
+_basin_byte:   .byte 0
+_basin_status: .byte 0
+
 
 
 ; ============================================================
@@ -1642,7 +2075,33 @@ C128Hook_OnBASIN:
 ;       return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCHROUT:
+        ; Check if we have an active output channel to a file
+        lda seq_output_slot
+        cmp #$FF
+        beq _fchrout_rom
+
+        ; We're writing to a file - get byte from guest A
+        lda c128_a
+        jsr CHROUT
+
+        ; Check status
+        jsr READST
+        ldx seq_output_slot
+        ora seq_slot_status,x
+        sta seq_slot_status,x
+        jsr c128_write_status
+
+        ; Clear carry for success
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+
+        jsr C128Hook_RTS_Guest
         rts
+
+_fchrout_rom:
+        rts
+
 
 
 ; ============================================================
@@ -1655,7 +2114,85 @@ C128Hook_OnCHROUT:
 ;       update status, return in guest A via RTS_Guest.
 ; ============================================================
 C128Hook_OnGETIN:
+        ; Check if we have an active input channel
+        lda seq_input_slot
+        cmp #$FF
+        beq _getin_rom
+
+        ; Reading from a file
+        ldx seq_input_slot
+
+        ; Check EOF
+        lda seq_slot_status,x
+        and #$40
+        bne _getin_eof
+
+        ; Read from host
+        jsr CHRIN
+        sta _getin_byte
+
+        ; Check host status
+        jsr READST
+        sta _getin_status
+
+        ; Update our status
+        ldx seq_input_slot
+        ora seq_slot_status,x
+        sta seq_slot_status,x
+
+        ; Update guest status
+        jsr c128_write_status
+
+        ; Return byte in guest A
+        lda _getin_byte
+        sta c128_a
+
+        ; Clear carry
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+
+        jsr C128Hook_RTS_Guest
         rts
+
+_getin_eof:
+        lda #$00
+        sta c128_a
+        lda #$40
+        jsr c128_write_status
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        jsr C128Hook_RTS_Guest
+        rts
+
+_getin_rom:
+        rts
+
+_getin_byte:   .byte 0
+_getin_status: .byte 0
+
+
+
+; ============================================================
+; Host KERNAL bank swap helpers
+;
+; The MEGA65 host KERNAL needs its original ROM in banks 2-3.
+; The emulator overwrites these banks with VDC RAM etc.
+; Before any host KERNAL file I/O, swap in the originals;
+; after, swap back.
+;
+; Attic RAM layout:
+;   $80020000 = saved original bank 2 (at init)
+;   $80030000 = saved original bank 3 (at init)
+;   $80060000 = saved emulator bank 2 (during swap)
+;   $80070000 = saved emulator bank 3 (during swap)
+; ============================================================
+
+
+
+
+
 
 ; ============================================================
 ; DMA / sync helpers
