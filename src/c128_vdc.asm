@@ -17,6 +17,7 @@
 ;   write_vdc_register  - Handle CPU writes to $D600-$D601
 ;   VDC_RenderFrame     - Batch copy VDC screen/attrs to MEGA65
 ;   VDC_UpdateCursor    - Draw/erase blinking cursor
+;   VDC_SyncCursor      - Sync C128 ZP cursor from VDC position
 ;   vdc_print_char      - Direct char output at VDC cursor
 ; ============================================================
 
@@ -800,6 +801,47 @@ _vdc_skip_attr:
         rts
 
 _vdc_page_count: .byte 0
+
+
+; ============================================================
+; VDC_SyncCursor - Sync C128 screen editor cursor from VDC
+;
+; In 80-col mode, derives ZP $EB (row) and $EC (col) from
+; VDC cursor position R14:R15 relative to screen start R12:R13.
+; In 40-col mode, does nothing (ROM handles cursor).
+; ============================================================
+VDC_SyncCursor:
+        lda display_showing_80
+        beq _vsc_done
+        lda vdc_regs+15
+        sec
+        sbc vdc_regs+13
+        sta tmp_lo
+        lda vdc_regs+14
+        sbc vdc_regs+12
+        sta tmp_hi
+        ldx #0
+_vsc_calcrow:
+        lda tmp_lo
+        sec
+        sbc #80
+        tay
+        lda tmp_hi
+        sbc #0
+        bcc _vsc_gotrow
+        sta tmp_hi
+        sty tmp_lo
+        inx
+        bra _vsc_calcrow
+_vsc_gotrow:
+        txa
+        ldx #$EB
+        jsr c128_write_zp_x     ; row -> ZP $EB
+        lda tmp_lo
+        ldx #$EC
+        jsr c128_write_zp_x     ; col -> ZP $EC
+_vsc_done:
+        rts
 
 
 ; ============================================================

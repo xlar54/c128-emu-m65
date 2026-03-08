@@ -194,6 +194,34 @@ C128Hook_DOS_Reset:
 
 
 ; ============================================================
+; dos_print_filename - Print "SEARCHING FOR " + filename
+;
+; Prints the search message followed by the filename in
+; c128_fl_buf (c128_fl_len bytes). Uses emu_print_string
+; and emu_chrout.
+; ============================================================
+dos_print_filename:
+        lda #<C128Host_Msg_Searching
+        ldx #>C128Host_Msg_Searching
+        jsr emu_print_string
+
+        ; Fall through to print just the filename
+dos_print_filename_only:
+        ldy #0
+_dpf_loop:
+        cpy c128_fl_len
+        beq _dpf_done
+        lda c128_fl_buf,y
+        phy
+        jsr emu_chrout
+        ply
+        iny
+        bne _dpf_loop
+_dpf_done:
+        rts
+
+
+; ============================================================
 ; C128Hook_OnSETNAM - Capture filename parameters
 ; Intercept at $FFBD
 ;
@@ -438,24 +466,8 @@ _load_file:
         ; which pops the JSR $FFD5 return address from the guest stack.
 
 _load_continue:
-        ; Init print cursor position
-
         ; Print "SEARCHING FOR " + filename
-        lda #<C128Host_Msg_Searching
-        ldx #>C128Host_Msg_Searching
-        jsr emu_print_string
-
-        ldy #0
-_load_print_name:
-        cpy c128_fl_len
-        beq _load_print_name_done
-        lda c128_fl_buf,y
-        phy
-        jsr emu_chrout
-        ply
-        iny
-        bne _load_print_name
-_load_print_name_done:
+        jsr dos_print_filename
 
         ; Determine the MEGA65 bank for the load destination.
         ; Use our captured c128_setbnk_data (set by OnSETBNK hook).
@@ -744,39 +756,9 @@ _load_error:
         ;jsr C128Host_PrintString
 
 _load_return:
-        ; Update C128 cursor ZP from VDC cursor position (80-col only)
-        ; In 40-col mode, vic_print_char already updated ZP $EB/$EC
-        lda display_showing_80
-        beq _load_skip_cursor_sync
-        lda vdc_regs+15
-        sec
-        sbc vdc_regs+13
-        sta tmp_lo
-        lda vdc_regs+14
-        sbc vdc_regs+12
-        sta tmp_hi
-        ldx #0
-_load_calcrow:
-        lda tmp_lo
-        sec
-        sbc #80
-        tay
-        lda tmp_hi
-        sbc #0
-        bcc _load_gotrow
-        sta tmp_hi
-        sty tmp_lo
-        inx
-        bra _load_calcrow
-_load_gotrow:
-        txa
-        ldx #$EB
-        jsr c128_write_zp_x     ; row -> ZP $EB
-        lda tmp_lo
-        ldx #$EC
-        jsr c128_write_zp_x     ; col -> ZP $EC
+        ; Sync C128 cursor ZP from VDC cursor position (80-col only)
+        jsr VDC_SyncCursor
 
-_load_skip_cursor_sync:
         ; Restore video state if error occurred (80-col only)
         lda display_showing_80
         beq +
@@ -800,9 +782,13 @@ C128Hook_LoadDirectory:
         ; Load "$" directory listing from host SD card
         ; Uses staging buffer at C128_DIR_BUF, then DMA to guest RAM
 
-        ; Ensure B=0 for KERNAL calls
-        ;lda #$00
-        ;tab
+        ; Print "SEARCHING FOR " + "$" and "LOADING"
+        jsr dos_print_filename
+
+        ; Print "LOADING"
+        lda #<C128Host_Msg_Loading
+        ldx #>C128Host_Msg_Loading
+        jsr emu_print_string
 
         ; Reset DMA controller state that may have been
         ; altered by attic RAM DMA operations
@@ -928,7 +914,8 @@ ld_dir_bypass:
         lda #0
         sta c128_fl_len
 
-        ; Return to BASIC after the JSR $FFD5
+        ; Sync cursor and return
+        jsr VDC_SyncCursor
         jsr C128Hook_RTS_Guest
         rts
 
@@ -1016,18 +1003,7 @@ _save_have_name:
         lda #<C128Host_Msg_Saving
         ldx #>C128Host_Msg_Saving
         jsr emu_print_string
-
-        ldy #0
-_save_print_name:
-        cpy c128_fl_len
-        beq _save_print_done
-        lda c128_fl_buf,y
-        phy
-        jsr emu_chrout
-        ply
-        iny
-        bne _save_print_name
-_save_print_done:
+        jsr dos_print_filename_only
 
         ; DMA copy from guest RAM (bank 4) to staging buffer+2
         ; First 2 bytes = PRG load address header
@@ -1145,38 +1121,8 @@ _save_error:
 
 _save_return:
         ; Sync C128 cursor ZP from VDC cursor position (80-col only)
-        lda display_showing_80
-        beq _save_skip_cursor
+        jsr VDC_SyncCursor
 
-        lda vdc_regs+15
-        sec
-        sbc vdc_regs+13
-        sta tmp_lo
-        lda vdc_regs+14
-        sbc vdc_regs+12
-        sta tmp_hi
-        ldx #0
-_save_calcrow:
-        lda tmp_lo
-        sec
-        sbc #80
-        tay
-        lda tmp_hi
-        sbc #0
-        bcc _save_gotrow
-        sta tmp_hi
-        sty tmp_lo
-        inx
-        bra _save_calcrow
-_save_gotrow:
-        txa
-        ldx #$EB
-        jsr c128_write_zp_x     ; row -> ZP $EB
-        lda tmp_lo
-        ldx #$EC
-        jsr c128_write_zp_x     ; col -> ZP $EC
-
-_save_skip_cursor:
         lda #0
         sta c128_file_op_active
         sta c128_fl_len
@@ -1602,41 +1548,9 @@ _dir_done:
         lda #$0D
         jsr emu_chrout
 
-        ; Update C128 cursor ZP (80-col only - 40-col already tracked)
-        lda display_showing_80
-        beq _dir_skip_cursor
+        ; Sync cursor
+        jsr VDC_SyncCursor
 
-        ; Row = (R14:R15 - R12:R13) / 80
-        lda vdc_regs+15
-        sec
-        sbc vdc_regs+13
-        sta tmp_lo
-        lda vdc_regs+14
-        sbc vdc_regs+12
-        sta tmp_hi
-        ldx #0
-_dir_calcrow:
-        lda tmp_lo
-        sec
-        sbc #80
-        tay
-        lda tmp_hi
-        sbc #0
-        bcc _dir_gotrow
-        sta tmp_hi
-        sty tmp_lo
-        inx
-        bra _dir_calcrow
-_dir_gotrow:
-        ; X = row, tmp_lo = column
-        txa
-        ldx #$EB
-        jsr c128_write_zp_x     ; row -> ZP $EB
-        lda tmp_lo
-        ldx #$EC
-        jsr c128_write_zp_x     ; col -> ZP $EC
-
-_dir_skip_cursor:
         ; Clean up
         jsr CLRCHN
         lda #$02
