@@ -98,6 +98,9 @@ READST  = $FFB7
 ; MEGA65 DMA controller
 DMA_REG = $D707
 
+; Macros (must be included before use)
+        .include "macros.asm"
+
 ; ============================================================
 ; Entry point
 ; ============================================================
@@ -108,50 +111,18 @@ start:
         ; ============================================================
         ; Clear C128 RAM Bank 0 (MEGA65 bank 4) via DMA fill
         ; ============================================================
-        lda #$00
-        sta $D707
-        .byte $80, $00          ; enhanced dma - src bits 20-27 = 0
-        .byte $81, $00          ; enhanced dma - dest bits 20-27 = 0
-        .byte $00               ; end of job options
-        .byte $03               ; fill                                 
-        .word $FFFF             ; count (64K-1, wraps to fill all)
-        .word $0000             ; fill with $00
-        .byte $00               ; unused with fill
-        .word $0000             ; destination start
-        .byte $04               ; dest bank 4
-        .byte $00               ; command high byte
-        .word $0000             ; modulo (ignored)
+        #dma_fill_chip $04, $0000, $FFFF, $00
 
         ; ============================================================
         ; Clear C128 RAM Bank 1 (attic $8000000) via DMA fill
         ; ============================================================
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $80, $00
-        .byte $03               ; fill
-        .word $FFFF
-        .word $0000
-        .byte $00
-        .word $0000
-        .byte $00               ; dest bank 0 in MB $80 = attic
-        .byte $00
-        .word $0000
+        #dma_fill_attic $00, $0000, $FFFF, $00
 
         ; ============================================================
         ; Clear LOW_RAM_BUFFER ($A000-$AFFF) to match cleared C128 RAM
         ; DMA-synced from bank 4 before hooks that read it
         ; ============================================================
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03               ; fill
-        .word $1000             ; count = 4KB
-        .word $0000             ; fill with $00
-        .byte $00
-        .word $A000             ; dest = LOW_RAM_BUFFER
-        .byte $00               ; dest bank 0
-        .byte $00
-        .word $0000
+        #dma_fill_chip $00, $A000, $1000, $00
 
         ; ============================================================
         ; Load ROM files into bank 1 ($10000-$1FFFF)
@@ -181,37 +152,14 @@ start:
         jsr LOAD
 
         ; DMA copy $C000-$FFFF from bank 0 to bank 1 (16KB)
+        ; Even though $C000-$FFFF is mapped, DMA still reads the underlying RAM
         ; ($1F800-$1FFFF will be overridden by color RAM window on reads,
         ;  but the first 14KB at $1C000-$1F7FF will be accessible)
-        lda #$00
-        sta $D707
-        .byte $80, $00          ; src MB = 0
-        .byte $81, $00          ; dst MB = 0
-        .byte $00               ; end options
-        .byte $00               ; copy command
-        .word $4000             ; count = 16384
-        .word $C000             ; src = $C000
-        .byte $00               ; src bank 0
-        .word $C000             ; dst = $C000
-        .byte $01               ; dst bank 1
-        .byte $00               ; command high byte
-        .word $0000             ; modulo
+        #dma_copy_chip $00, $C000, $01, $C000, $4000
 
         ; DMA copy $F800-$FFFF from bank 0 to $2000 in bank 1 (2KB)
         ; This is the relocated copy that avoids the color RAM window
-        lda #$00
-        sta $D707
-        .byte $80, $00          ; src MB = 0
-        .byte $81, $00          ; dst MB = 0
-        .byte $00               ; end options
-        .byte $00               ; copy command
-        .word $0800             ; count = 2048
-        .word $F800             ; src = $F800
-        .byte $00               ; src bank 0
-        .word $2000             ; dst = $2000
-        .byte $01               ; dst bank 1 ($12000)
-        .byte $00               ; command high byte
-        .word $0000             ; modulo
+        #dma_copy_chip $00, $F800, $01, $2000, $0800
 
 
         ; basic hi
@@ -253,44 +201,8 @@ start:
         ldy #$40
         jsr LOAD
 
-
-        ; Patch BASIC ROM: Place trap opcodes for native hooks
-        ; We use illegal opcode $02 (JAM) at hook points.
-        ; The emulator's opcode decoder catches $02 and dispatches
-        ; to our native handler based on PC address.
-        ; This avoids any need for $FF page trampolines.
-        
-        ; Bank 1 pointer already set up from basic_lo LOAD above
-        lda #$01
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        
-        ; Hook 1: GONE dispatch - DISABLED to reduce code size
-        ; BASIC runs natively through ROM
-;        lda #$3F
-;        sta C128_MEM_PTR+0
-;        lda #$4B
-;        sta C128_MEM_PTR+1
-;        lda #$02                ; trap opcode
-;        ldz #0
-;        sta [C128_MEM_PTR],z
-        
-        ; Hook 2: Crunch Tokens at $430D - DISABLED (tokenizer has bugs)
-        ; TODO: Fix in-place tokenization to match ROM contract
-;        lda #$0D
-;        sta C128_MEM_PTR+0
-;        lda #$43
-;        sta C128_MEM_PTR+1
-;        lda #$12                ; trap opcode
-;        ldz #0
-;        sta [C128_MEM_PTR],z
-
-        ; chargen - MUST BE LAST FILE LOAD
         ; Loaded to bank 2 at $A000 ($02A000).
         ; Bank 2 requires ROM write-protect off (trap $70).
-        ; This disables further KERNAL file operations,
-        ; so chargen must be the last file loaded at boot.
 
         ; Disable ROM write-protect for bank 2
         lda #$70
@@ -314,37 +226,20 @@ start:
         ldy #$A0
         jsr LOAD                ; Load chargen to $A000 in bank 2 = $02A000
 
-        ; Chargen stays in bank 1 at $10000-$11FFF only.
+        ; Chargen is in bank 2 at $2A000 only.
         ; DO NOT DMA copy to bank 0 - $08000-$09FFF is emulator code.
         ; VIC-IV CHARPTR points directly to bank 2 chargen at $02A000.
-        ; Emulated CPU reads use read_from_chargen which reads bank 1 directly.
-
-        ; Banks 2-3 untouched - C65 KERNAL/DOS stays resident
-
-        ; No ROM write-protect toggle needed - banks 2-3 not used
+        ; Emulated CPU reads use read_from_chargen which reads bank 2 directly.
 
         ; ============================================================
         ; Clear display area in bank 5 (VDC RAM + screen + color saves)
         ; ============================================================
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03               ; fill
-        .word $0000             ; count = 64KB (entire bank 5)
-        .word $0000             ; fill with $00
-        .byte $00
-        .word $0000             ; dest start = $0000 in bank 5 = $50000
-        .byte $05               ; dest bank 5
-        .byte $00
-        .word $0000
+        #dma_fill_chip $05, $0000, $0000, $00
 
         ; ============================================================
         ; Initialize and start emulation
         ; (C128_CPUReset calls C128_MemInit and C128_VideoInit internally)
         ; ============================================================
-
-        ; Initialize LOW_RAM_BUFFER pointer for ZP/stack access
-        jsr lrb_ptr_init
 
         jsr C128_CPUReset
 
@@ -391,5 +286,6 @@ kernal_name_end:
         .include "c128_cpu_8502.asm"
         .include "c128_hooks.asm"
         .include "c128_mem.asm"
+        .include "c128_vdc.asm"
         .include "c128_sound.asm"
         .include "c128_host.asm"

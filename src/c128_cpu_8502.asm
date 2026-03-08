@@ -509,21 +509,6 @@ _f16_slow:
 ; Stack page is always in shared bottom region -> always BANK_RAM0.
 cached_stack_bank: .byte BANK_RAM0
 
-; --- init_stack_ptr ---
-; Initialize dedicated c128_stack_ptr. Byte +0 stays $00 permanently;
-; push/pull use Z register = SP to index into the stack page.
-init_stack_ptr:
-        lda #$00
-        sta c128_stack_ptr+0    ; Always 0 - Z register provides offset
-        lda #$01
-        sta c128_stack_ptr+1    ; Page $01 (stack page)
-        lda #BANK_RAM0
-        sta c128_stack_ptr+2    ; Always bank 4
-        lda #$00
-        sta c128_stack_ptr+3    ; Megabyte 0
-        rts
-
-; --- push_data ---
 ; --- push_data ---
 ; Uses c128_stack_ptr with +0=0 always, Z register = SP for offset
 push_data:
@@ -547,24 +532,10 @@ pull_to_a:
 ; Special handling for $00/$01 (8502 CPU port registers)
 ; ============================================================
 
-; No persistent pointer needed - removed LRB_PTR
-
 ; 8502 port register state
 cpu_port_ddr:   .byte $2F       ; Data Direction Register (default: bits 0-3,5 output)
 cpu_port_data:  .byte $07       ; Port data register (default: LORAM+HIRAM+CHAREN on)
 cpu_port_ext:   .byte $FF       ; External input lines (active low, no cart = all high)
-
-; Initialize pointers - set up dedicated stack and ZP pointers
-lrb_ptr_init:
-        jsr init_stack_ptr
-        ; Initialize dedicated ZP pointer: $04:$00:$00:XX
-        lda #$00
-        sta c128_zp_ptr+0       ; Will be set before each use
-        sta c128_zp_ptr+1       ; Page $00
-        sta c128_zp_ptr+3       ; Megabyte 0
-        lda #BANK_RAM0
-        sta c128_zp_ptr+2       ; Bank 4
-        rts
 
 
 ; ============================================================
