@@ -1918,29 +1918,6 @@ _wc2_not_00:
 
 ; ============================================================
 ; ============================================================
-; Utility: print_hex8 - Print byte in A as 2 hex chars
-; ============================================================
-print_hex8:
-        pha
-        lsr
-        lsr
-        lsr
-        lsr
-        tax
-        lda _hex_chars,x
-        jsr CHROUT
-        pla
-        and #$0F
-        tax
-        lda _hex_chars,x
-        jsr CHROUT
-        rts
-
-_hex_chars:
-        .text "0123456789abcdef"
-
-
-; ============================================================
 ; Aliases used by hooks and host code
 ; ============================================================
 BANK_RAM        = BANK_RAM0             ; Default RAM bank alias
@@ -2062,58 +2039,39 @@ _vipc_col:     .byte 0
 ; vic_scroll_up - Scroll 40-col screen up one row
 ; ============================================================
 vic_scroll_up:
-        ; Scroll screen RAM
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00               ; copy
-        .word 960               ; 24 rows * 40
-        .word $0428             ; src = $040428 (row 1)
-        .byte $04               ; bank 4
-        .word $0400             ; dst = $040400 (row 0)
-        .byte $04               ; bank 4
-        .byte $00
-        .word $0000
+        ; Scroll screen RAM (24 rows * 40 = 960 bytes)
+        #dma_copy_chip $04, $0428, $04, $0400, 960
 
         ; Scroll color RAM
-        lda #$00
-        sta $D707
-        .byte $80, $FF, $81, $FF, $00
-        .byte $00               ; copy
-        .word 960
-        .word $0028             ; src = offset 40
-        .byte $08
-        .word $0000             ; dst = offset 0
-        .byte $08
-        .byte $00
-        .word $0000
+        #dma_copy $FF, $08, $0028, $FF, $08, $0000, 960
 
-        ; Clear bottom row of screen
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $03               ; fill
-        .word 40
-        .word $0020             ; space
-        .byte $00
-        .word $07C0             ; $0400 + 960 = $07C0
-        .byte $04
-        .byte $00
-        .word $0000
+        ; Clear bottom row of screen with spaces
+        #dma_fill_chip $04, $07C0, 40, $20
 
-        ; Clear bottom row of color
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $FF, $00
-        .byte $03               ; fill
-        .word 40
-        .word $0001             ; white
-        .byte $00
-        .word 960               ; offset 960
-        .byte $08
-        .byte $00
-        .word $0000
+        ; Clear bottom row of color with current text color from ZP $86
+        lda #$86
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        sta _vsc_color
+        lda #<960
+        sta C128_MEM_PTR+0
+        lda #>960
+        sta C128_MEM_PTR+1
+        lda #$F8
+        sta C128_MEM_PTR+2
+        lda #$0F
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda _vsc_color
+_vsc_loop:
+        sta [C128_MEM_PTR],z
+        inz
+        cpz #40
+        bne _vsc_loop
         rts
+
+_vsc_color: .byte 0
 
 
 ; VDC_RenderFrame, VDC_UpdateCursor, vdc_to_vic_color, and
