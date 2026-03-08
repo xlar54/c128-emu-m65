@@ -215,6 +215,9 @@ C128Hook_OnSETNAM:
         ; first with length=0 to clear, then with actual name)
         lda c128_a
         bne _setnam_capture
+        ; Length 0: clear our filename state so stale data isn't used
+        sta c128_fl_len
+        sta c128_setnam_valid
         jmp _setnam_skip
 _setnam_capture:
 
@@ -232,58 +235,41 @@ _setnam_capture:
         sta c128_setnam_valid
 
         ; Copy actual filename bytes into our buffer.
-        ; The filename pointer may be in:
-        ;   - Low RAM ($0000-$0FFF): read from LOW_RAM_BUFFER
-        ;   - RAM $1000+: read from bank 4 (or bank from $C7)
-        ;   - Under ROM: still in bank 4 physical RAM
-        ; We use C128_MEM_PTR to read from the correct bank.
+        ;
+        ; The filename bank is set by SETBNK (stored in c128_setbnk_fname
+        ; and guest ZP $C7). For normal LOAD/SAVE, SETBNK is called before
+        ; SETNAM so c128_setbnk_fname is correct. For D-commands (DLOAD etc),
+        ; SETBNK may not have been called yet, but D-command filenames are
+        ; always in bank 0 at $1100.
+        ;
+        ; Bank 0 filenames: read from MEGA65 bank 4 via C128_MEM_PTR
+        ; Bank 1 filenames: read from attic via DMA (attic_read_byte)
+        ;
+        ; We check c128_setbnk_fname first. If it says bank 1 but the
+        ; address is in the $1000-$1FFF range (DOS command area), override
+        ; to bank 0 since D-commands always use bank 0 for filenames.
 
-        ; Determine which MEGA65 bank holds the filename.
-        ; Use our captured c128_setbnk_fname (set by OnSETBNK hook).
-        ; Bank 0 -> MEGA65 bank 4, Bank 1 -> MEGA65 bank 5.
         lda c128_setbnk_fname
-        beq _setnam_bank0
-        ; C128 bank 1 = attic RAM - use DMA for filename read
+        beq _setnam_use_bank0
+        ; setbnk says bank 1 - but check if address suggests bank 0
+        lda c128_setnam_ptr_hi
+        cmp #$20                ; below $2000? DOS command area = bank 0
+        bcc _setnam_use_bank0
+        ; Genuine bank 1 filename (e.g. LOAD from input buffer at $FEFD)
         jmp _setnam_copy_attic
-_setnam_bank0:
-        lda #BANK_RAM0          ; C128 bank 0 = MEGA65 bank 4
+
+_setnam_use_bank0:
+        lda #BANK_RAM0
         sta C128_MEM_PTR+2
         lda #BANK_RAM0_MB
         sta C128_MEM_PTR+3
-
-        ; Check if pointer is in low RAM range
-        lda c128_setnam_ptr_hi
-        cmp #$10
-        bcs _setnam_copy_bank
-
-        ; Pointer is in low RAM ($0000-$0FFF) - read via LOW_RAM_BUFFER
-        lda c128_setnam_ptr_lo
-        sta $F5
-        clc
-        lda c128_setnam_ptr_hi
-        adc #>LOW_RAM_BUFFER
-        sta $F6
-
-        ldy #0
-_setnam_copy_low:
-        cpy c128_setnam_len
-        beq _setnam_copy_done
-        lda ($F5),y
-        sta c128_fl_buf,y
-        iny
-        cpy #16
-        bcc _setnam_copy_low
-        bra _setnam_copy_done
-
-_setnam_copy_bank:
-        ; Pointer is >= $1000 - read from MEGA65 bank via quad pointer
         lda c128_setnam_ptr_lo
         sta C128_MEM_PTR+0
         lda c128_setnam_ptr_hi
         sta C128_MEM_PTR+1
 
         ldy #0
-_setnam_copy_b_loop:
+_setnam_copy_loop:
         cpy c128_setnam_len
         beq _setnam_copy_done
         tya
@@ -292,7 +278,8 @@ _setnam_copy_b_loop:
         sta c128_fl_buf,y
         iny
         cpy #16
-        bcc _setnam_copy_b_loop
+        bcc _setnam_copy_loop
+        bra _setnam_copy_done
 
 _setnam_copy_attic:
         ; Read filename from attic RAM bank 1 via DMA
@@ -303,21 +290,17 @@ _setnam_copy_attic:
 _setnam_attic_loop:
         cpy c128_setnam_len
         beq _setnam_copy_done
-        ; Save Y (loop counter)
         phy
-        ; Set address: hi byte in A, lo byte in c128_addr_lo
         lda c128_setnam_ptr_hi
-        jsr attic_read_byte     ; returns byte in A
+        jsr attic_read_byte
         ply
         sta c128_fl_buf,y
-        ; Increment source address
         inc c128_addr_lo
         bne +
         inc c128_setnam_ptr_hi
 +       iny
         cpy #16
         bcc _setnam_attic_loop
-        bra _setnam_copy_done
 
 _setnam_copy_done:
         lda #0
@@ -412,7 +395,7 @@ C128Hook_OnLOAD:
         lda c128_fl_len
         bne _load_has_name
 
-        ; No filename - set carry and error code 8 (MISSING FILE NAME)
+        ; No filename - MISSING FILE NAME error
         lda c128_p
         ora #P_C
         sta c128_p
@@ -858,6 +841,8 @@ C128Hook_LoadDirectory:
         sta c128_p
         lda dos_err_code
         sta c128_a
+        lda #0
+        sta c128_fl_len
         jsr C128Hook_RTS_Guest
         rts
 
@@ -940,6 +925,9 @@ ld_dir_bypass:
         and #((~P_C) & $FF)
         sta c128_p
 
+        lda #0
+        sta c128_fl_len
+
         ; Return to BASIC after the JSR $FFD5
         jsr C128Hook_RTS_Guest
         rts
@@ -978,7 +966,8 @@ _save_check:
         ; Check for valid filename
         lda c128_fl_len
         bne _save_have_name
-        ; No filename
+
+        ; No filename - MISSING FILE NAME error
         lda c128_p
         ora #P_C
         sta c128_p
@@ -1155,6 +1144,39 @@ _save_error:
         jsr c128_write_status
 
 _save_return:
+        ; Sync C128 cursor ZP from VDC cursor position (80-col only)
+        lda display_showing_80
+        beq _save_skip_cursor
+
+        lda vdc_regs+15
+        sec
+        sbc vdc_regs+13
+        sta tmp_lo
+        lda vdc_regs+14
+        sbc vdc_regs+12
+        sta tmp_hi
+        ldx #0
+_save_calcrow:
+        lda tmp_lo
+        sec
+        sbc #80
+        tay
+        lda tmp_hi
+        sbc #0
+        bcc _save_gotrow
+        sta tmp_hi
+        sty tmp_lo
+        inx
+        bra _save_calcrow
+_save_gotrow:
+        txa
+        ldx #$EB
+        jsr c128_write_zp_x     ; row -> ZP $EB
+        lda tmp_lo
+        ldx #$EC
+        jsr c128_write_zp_x     ; col -> ZP $EC
+
+_save_skip_cursor:
         lda #0
         sta c128_file_op_active
         sta c128_fl_len
