@@ -17,7 +17,7 @@
 ;     $18000-$1BFFF: BASIC HI ROM  (C128 $8000-$BFFF)
 ;     $1C000-$1FFFF: KERNAL ROM    (C128 $C000-$FFFF)
 ;   Bank 4 ($40000-$4FFFF): C128 RAM Bank 0 (64KB)
-;   Bank 5 ($50000-$5FFFF): C128 RAM Bank 1 (64KB)
+;   Attic ($8000000-$800FFFF): C128 RAM Bank 1 (64KB, DMA-only)
 ;
 ; C128 MMU Configuration Register ($D500 / $FF00):
 ;   Bit 7-6: RAM bank select (00=bank0, 01=bank1)
@@ -59,7 +59,7 @@
 ; ============================================================
 BANK_ROM    = $01                       ; C128 ROMs in MEGA65 bank 1
 BANK_RAM0   = $04                       ; C128 RAM bank 0 in MEGA65 bank 4
-BANK_RAM1   = $05                       ; C128 RAM bank 1 in attic ($8050000)
+BANK_RAM1   = $00                       ; C128 RAM bank 1 in attic ($8000000)
 BANK_RAM1_MB = $80                      ; Megabyte byte for RAM bank 1 (attic)
 BANK_RAM0_MB = $00                      ; Megabyte byte for RAM bank 0 (chip RAM)
 

@@ -21,11 +21,12 @@
 ;   Bank 2 ($20000-$2FFFF): C65 ROM (write-protect off after boot)
 ;     $2A000-$2BFFF: Character ROM (chargen, 8KB, loaded last)
 ;
-;   Bank 3 ($30000-$3FFFF): VDC display RAM
-;     $32000-$35FFF: VDC RAM (16KB, overwrites C65 BASIC, ROM write-protect off)
+;   Bank 3 ($30000-$3FFFF): Unused (C65 BASIC ROM area)
 ;
 ;   Bank 4 ($40000-$4FFFF): C128 RAM Bank 0 (64KB)
-;   Bank 5 ($50000-$5FFFF): C128 RAM Bank 1 (64KB)
+;   Bank 5 ($50000-$5FFFF): VDC display RAM + 80-col screen + color save buffers
+;
+;   Attic ($8000000-$800FFFF): C128 RAM Bank 1 (64KB, DMA-only access)
 ;
 ;   Color RAM at $0FF80000 (accessed via 32-bit pointers)
 ;
@@ -122,7 +123,7 @@ start:
         .word $0000             ; modulo (ignored)
 
         ; ============================================================
-        ; Clear C128 RAM Bank 1 (attic $8050000) via DMA fill
+        ; Clear C128 RAM Bank 1 (attic $8000000) via DMA fill
         ; ============================================================
         lda #$00
         sta $D707
@@ -132,7 +133,7 @@ start:
         .word $0000
         .byte $00
         .word $0000
-        .byte $05               ; dest bank 5 in MB $80 = attic
+        .byte $00               ; dest bank 0 in MB $80 = attic
         .byte $00
         .word $0000
 
