@@ -537,9 +537,9 @@ _do_CHKIN:
         ldx #$0f
         jsr CHKIN
 
-_loopy:
-inc $d020
-jmp _loopy
+;_loopy:
+;inc $d020
+;jmp _loopy
         bcc _do_BASIN
 
         sta dos_err_code

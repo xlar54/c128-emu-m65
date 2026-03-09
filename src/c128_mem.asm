@@ -509,6 +509,18 @@ display_show_40col:
         sta $D062               ; SCRNPTR[23:16] = $04
         lda #$00
         sta $D063               ; -> $040400
+
+        ; Enable SPRPTR16 mode and point SPRPTRADR at our 16-byte
+        ; pointer table in host RAM. In SPRPTR16 mode, sprite data
+        ; address = pointer_value × 64 (no VIC bank involved),
+        ; allowing sprites to reference data in bank 4 ($40000+).
+        lda #<spr16_ptrs
+        sta $D06C               ; SPRPTRADRLSB
+        lda #>spr16_ptrs
+        sta $D06D               ; SPRPTRADRMSB
+        lda #$80                ; bit 7 = SPRPTR16 enable, bank = 0
+        sta $D06E               ; SPRPTRBNK + SPRPTR16
+
         ; Restore 40-col border/background from VIC-II shadow registers
         lda vic_regs+$20
         sta $D020
@@ -1253,17 +1265,17 @@ _rv_raster:
         rts
 
 _rv_irq:
-        ; $D019: IRQ flags
-        lda vic_regs+$19
+        ; $D019: IRQ flags - merge emulated raster IRQ with real collision IRQs
+        lda $D019               ; read real hardware for collision bits
+        and #$06                ; keep only collision flags
+        ora vic_regs+$19        ; merge with emulated flags (raster, etc.)
         rts
 
 _rv_sprite_collision:
-        ; Sprite collision registers - cleared on read
-        lda vic_regs,x
-        pha
-        lda #0
-        sta vic_regs,x
-        pla
+        ; Sprite collision registers - read from real MEGA65 VIC-IV hardware
+        ; The VIC-IV detects collisions in hardware and stores results
+        ; in the real $D01E/$D01F registers. Reading clears them.
+        lda $D000,x             ; read real hardware register
         rts
 
 
@@ -1659,6 +1671,8 @@ write_vic_register:
         ; Handle side effects
         cpx #$11
         beq _wv_d011
+        cpx #$12
+        beq _wv_d012
         cpx #$16
         beq _wv_d016
         cpx #$18
@@ -1683,12 +1697,41 @@ _wv_ignore:
 
 _wv_d011:
         ; $D011: screen control
+        ; Bit 7 = raster compare high bit (write), current raster high bit (read)
+        ; Bit 5 = BMM (bitmap mode), Bit 4 = DEN (display enable)
+        ; Bit 3 = RSEL (row select), Bits 2-0 = YSCROLL
         lda c128_saved_data
         sta vic_regs+$11        ; Always update shadow
+
+        ; Update raster compare high bit from bit 7
+        and #$80
+        beq _wv_d011_rc_lo
+        lda #$01
+_wv_d011_rc_lo:
+        sta vic_raster_compare_hi
+
+        lda c128_saved_data
         ldx vdc_mode_active
-        bne +                   ; In 80-col mode, don't touch real VIC-IV
+        bne _wv_d011_done       ; In 80-col mode, don't touch real VIC-IV
         sta $D011
-+       rts
+
+        ; Check if bitmap mode changed - reconfigure CHARPTR
+        ; In bitmap mode, CHARPTR must point at bitmap data
+        ; In character mode, CHARPTR points at charset
+        and #$20                ; isolate BMM bit
+        cmp _d011_prev_bmm
+        beq _wv_d011_done       ; no change
+        sta _d011_prev_bmm
+
+        ; BMM changed - reconfigure CHARPTR from current $D018
+        lda vic_regs+$18
+        sta c128_saved_data     ; set up for _d018 handler
+        jmp _wv_d018_update     ; reconfigure CHARPTR/SCRNPTR
+
+_wv_d011_done:
+        rts
+
+_d011_prev_bmm: .byte 0        ; previous BMM state
 
 _wv_d016:
         ; $D016: screen control 2
@@ -1696,15 +1739,32 @@ _wv_d016:
         sta $D016
         rts
 
+_wv_d012:
+        ; $D012: Raster compare register (write = set compare value)
+        ; On read, returns current raster line (handled in read_vic_register)
+        lda c128_saved_data
+        sta vic_raster_compare_lo
+        ; Don't write to real MEGA65 $D012 - we handle raster compare internally
+        rts
+
 _wv_d018:
         ; $D018: VIC-II memory control register
         ; Bits 4-7: Screen base offset (x $0400)
         ; Bits 1-3: Charset base offset (x $0800)
+        ;           In bitmap mode, bit 3 selects bitmap base ($0000 or $2000)
         ;
         ; In 80-col mode, save to shadow only - don't update SCRNPTR/CHARPTR
         ; since VDC_RenderFrame handles the display
         lda vdc_mode_active
         bne _d018_shadow_only
+
+_wv_d018_update:
+        ; Check if bitmap mode is active ($D011 bit 5)
+        lda vic_regs+$11
+        and #$20
+        bne _d018_bitmap
+
+        ; --- Character mode: CHARPTR = charset base ---
         ;
         ; VIC-II CHARACTER ROM SHADOW:
         ; In VIC bank 0 ($0000-$3FFF) or bank 2 ($8000-$BFFF),
@@ -1726,7 +1786,7 @@ _wv_d018:
         cmp #$18
         beq _d018_charrom
 
-        ; Not a char ROM shadow address - use RAM
+        ; Not a char ROM shadow address - use RAM in bank 4
         lda #$00
         sta $D068
         lda _d018_char_hi
@@ -1737,8 +1797,6 @@ _wv_d018:
 
 _d018_charrom:
         ; Point CHARPTR at chargen in bank 2 ($02A000)
-        ; $D018 charset offset $10 -> $A000+$1000=$B000
-        ; $D018 charset offset $18 -> $A000+$1800=$B800
         lda #$00
         sta $D068
         lda _d018_char_hi
@@ -1746,6 +1804,30 @@ _d018_charrom:
         adc #>CHARGEN_OFF       ; $10 -> $B0, $18 -> $B8
         sta $D069
         lda #CHARGEN_BANK
+        sta $D06A
+        jmp _d018_screen
+
+_d018_bitmap:
+        ; --- Bitmap mode: CHARPTR = bitmap data base ---
+        ; $D018 bit 3: 0 = bitmap at VIC bank+$0000, 1 = bitmap at VIC bank+$2000
+        ; VIC bank 0 (default), so bitmap at $40000 or $42000 in MEGA65
+        lda c128_saved_data
+        and #$08                ; isolate bit 3
+        beq _d018_bmp_lo
+        ; Bit 3 set: bitmap at $2000 -> MEGA65 $42000
+        lda #$00
+        sta $D068
+        lda #$20
+        sta $D069
+        lda #BANK_RAM0
+        sta $D06A
+        jmp _d018_screen
+_d018_bmp_lo:
+        ; Bit 3 clear: bitmap at $0000 -> MEGA65 $40000
+        lda #$00
+        sta $D068
+        sta $D069
+        lda #BANK_RAM0
         sta $D06A
 
 _d018_screen:
@@ -1775,6 +1857,9 @@ _d018_scrn_hi: .byte 0
 _wv_d019:
         ; $D019: IRQ flag register - write 1 to acknowledge
         ; Writing a 1 bit clears that flag
+        ; Also acknowledge on real VIC-IV hardware using ASL (RMW)
+        ; which triggers the MEGA65's write-back hack to clear flags
+        asl $D019
         lda c128_saved_data
         and vic_regs+$19
         eor vic_regs+$19

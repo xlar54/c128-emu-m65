@@ -1041,11 +1041,53 @@ _vic_check_raster_irq:
         sta c128_irq_pending
 
 _vic_next_line:
+        ; Acknowledge any pending VIC-IV IRQ flags using RMW instruction.
+        ; On the MEGA65, ASL $D019 triggers the write-back hack that
+        ; writes the original value back (clearing set flags).
+        asl $D019
+
+        ; Check real VIC-IV for sprite collision IRQ flags
+        ; Only trigger on rising edge (new collision, not ongoing)
+        lda $D019               ; read real VIC-IV IRQ flags
+        and #$06                ; isolate collision bits (1 and 2)
+        beq _vic_collision_clear
+        ; Collision active - check if already flagged (no re-trigger)
+        tax                     ; save collision bits
+        and _vic_prev_collision
+        cmp _vic_prev_collision
+        beq _vic_no_collision   ; same bits already set, skip
+        ; New collision detected - merge into shadow
+        txa
+        sta _vic_prev_collision
+        ora vic_regs+$19
+        sta vic_regs+$19
+        ; Acknowledge collision on real hardware via RMW
+        asl $D019
+        ; Check if collision IRQ is enabled in $D01A
+        lda vic_regs+$19
+        and #$06
+        and vic_regs+$1A
+        beq _vic_no_collision
+        ; Trigger emulated IRQ
+        lda vic_regs+$19
+        ora #$80
+        sta vic_regs+$19
+        lda #1
+        sta c128_irq_pending
+        bra _vic_no_collision
+_vic_collision_clear:
+        ; No collision - reset edge detection
+        lda #0
+        sta _vic_prev_collision
+_vic_no_collision:
+
         ; More lines to process?
         lda vic_cycle_accum
         cmp #VIC_CYCLES_PER_LINE
         bcs _vic_line_loop
         rts
+
+_vic_prev_collision: .byte 0    ; previous collision state for edge detection
 
 
 ; ============================================================
@@ -1090,6 +1132,50 @@ _c128_wants_80:
         lda #1
         sta vdc_mode_active
 _mode_check_done:
+
+        ; In 40-col mode, convert C128 8-bit sprite pointers to
+        ; 16-bit SPRPTR16 format. Read 8 pointer bytes from C128
+        ; screen+$3F8, add $1000 (bank 4 offset: $40000/64), and
+        ; write 16 bytes to spr16_ptrs table.
+        lda display_showing_80
+        bne _skip_sprite_sync
+
+        ; Calculate sprite pointer source address in bank 4:
+        ; screen base (from $D018 shadow) + $3F8
+        ; Screen hi byte is in vic_regs+$18 bits 4-7 >> 2 & $3C
+        lda vic_regs+$18
+        lsr
+        lsr
+        and #$3C
+        clc
+        adc #$03                ; + $03xx (high byte of $3F8)
+        sta C128_MEM_PTR+1
+        lda #$F8                ; low byte of $3F8
+        sta C128_MEM_PTR+0
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ldx #0                  ; sprite index (0-7)
+        ldy #0                  ; spr16_ptrs offset (0,2,4,...14)
+_spr_convert:
+        txa
+        taz
+        lda [C128_MEM_PTR],z    ; read 8-bit pointer from bank 4
+        clc
+        adc #<$1000             ; add bank 4 offset low ($00)
+        sta spr16_ptrs,y        ; store 16-bit pointer low byte
+        iny
+        lda #>$1000             ; bank 4 offset high ($10)
+        adc #0                  ; add carry from low byte
+        sta spr16_ptrs,y        ; store 16-bit pointer high byte
+        iny
+        inx
+        cpx #8
+        bcc _spr_convert
+
+_skip_sprite_sync:
 
         ; VDC 80-column rendering only when displaying 80-col screen
         lda display_showing_80
@@ -1400,6 +1486,11 @@ pc_trace_idx:          .byte 0
 pc_trace_hi:           .fill 128, 0
 pc_trace_lo:           .fill 128, 0
 pc_trace_sp:           .fill 128, 0
+
+; 16-bit sprite pointer table for SPRPTR16 mode
+; Must be aligned to 16-byte boundary
+        .align 16
+spr16_ptrs:     .fill 16, 0    ; 8 sprites × 2 bytes each
 
 ; ============================================================
 ; cpu_take_irq - Execute IRQ sequence
