@@ -209,6 +209,10 @@ start:
         sta $D640
         clv
 
+        ; Save C65 ROM at $2A000 (8KB) to attic at $8020000 before
+        ; chargen load overwrites it. Needed for GO64 restore.
+        #dma_copy $00, $02, $A000, $80, $02, $0000, $2000
+
         lda #$02
         ldx #$00
         jsr SETBNK              ; Load to bank 2

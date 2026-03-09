@@ -258,7 +258,23 @@ _check_f9:
 
 _check_a8:
         ; Crunch/GONE disabled - no $A8xx hooks active
-        jmp _done_fast
+        cmp #$A8
+        beq _done_fast
+
+        ; ----- Check for $E24B (GO64 mode) -----
+        cmp #$E2
+        bne _done_fast
+        lda c128_pc_lo
+        cmp #$4B
+        bne _done_fast
+        ; GO64 detected - save regs and handle
+        pha
+        txa
+        pha
+        tya
+        pha
+        jsr C128Hook_GO64
+        jmp _done
 
 ; Fast exit - no registers were saved, just return
 _done_fast:
@@ -651,3 +667,23 @@ _attr_clr_dst:
 
 ; Crunch tokenizer removed to reduce code size
 ; (BASIC tokenizer runs natively through ROM)
+
+
+; ============================================================
+; C128Hook_GO64 - Handle GO64 command
+;
+; Restores the C65 ROM at $2A000 (8KB chargen area that was
+; overwritten during boot), then calls the MEGA65's native
+; GO64 routine at $FF53 to switch to C64 mode.
+; ============================================================
+C128Hook_GO64:
+        ; Restore C65 ROM: DMA copy 8KB from attic $8020000 to $2A000
+        #dma_copy $80, $02, $0000, $00, $02, $A000, $2000
+
+        ; Enable HOTREG so GO64 can reconfigure VIC-IV properly
+        lda $D05D
+        ora #$80
+        sta $D05D
+
+        ; Call MEGA65 native GO64 (now C65 KERNAL is mapped at $E000+)
+        jmp $FF53

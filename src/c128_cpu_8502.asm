@@ -272,8 +272,10 @@ hook_page_flags:
         .byte 6
         ; $E1: raster waits + delay loop
         .byte 5
-        ; $E2-$F7: no hooks
-        .fill 22, 0
+        ; $E2: GO64 hook
+        .byte $80
+        ; $E3-$F7: no hooks
+        .fill 21, 0
         ; $F8: KERNAL hooks
         .byte $80
         ; $F9: no hooks
@@ -2605,6 +2607,8 @@ _hook_chain_kernal_check:
         cmp #$A8
         beq _hook_do_check
         cmp #$A0
+        beq _hook_do_check
+        cmp #$E2
         beq _hook_do_check
         cmp #$4B
         beq _hook_do_check
