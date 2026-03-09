@@ -85,7 +85,8 @@ C128_RAM_PTR    = $F8           ; 4 bytes at $F8-$FB
 
 ; -----------------------------------------------------------------
 ; read_data_fast: Inline read from c128_addr_hi:c128_addr_lo
-; For addr < $40 page, reads via dedicated C128_RAM_PTR (bank 4).
+; For addr < $4000, reads via dedicated C128_RAM_PTR (bank 4)
+; with bank 1 shared RAM check.
 ; For addr >= $4000, falls back to jsr C128_ReadFast.
 ; Result in A. Clobbers Z.
 ; -----------------------------------------------------------------
@@ -1051,6 +1052,23 @@ _vic_next_line:
 ; VIC_FrameTasks - Called once per frame (at raster line 0)
 ; ============================================================
 VIC_FrameTasks:
+        ; Frame-lock to MEGA65 vertical blank (~50Hz PAL)
+        ; Wait for raster to reach vblank area (line >= 300).
+        ; Then wait for it to leave vblank (line < 256) so we don't
+        ; pass through immediately on the next emulated frame.
+        ;
+        ; Phase 1: Wait for vblank
+-       lda $D012
+        tay
+        lda $D011
+        and #$80
+        beq -                   ; raster < 256, keep waiting
+        cpy #44
+        bcc -                   ; raster < 300, keep waiting
+;        ; Phase 2: Wait for vblank to end (new frame starts)
+;-       lda $D011
+;        and #$80
+;        bne -                   ; raster >= 256, still in vblank
         ; Keyboard injection - read MEGA65 hardware keyboard and inject
         ; into C128 keyboard buffer. TAB key is intercepted for screen toggle.
         jsr C128_KeyboardInject
@@ -1078,35 +1096,9 @@ _mode_check_done:
         beq _skip_vdc_render
         jsr VDC_RenderFrame
 _skip_vdc_render:
-
-        ; Brief delay when in 40-col mode to reduce emulation speed
-        lda display_showing_80
-        bne +                   ; skip delay in 80-col mode
-        
-        ldx #$FF
-        ldy #$FF        ; outer loop - tweak this
--       dex
-        bne -
-        ldx #$FF
-        dey
-        bne -
-
-+
-        ; Cursor blink phase toggle (every 16 frames)
+        ; Update VDC cursor (handles blink timing internally)
         lda display_showing_80
         beq _frame_done
-
-        inc c128_cur_div
-        lda c128_cur_div
-        cmp #110
-        bcc _cur_redraw
-        lda #0
-        sta c128_cur_div
-        lda c128_cur_phase
-        eor #1
-        sta c128_cur_phase
-_cur_redraw:
-        ; Redraw cursor every frame (after VDC DMA overwrites it)
         jsr VDC_UpdateCursor
 
 _frame_done:
@@ -1401,8 +1393,7 @@ vic_raster_compare_lo: .byte $FF     ; Raster compare low byte
 vic_raster_compare_hi: .byte $01     ; Raster compare high bit
 
 ; Cursor state
-c128_cur_div:          .byte 0
-c128_cur_phase:        .byte 0
+
 tab_last:             .byte 0
 display_showing_80:   .byte 1           ; 1=showing 80-col, 0=showing 40-col
 pc_trace_idx:          .byte 0

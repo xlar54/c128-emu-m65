@@ -39,7 +39,9 @@ VDC_RAM_BASE = $0000            ; base offset within bank ($50000)
 ; VDC Register State
 ; ============================================================
 vdc_index:       .byte 0          ; Current VDC register index
-vdc_regs:        .fill 12, 0     ; R0-R11
+vdc_regs:        .fill 10, 0     ; R0-R9
+                 .byte $60       ; R10 = cursor mode: %11 blink, start line 0
+                 .byte $07       ; R11 = cursor end line 7 (full block)
                  .byte $00, $00  ; R12:R13 = screen start ($0000)
                  .byte $00, $00  ; R14:R15 = cursor position
                  .fill 4, 0     ; R16-R19
@@ -848,32 +850,77 @@ _vsc_done:
 ; VDC_UpdateCursor - Draw/erase cursor on MEGA65 screen
 ;
 ; Checks VDC R10 bits 6:5 for cursor mode:
-;   %01 = cursor disabled (CRSROFF writes $20)
-; Tracks previous cursor position. On each call:
-; 1. Erase old cursor (restore char from VDC RAM at old position)
-; 2. If cursor enabled and phase is ON, draw new cursor
+;   %00 = non-blinking (always visible)
+;   %01 = cursor disabled
+;   %10 = slow blink (toggle every 16 frames, ~1/16 SRF)
+;   %11 = fast blink (toggle every 8 frames, ~1/32 SRF)
+;
+; Manages its own blink counter (_vdc_cur_counter).
+; Called once per frame from the main loop.
 ;
 ; MEGA65 screen at $054000, VDC screen RAM at $50000 + R12:R13
 ; ============================================================
 VDC_UpdateCursor:
-        ; Check VDC R10 bits 6:5 - if %01, cursor is disabled
+        ; Extract cursor mode from R10 bits 6:5
         lda vdc_regs+10
         and #%01100000
-        cmp #%00100000          ; %01 = cursor off
-        bne _vdc_cur_enabled
+        sta _vdc_cur_mode
+
+        ; Mode %01 ($20) = cursor off
+        cmp #%00100000
+        bne _vdc_cur_not_off
 
         ; Cursor disabled - erase if currently drawn, then exit
         lda _vdc_cur_drawn
-        beq _vdc_cur_done       ; Not drawn, nothing to do
-        jmp _vdc_cur_do_erase   ; Erase and exit
+        beq _vdc_cur_done
+        jmp _vdc_cur_do_erase
 
-_vdc_cur_enabled:
+_vdc_cur_not_off:
+        ; Determine if cursor should be visible this frame
+        lda _vdc_cur_mode
+        beq _vdc_cur_visible    ; %00 = non-blinking, always visible
+
+        ; Blinking mode - increment counter and check threshold
+        inc _vdc_cur_counter
+        lda _vdc_cur_mode
+        cmp #%01000000          ; %10 = slow blink
+        beq _vdc_cur_slow
+
+        ; %11 = slow blink: toggle every 16 frames (1/32 SRF)
+        lda _vdc_cur_counter
+        cmp #16
+        bcc _vdc_cur_check_phase
+        bra _vdc_cur_toggle
+
+_vdc_cur_slow:
+        ; %10 = fast blink: toggle every 8 frames (1/16 SRF)
+        lda _vdc_cur_counter
+        cmp #8
+        bcc _vdc_cur_check_phase
+
+_vdc_cur_toggle:
+        ; Reset counter and toggle phase
+        lda #0
+        sta _vdc_cur_counter
+        lda _vdc_cur_phase
+        eor #1
+        sta _vdc_cur_phase
+
+_vdc_cur_check_phase:
+        lda _vdc_cur_phase
+        bne _vdc_cur_visible
+
+        ; Phase OFF - erase cursor if drawn
+        lda _vdc_cur_drawn
+        beq _vdc_cur_done
+        jmp _vdc_cur_do_erase
+
+_vdc_cur_visible:
         ; --- Step 1: Erase old cursor at previous position ---
         lda _vdc_cur_drawn
-        beq _vdc_cur_no_erase   ; Not drawn, nothing to erase
+        beq _vdc_cur_no_erase
 
 _vdc_cur_do_erase:
-
         ; Read original char from VDC screen RAM at old position
         ; VDC RAM addr = R12:R13 + prev_offset, at $50000+
         lda vdc_regs+13
@@ -913,6 +960,13 @@ _vdc_cur_do_erase:
         lda #0
         sta _vdc_cur_drawn      ; mark as erased
 
+        ; If we got here from cursor-off or phase-off, exit now
+        lda _vdc_cur_mode
+        cmp #%00100000          ; cursor off?
+        beq _vdc_cur_done
+        lda _vdc_cur_phase
+        beq _vdc_cur_done       ; phase off for blinking mode
+
 _vdc_cur_no_erase:
         ; --- Step 2: Compute new cursor offset ---
         lda vdc_regs+15         ; R15 cursor pos low
@@ -924,23 +978,15 @@ _vdc_cur_no_erase:
         sta _vdc_cur_offset+1
 
         ; Bounds check: offset must be 0-1999 ($0000-$07CF)
-        ; High byte in A after the SBC above
-        ; high < $07: definitely in bounds
-        ; high > $07: definitely out of bounds
-        ; high == $07: check low byte < $D0
         cmp #$07
         bcc _vdc_cur_in_bounds  ; high < $07: in bounds
         bne _vdc_cur_done       ; high > $07: out of bounds
-        ; high == $07: check low byte
         lda _vdc_cur_offset
         cmp #$D0
         bcs _vdc_cur_done       ; low >= $D0: offset >= 2000, out of bounds
 
 _vdc_cur_in_bounds:
-        ; --- Step 3: If cursor phase ON, draw at new position ---
-        lda c128_cur_phase
-        beq _vdc_cur_save_prev  ; Phase OFF - just save position, don't draw
-
+        ; --- Step 3: Draw cursor at new position ---
         ; Write reverse space ($A0) to MEGA65 screen
         lda _vdc_cur_offset
         clc
@@ -970,9 +1016,12 @@ _vdc_cur_save_prev:
 _vdc_cur_done:
         rts
 
-_vdc_cur_offset: .word 0
-_vdc_cur_prev:   .word 0       ; Previous cursor offset (for erase)
-_vdc_cur_drawn:  .byte 0       ; 1 = cursor block currently on screen
+_vdc_cur_offset:  .word 0
+_vdc_cur_prev:    .word 0       ; Previous cursor offset (for erase)
+_vdc_cur_drawn:   .byte 0       ; 1 = cursor block currently on screen
+_vdc_cur_mode:    .byte 0       ; R10 bits 6:5 cached
+_vdc_cur_counter: .byte 0       ; Frame counter for blink timing
+_vdc_cur_phase:   .byte 1       ; 1 = cursor visible, 0 = hidden
 
 
 ; ============================================================
