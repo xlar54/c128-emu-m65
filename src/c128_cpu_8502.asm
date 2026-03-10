@@ -1260,6 +1260,171 @@ _tab_show_40:
         rts
 
 _ki_not_tab:
+        ; Check for function key PETSCII codes and expand definitions
+        ; C128 function keys: F1=$85, F3=$86, F5=$87, F7=$88
+        ;                     F2=$89, F4=$8A, F6=$8B, F8=$8C
+        ; Map to function key index 0-7
+        cmp #$85
+        bcc _ki_not_fkey        ; < $85, not a function key
+        cmp #$8D
+        bcs _ki_not_fkey        ; >= $8D, not a function key
+
+        ; It's a function key - dequeue it
+        pha
+        lda #$01
+        sta $D610
+        pla
+
+        ; Map PETSCII to C128 function key index (0-7)
+        ; F1=$85->0, F3=$86->2, F5=$87->4, F7=$88->6
+        ; F2=$89->1, F4=$8A->3, F6=$8B->5, F8=$8C->7
+        sec
+        sbc #$85                ; A = 0-7 (F1-F4 = 0-3, F2-F8 = 4-7)
+        ; Remap: 0->0(F1), 1->2(F3), 2->4(F5), 3->6(F7),
+        ;        4->1(F2), 5->3(F4), 6->5(F6), 7->7(F8)
+        tax
+        lda _fkey_remap,x
+        tax                     ; X = C128 function key index (0-7)
+
+        ; Read definition length from C128 RAM at $1000+X (bank 4: $41000+X)
+        txa
+        clc
+        adc #$00
+        sta C128_MEM_PTR+0
+        lda #$10
+        adc #0
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; A = definition length
+        beq _ki_done            ; length 0, nothing to inject
+        sta _fkey_len
+
+        ; Calculate offset into definition area at $100A
+        ; Sum lengths of keys 0..X-1 to find start offset
+        lda #$00
+        sta _fkey_offset
+        cpx #$00
+        beq _fkey_offset_done
+        ; Sum previous lengths
+        ldy #0                  ; index
+        lda #$00
+        sta C128_MEM_PTR+0
+        lda #$10
+        sta C128_MEM_PTR+1
+_fkey_sum:
+        ldz #0
+        tya
+        taz
+        lda [C128_MEM_PTR],z
+        clc
+        adc _fkey_offset
+        sta _fkey_offset
+        iny
+        dex
+        bne _fkey_sum
+
+_fkey_offset_done:
+        ; Point at definition string: $100A + offset (bank 4)
+        lda _fkey_offset
+        clc
+        adc #$0A
+        sta C128_MEM_PTR+0
+        lda #$10
+        adc #0
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Inject each character of the definition into C128 keyboard buffer
+        ; Save the definition string pointer for restoration during loop
+        lda C128_MEM_PTR+0
+        sta _fkey_str_lo
+        lda C128_MEM_PTR+1
+        sta _fkey_str_hi
+        ldy #0                  ; string index
+_fkey_inject_loop:
+        cpy _fkey_len
+        bcs _ki_done            ; all characters injected
+
+        ; Check buffer has room
+        pha
+        lda #C128_NDX_ZP
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        cmp #C128_KEYD_MAX
+        bcs _fkey_inject_full
+
+        ; Read character from definition
+        tax                     ; X = current NDX
+        tya
+        taz
+        lda [C128_MEM_PTR],z    ; A = definition char
+        pha                     ; save char
+
+        ; Write to KEYD[NDX]
+        txa                     ; A = NDX
+        clc
+        adc #<C128_KEYD_OFFSET
+        sta C128_MEM_PTR+0
+        lda #>C128_KEYD_OFFSET
+        adc #0
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        pla                     ; get char back
+        sta [C128_MEM_PTR],z
+
+        ; Increment NDX
+        lda #C128_NDX_ZP
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        clc
+        adc #1
+        sta [c128_zp_ptr],z
+
+        ; Restore C128_MEM_PTR to definition string for next iteration
+        lda _fkey_str_lo
+        sta C128_MEM_PTR+0
+        lda _fkey_str_hi
+        sta C128_MEM_PTR+1
+        lda #BANK_RAM0
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        pla                     ; balance the pha before buffer check
+        iny
+        bra _fkey_inject_loop
+
+_fkey_inject_full:
+        pla                     ; balance pha
+        ; Buffer full, remaining chars lost
+        rts
+
+_fkey_remap:
+        ; Maps PETSCII offset (0-7) to C128 function key index
+        ; PETSCII: F1=$85(0) F3=$86(1) F5=$87(2) F7=$88(3)
+        ;          F2=$89(4) F4=$8A(5) F6=$8B(6) F8=$8C(7)
+        ; C128 index: F1=0 F2=1 F3=2 F4=3 F5=4 F6=5 F7=6 F8=7
+        .byte 0, 2, 4, 6, 1, 3, 5, 7
+
+_fkey_len:      .byte 0
+_fkey_offset:   .byte 0
+_fkey_str_lo:   .byte 0
+_fkey_str_hi:   .byte 0
+
+_ki_not_fkey:
         ; Dequeue the key by writing 1 to $D610
         pha
         lda #$01
