@@ -461,19 +461,21 @@ _irq_clock_done:
         lda #0
         sta cia1_icr_data       ; Clear pending interrupt flags
 
-        ; --- Do RTI natively ---
-        ; The IRQ pushed P, PC onto guest stack (and ROM pushed MMU config).
-        ; $FF33 would: PLA (MMU config) → STA $FF00, then pull Y, X, A, then RTI
-        ; The IRQ entry at $FF17 pushes: MMU config, A, X, Y (then JMPs to handler)
-        ; So the stack is (top→bottom): [handler stuff], Y, X, A, MMU_config, P, PClo, PChi
-        ;
-        ; We need to unwind: pull Y, X, A, MMU_config from stack, then RTI (pull P, PC)
-        ;
-        ; Actually, let's just set PC to $FF33 and let the emulator handle it.
-        ; It's only ~10 emulated instructions and gets the stack cleanup right.
-        lda #$33
-        sta c128_pc_lo
+        ; --- Call BASIC IRQ extension at $4006 ---
+        ; This handles PLAY (music), MOVSPR (sprite motion), COLLISION.
+        ; Push return address ($FF33-1 = $FF32) onto guest stack so
+        ; RTS from $4006 goes to $FF33 (KERNAL IRQ exit/RTI).
         lda #$FF
+        sta c128_data
+        jsr push_data           ; push high byte of $FF33
+        lda #$32
+        sta c128_data
+        jsr push_data           ; push low byte ($33-1=$32 for RTS convention)
+
+        ; Set PC to $4006 - BASIC IRQ handler
+        lda #$06
+        sta c128_pc_lo
+        lda #$40
         sta c128_pc_hi
 
         lda #1
@@ -678,12 +680,95 @@ _attr_clr_dst:
 ; ============================================================
 C128Hook_GO64:
         ; Restore C65 ROM: DMA copy 8KB from attic $8020000 to $2A000
+        ;#dma_copy $80, $02, $0000, $00, $02, $A000, $2000
+
+        ; Enable HOTREG so GO64 can reconfigure VIC-IV properly
+        ;lda $D05D
+        ;ora #$80
+        ;sta $D05D
+
+        ; Call MEGA65 native GO64 (now C65 KERNAL is mapped at $E000+)
+        ;jmp $FF53
+
+        ; Disable interrupts during transition
+        sei
+
+        ; Restore C65 ROM: DMA copy 8KB from attic $8020000 to $2A000
         #dma_copy $80, $02, $0000, $00, $02, $A000, $2000
+
+        ; Restore C65 KERNAL mapping at $E000-$FFFF only.
+        ; We cannot map $2000-$7FFF (MAPLO) because our emulator code lives there.
+        ; MAPHI: map $8000-$BFFF + $E000-$FFFF to bank 3, offset $30000
+        ; MAPLO: unmapped (leave our code accessible)
+        lda #$00
+        ldx #$00                ; MAPLO: nothing mapped, no offset
+        ldy #$00
+        ldz #$B3                ; MAPHI: $8000-$BFFF + $E000-$FFFF, offset $30000
+        map
+
+        ; Bank I/O in via C64 mechanism
+        lda #$35
+        sta $01
+
+        ; Do MEGA65 / VIC-IV I/O knock
+        lda #$47
+        sta $D02F
+        lda #$53
+        sta $D02F
+
+        ; End MAP sequence
+        eom
+
+        ; Do Hypervisor call to re-write-protect the ROM area
+        lda #$71
+        sta $D640
+        clv
+
+        ; Reset VIC-IV to safe defaults
+        lda #$00
+        sta $D031               ; H640 off, no VIC-III features
+        sta $D054               ; No MEGA65 extended features
+
+        ; Reset SCRNPTR to default ($0400 in bank 0)
+        sta $D060
+        lda #$04
+        sta $D061
+        lda #$00
+        sta $D062
+        sta $D063
+
+        ; Reset CHARPTR to default ($1000 in bank 0 = char ROM)
+        sta $D068
+        lda #$10
+        sta $D069
+        lda #$00
+        sta $D06A
+
+        ; Disable SPRPTR16, reset SPRPTRADR
+        sta $D06E
+        lda #$F8
+        sta $D06C
+        lda #$07
+        sta $D06D
 
         ; Enable HOTREG so GO64 can reconfigure VIC-IV properly
         lda $D05D
         ora #$80
         sta $D05D
+
+        ; Reset VIC-II registers to defaults
+        lda #$1B
+        sta $D011
+        lda #$C8
+        sta $D016
+        lda #$14
+        sta $D018
+        lda #$00
+        sta $D015               ; sprites off
+        lda #$0E
+        sta $D020               ; light blue border
+        lda #$06
+        sta $D021               ; blue background
 
         ; Call MEGA65 native GO64 (now C65 KERNAL is mapped at $E000+)
         jmp $FF53

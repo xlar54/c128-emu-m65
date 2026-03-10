@@ -1317,11 +1317,27 @@ _rc1_port_a:
 
 _rc1_port_b:
         ; $DC01: Keyboard row read
-        ; Return $FF (no keys pressed) - keyboard input is handled
-        ; by injecting MEGA65 $D619 PETSCII codes directly into the
-        ; C128 keyboard buffer. Passing real CIA through here causes
-        ; duplicate keypresses since both paths see the same key.
-        lda #$FF
+        ; Normally return $FF (no keys) - keyboard input is handled
+        ; by injecting PETSCII codes into C128 keyboard buffer.
+        ; Exception: when $DC00 = $7F (column 7 selected), check
+        ; RUN/STOP key via MEGA65 keyboard matrix scan so the
+        ; KERNAL's RUN/STOP detection at $F63D works.
+        lda $DC00               ; what column is selected?
+        cmp #$7F                ; column 7? (%01111111)
+        bne _rc1_pb_nokey
+
+        ; Column 7 selected - scan RUN/STOP (col 7, row 7)
+        lda #$07
+        sta $D614               ; select column 7
+        lda $D613               ; read rows
+        and #$80                ; bit 7 = row 7 (RUN/STOP)
+        bne _rc1_pb_nokey       ; bit set = not pressed
+        ; RUN/STOP pressed - return with bit 7 clear
+        lda #$7F                ; %01111111 = bit 7 clear
+        rts
+
+_rc1_pb_nokey:
+        lda #$FF                ; no keys pressed
         rts
 
 _rc1_icr:

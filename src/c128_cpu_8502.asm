@@ -1207,11 +1207,39 @@ C128_KEYD_MAX    = 10           ; Max buffer size
 C128_NDX_ZP      = $D0          ; ZP address of buffer count
 
 C128_KeyboardInject:
-        ; Read MEGA65 hardware keyboard buffer (PETSCII)
+        ; Poll RUN/STOP via MEGA65 keyboard matrix ($D614/$D613)
+        ; and set C128 ZP $91 directly as a fallback
+        ; RUN/STOP = column 7, row 7
+        lda #$07
+        sta $D614
+        lda $D613
+        and #$80
+        bne _ki_runstop_up
+        ; RUN/STOP pressed
+        lda #$91
+        sta c128_zp_ptr+0
+        ldz #0
+        lda #$00
+        sta [c128_zp_ptr],z     ; ZP $91 = $00 (pressed)
+        bra _ki_check_queue
+_ki_runstop_up:
+        lda #$91
+        sta c128_zp_ptr+0
+        ldz #0
+        lda #$FF
+        sta [c128_zp_ptr],z     ; ZP $91 = $FF (not pressed)
+
+_ki_check_queue:
+        ; Read MEGA65 keyboard queue via ASCIIKEY ($D610)
+        lda $D610
+        beq _ki_done            ; $00 = queue empty
+
+        ; Key pending - read PETSCIIKEY for the PETSCII value
         lda $D619
-        beq _ki_done            ; $00 = no key pending
         cmp #$FF
-        beq _ki_done            ; $FF = no key pending
+        beq _ki_dequeue_skip    ; no PETSCII interpretation, discard
+
+_ki_process_key:
 
         ; Intercept TAB ($09) for display-only screen peek
         cmp #$09
@@ -1279,6 +1307,10 @@ _ki_not_tab:
         adc #1
         sta [c128_zp_ptr],z
 
+_ki_dequeue_skip:
+        ; Key has no PETSCII value - dequeue and discard
+        lda #$01
+        sta $D610
 _ki_done:
         rts
 
