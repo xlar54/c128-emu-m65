@@ -1288,11 +1288,8 @@ _ki_not_tab:
 
         ; Read definition length from C128 RAM at $1000+X (bank 4: $41000+X)
         txa
-        clc
-        adc #$00
         sta C128_MEM_PTR+0
         lda #$10
-        adc #0
         sta C128_MEM_PTR+1
         lda #BANK_RAM0
         sta C128_MEM_PTR+2
@@ -1316,7 +1313,6 @@ _ki_not_tab:
         lda #$10
         sta C128_MEM_PTR+1
 _fkey_sum:
-        ldz #0
         tya
         taz
         lda [C128_MEM_PTR],z
