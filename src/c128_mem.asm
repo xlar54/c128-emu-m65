@@ -526,7 +526,13 @@ display_show_40col:
         sta $D020
         lda vic_regs+$21
         sta $D021
+
+        ; Restore sprites that were saved when switching to 80-col
+        lda saved_sprite_enable
+        sta $D015
         rts
+
+saved_sprite_enable: .byte 0
 
 ; ============================================================
 ; display_show_80col - Display-only: show 80-col VDC screen
@@ -568,6 +574,12 @@ display_show_80col:
         sta $D058
         lda #0
         sta $D059
+
+        ; Save and disable sprites for 80-col display
+        lda vic_regs+$15
+        sta saved_sprite_enable
+        lda #$00
+        sta $D015
         ; Point SCRNPTR at bank 5 screen: $054000
         lda #$00
         sta $D060               ; SCRNPTR[7:0]
@@ -1673,6 +1685,8 @@ write_vic_register:
         beq _wv_d011
         cpx #$12
         beq _wv_d012
+        cpx #$15
+        beq _wv_d015
         cpx #$16
         beq _wv_d016
         cpx #$18
@@ -1732,6 +1746,16 @@ _wv_d011_done:
         rts
 
 _d011_prev_bmm: .byte 0        ; previous BMM state
+
+_wv_d015:
+        ; $D015: Sprite enable register
+        ; In 80-col mode, don't write to real VIC-IV (sprites hidden)
+        ; Shadow is already updated at line 1681
+        lda display_showing_80
+        bne +
+        lda c128_saved_data
+        sta $D015
++       rts
 
 _wv_d016:
         ; $D016: screen control 2
