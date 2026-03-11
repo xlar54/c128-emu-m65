@@ -496,6 +496,24 @@ display_show_40col:
 
         lda #$00
         sta $D031               ; H640 off
+
+        ; If VDC was in bitmap mode, restore VIC-IV to text mode
+        ; Clear vdc_bitmap_active so switching back to 80-col
+        ; re-runs the full bitmap VIC-IV setup
+        lda vdc_bitmap_active
+        beq _ds40_no_bmp
+        lda #$1B
+        sta $D011               ; bitmap off
+        lda #<CHARGEN_OFF
+        sta $D068
+        lda #>CHARGEN_OFF
+        sta $D069
+        lda #CHARGEN_BANK
+        sta $D06A
+        lda #0
+        sta vdc_bitmap_active
+_ds40_no_bmp:
+
         lda #40
         sta $D058
         lda #0

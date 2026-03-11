@@ -293,18 +293,17 @@ _wvdc_data_skip:
 
 _wvdc_word_count:
         ; R30: Writing word count triggers block copy or fill
-        ; The VDC copies/fills (count+1) bytes starting at R18:R19
-        ; Bit 5 of R24 selects copy (0) vs fill (1)
+        ; R30 triggers block fill/copy of additional bytes.
+        ; The R31 write already wrote the first byte and advanced R18:R19.
+        ; R30 value = number of additional bytes to fill/copy (not +1).
+        ; Bit 7 of R24 selects copy (1) vs fill (0).
         lda c128_saved_data
         sta vdc_regs+30
 
-        ; Count = value + 1 (16-bit because value=$FF -> count=256)
+        ; Count = raw value (16-bit: $00 means 0 extra bytes, $FF means 255)
         lda c128_saved_data
-        clc
-        adc #1
         sta _vdc_fill_count
         lda #0
-        adc #0
         sta _vdc_fill_count+1
 
         ; Check bit 7 of R24 (VSS register): 1 = copy, 0 = fill
@@ -562,19 +561,6 @@ _vdc_copy_advance:
         sta vdc_regs+32
         rts
 
-_wvdc_wc_skip:
-        ; 40-col mode: Advance R18:R19 by (value + 1)
-        clc
-        lda vdc_regs+19
-        adc c128_saved_data
-        sta vdc_regs+19
-        lda vdc_regs+18
-        adc #$00
-        sta vdc_regs+18
-        inc vdc_regs+19
-        bne +
-        inc vdc_regs+18
-+       rts
 
 
 ; ============================================================
@@ -688,14 +674,46 @@ _vpc_off_hi:  .byte 0
 ; via lookup table.
 ; ============================================================
 VDC_RenderFrame:
-        ; Force 80-col border/background colors from VDC register 26
-        ; VDC has no separate border color - border matches background
+        ; Check if VDC is in bitmap mode (R25 bit 7)
+        lda vdc_regs+25
+        bmi _vdc_render_bitmap
+
+        ; --- TEXT MODE ---
+        ; Border/background from R26 bits 4-7 using text color table
         lda vdc_regs+26
         and #$0F
         tax
         lda vdc_to_vic_color,x
         sta $D020
         sta $D021
+
+        ; --- TEXT MODE RENDERING ---
+        ; Ensure VIC-IV is in text mode (no bitmap)
+        lda vdc_bitmap_active
+        beq _vdc_text_mode_ok
+        ; Was in bitmap mode, switch back to text
+        lda #$00
+        sta vdc_bitmap_active
+        lda #$1B
+        sta $D011               ; bitmap off
+        ; Restore CHARPTR to chargen
+        lda #<CHARGEN_OFF
+        sta $D068
+        lda #>CHARGEN_OFF
+        sta $D069
+        lda #CHARGEN_BANK
+        sta $D06A
+        ; Restore SCRNPTR to 80-col text screen
+        lda #$00
+        sta $D060
+        lda #$40
+        sta $D061
+        lda #$05
+        sta $D062
+        lda #$00
+        sta $D063
+
+_vdc_text_mode_ok:
 
         ; --- Step 1: DMA copy VDC screen RAM to MEGA65 screen ---
         ; Always copy every frame (FastCHROUT/PRIMM removed,
@@ -803,6 +821,328 @@ _vdc_skip_attr:
         rts
 
 _vdc_page_count: .byte 0
+vdc_bitmap_active: .byte 0     ; 1 = VIC-IV is in bitmap mode for VDC
+
+; ============================================================
+; VDC Bitmap Mode Rendering
+;
+; Converts VDC sequential bitmap (80 bytes/row, 200 rows)
+; to VIC-IV character-cell bitmap format (8 consecutive bytes
+; per cell, cells arranged left-to-right, top-to-bottom).
+;
+; VDC byte at row R, column C = VDC_RAM + R*80 + C
+; VIC-IV byte for char_col C, char_row CR, pixel_row P =
+;   bitmap_base + (CR*80 + C)*8 + P
+;
+; Source: VDC RAM at bank 5 $050000 (R12:R13 offset)
+; Dest: bitmap buffer at bank 5 $054000 (reuse 80-col screen area)
+; Screen RAM: needs sequential char indices at $054000... wait,
+;   bitmap mode uses CHARPTR for data, SCRNPTR for color info.
+;   Actually in VIC-II bitmap mode, CHARPTR = bitmap data.
+;   SCRNPTR = screen RAM with color nibbles (hi=fg, lo=bg per cell).
+; ============================================================
+_vdc_render_bitmap:
+        ; Set border/bg from R26 background color (low nibble, same as text mode)
+        lda vdc_regs+26
+        and #$0F
+        tax
+        lda vdc_to_vic_color_bmp,x
+        sta $D020
+        sta $D021
+
+        ; Set up VIC-IV for H640 bitmap mode if not already
+        lda vdc_bitmap_active
+        bne _vdc_bmp_update
+
+        ; First time entering bitmap mode - configure VIC-IV
+        lda #1
+        sta vdc_bitmap_active
+
+        ; Enable bitmap mode: $D011 bit 5
+        lda #$3B
+        sta $D011
+
+        ; Point CHARPTR at bitmap buffer in bank 5: $054000
+        lda #$00
+        sta $D068
+        lda #$40
+        sta $D069
+        lda #$05
+        sta $D06A
+
+        ; Set SCRNPTR to color info area at bank 5: $058000
+        lda #$00
+        sta $D060
+        lda #$80
+        sta $D061
+        lda #$05
+        sta $D062
+        lda #$00
+        sta $D063
+
+        ; DMA fill color RAM with 0 (only needed once)
+        #dma_fill_col $0000, 2000, $00
+
+_vdc_bmp_update:
+        ; Check R25 bit 6: attributes enabled?
+        lda vdc_regs+25
+        and #%01000000
+        bne _vdc_bmp_attr_mode
+
+        ; --- Attributes disabled: uniform color from R26 ---
+        lda vdc_regs+26
+        and #$0F                ; foreground (ON bits)
+        tax
+        lda vdc_to_vic_color_bmp,x
+        asl
+        asl
+        asl
+        asl
+        sta _vdc_bmp_tmp        ; fg in high nibble
+        lda vdc_regs+26
+        lsr
+        lsr
+        lsr
+        lsr                     ; background (OFF bits)
+        tax
+        lda vdc_to_vic_color_bmp,x
+        ora _vdc_bmp_tmp        ; combine fg<<4 | bg
+        sta _vdc_bmp_fill_val
+
+        ; DMA fill screen RAM at $058000 with uniform color byte
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $00          ; dst MB = $00
+        .byte $00               ; end options
+        .byte $03               ; fill command
+        .word 2000              ; count
+_vdc_bmp_fill_val:
+        .word $0000             ; fill value (patched above)
+        .byte $00               ; src bank (ignored for fill)
+        .word $8000             ; dst addr = $8000
+        .byte $05               ; dst bank = $05 -> $058000
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
+        jmp _vdc_bmp_do_convert
+
+_vdc_bmp_attr_mode:
+        ; --- Attributes enabled: translate per-cell from VDC attr RAM ---
+        ; VDC bitmap attr: low nibble = fg, high nibble = bg
+        ; VIC-II bitmap screen RAM: high nibble = fg, low nibble = bg
+
+        ; Source: VDC RAM at $050000 + R20:R21
+        lda vdc_regs+21
+        sta C128_MEM_PTR+0
+        lda vdc_regs+20
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Dest: screen RAM at $058000 (bank 5)
+        lda #$00
+        sta vdc_color_ptr+0
+        lda #$80
+        sta vdc_color_ptr+1
+        lda #$05
+        sta vdc_color_ptr+2
+        lda #$00
+        sta vdc_color_ptr+3
+
+        ; Process 7 full pages (1792 bytes) then 208 tail
+        lda #7
+        sta _vdc_bmp_page_count
+
+_vdc_bmp_attr_page:
+        ldz #0
+_vdc_bmp_attr_inner:
+        lda [C128_MEM_PTR],z
+        ; High nibble = bg color (RGBI)
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+        lda vdc_to_vic_color_bmp,x  ; bg -> VIC-II
+        sta _vdc_bmp_tmp            ; save bg in low nibble
+
+        lda [C128_MEM_PTR],z
+        ; Low nibble = fg color (RGBI)
+        and #$0F
+        tax
+        lda vdc_to_vic_color_bmp,x  ; fg -> VIC-II
+        asl
+        asl
+        asl
+        asl                         ; fg to high nibble
+        ora _vdc_bmp_tmp            ; combine fg<<4 | bg
+        sta [vdc_color_ptr],z
+        inz
+        bne _vdc_bmp_attr_inner
+
+        inc C128_MEM_PTR+1
+        inc vdc_color_ptr+1
+        dec _vdc_bmp_page_count
+        bne _vdc_bmp_attr_page
+
+        ; Remaining 208 bytes
+        ldz #0
+_vdc_bmp_attr_tail:
+        lda [C128_MEM_PTR],z
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+        lda vdc_to_vic_color_bmp,x
+        sta _vdc_bmp_tmp
+
+        lda [C128_MEM_PTR],z
+        and #$0F
+        tax
+        lda vdc_to_vic_color_bmp,x
+        asl
+        asl
+        asl
+        asl
+        ora _vdc_bmp_tmp
+        sta [vdc_color_ptr],z
+        inz
+        cpz #208
+        bne _vdc_bmp_attr_tail
+
+_vdc_bmp_do_convert:
+        ; Convert VDC sequential bitmap to VIC-IV cell-interleaved bitmap
+        ; VDC: 80 bytes per row, 200 rows, sequential
+        ; VIC-IV: 8 bytes per cell (one per pixel row), 80 cells per char row
+        ;
+        ; For pixel row R (0-199):
+        ;   char_row = R / 8
+        ;   pix_in_cell = R mod 8
+        ;   src = VDC_RAM + R12:R13 + R * 80
+        ;   dst_base = $054000 + char_row * 640 + pix_in_cell
+        ;   For column C (0-79):
+        ;     dst[dst_base + C*8] = src[C]
+
+        ; Source base = VDC RAM + R12:R13
+        lda vdc_regs+13
+        clc
+        adc #<VDC_RAM_BASE
+        sta _vbmp_src_lo
+        lda vdc_regs+12
+        and #$3F
+        adc #>VDC_RAM_BASE
+        sta _vbmp_src_hi
+
+        ; Dest base = $4000 (within bank 5)
+        lda #$00
+        sta _vbmp_dst_lo
+        lda #$40
+        sta _vbmp_dst_hi
+
+        lda #0
+        sta _vbmp_pix_in_cell   ; R mod 8
+
+        ; Process 200 pixel rows
+        ldx #200
+_vbmp_row_loop:
+        stx _vbmp_rows_left
+
+        ; Set up source pointer
+        lda _vbmp_src_lo
+        sta C128_MEM_PTR+0
+        lda _vbmp_src_hi
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Set up dest pointer = dst_base + pix_in_cell
+        lda _vbmp_dst_lo
+        clc
+        adc _vbmp_pix_in_cell
+        sta vdc_color_ptr+0
+        lda _vbmp_dst_hi
+        adc #0
+        sta vdc_color_ptr+1
+        lda #$05
+        sta vdc_color_ptr+2
+        lda #$00
+        sta vdc_color_ptr+3
+
+        ; Inner loop: 80 columns
+        ; Source: sequential via Z index on C128_MEM_PTR
+        ; Dest: stride 8 via pointer, always write at offset 0
+        ldz #0
+        ldy #80
+_vbmp_col_loop:
+        lda [C128_MEM_PTR],z    ; read src[Z]
+        phz                     ; save Z
+        ldz #0
+        sta [vdc_color_ptr],z   ; write to dest[0]
+        plz                     ; restore Z
+
+        ; Source advances by 1
+        inz
+
+        ; Dest advances by 8
+        lda vdc_color_ptr+0
+        clc
+        adc #8
+        sta vdc_color_ptr+0
+        bcc +
+        inc vdc_color_ptr+1
++
+        dey
+        bne _vbmp_col_loop
+
+        ; Advance source by 80 for next pixel row
+        lda _vbmp_src_lo
+        clc
+        adc #80
+        sta _vbmp_src_lo
+        lda _vbmp_src_hi
+        adc #0
+        sta _vbmp_src_hi
+
+        ; Update pix_in_cell and dst_base
+        inc _vbmp_pix_in_cell
+        lda _vbmp_pix_in_cell
+        cmp #8
+        bcc _vbmp_same_char_row
+
+        ; New character row - reset pix_in_cell, advance dst_base by 640
+        lda #0
+        sta _vbmp_pix_in_cell
+        lda _vbmp_dst_lo
+        clc
+        adc #<640
+        sta _vbmp_dst_lo
+        lda _vbmp_dst_hi
+        adc #>640
+        sta _vbmp_dst_hi
+
+_vbmp_same_char_row:
+        ldx _vbmp_rows_left
+        dex
+        bne _vbmp_row_loop
+
+        rts
+
+_vbmp_src_lo:       .byte 0
+_vbmp_src_hi:       .byte 0
+_vbmp_dst_lo:       .byte 0
+_vbmp_dst_hi:       .byte 0
+_vbmp_pix_in_cell:  .byte 0
+_vbmp_rows_left:    .byte 0
+_vdc_bmp_tmp:       .byte 0
+_vdc_bmp_page_count: .byte 0
 
 
 ; ============================================================
@@ -1047,8 +1387,16 @@ _vdc_cur_phase:   .byte 1       ; 1 = cursor visible, 0 = hidden
 ; VDC $B (1011 lt purple)-> VIC 4  (purple)
 ; VDC $C (1100 dk yellow)-> VIC 9  (brown)
 ; VDC $D (1101 lt yellow)-> VIC 7  (yellow)
-; VDC $E (1110 lt gray)  -> VIC 15 (light grey)
-; VDC $F (1111 white)    -> VIC 1  (white)
+; VDC to VIC-II color mapping for TEXT mode (original working table)
 vdc_to_vic_color:
+        .byte 0, 11, 6, 14, 5, 13, 11, 3
+        .byte 2, 10, 4, 4, 9, 7, 15, 1
+
+; VDC RGBI to VIC-II color mapping for BITMAP mode
+; Same RGBI encoding as text mode (confirmed against Z64K):
+; $0=black $1=dk gray $2=dk blue $3=lt blue $4=dk green $5=lt green
+; $6=dk cyan $7=lt cyan $8=dk red $9=lt red $A=dk purple $B=lt purple
+; $C=brown $D=yellow $E=lt gray $F=white
+vdc_to_vic_color_bmp:
         .byte 0, 11, 6, 14, 5, 13, 11, 3
         .byte 2, 10, 4, 4, 9, 7, 15, 1

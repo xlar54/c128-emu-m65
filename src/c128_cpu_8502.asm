@@ -5981,7 +5981,16 @@ op_87:
         #finish_cycles_no_xtra
         rts
 op_8b: jmp op_illegal
-op_8f: jmp op_illegal
+; $8F SAX abs (illegal) - store A AND X to absolute address
+op_8f:
+        jsr addr_abs
+        lda c128_a
+        and c128_x
+        sta c128_data
+        #write_data_fast
+        lda #4
+        #finish_cycles_no_xtra
+        rts
 op_93: jmp op_illegal
 op_97: jmp op_illegal
 op_9b: jmp op_illegal
