@@ -254,10 +254,25 @@ _wvdc_attr_live:
         lda #$0F
         sta vdc_color_ptr+3
 _wvdc_attr_do_write:
-        ; Translate: extract low nibble, lookup VIC color
+        ; Translate attribute to color RAM
+        ; If bit 6 (reverse) set, use R26 fg color (high nibble)
+        lda c128_saved_data
+        and #$40
+        bne _wvdc_attr_rev
+        ; Normal: use attribute low nibble (foreground)
         lda c128_saved_data
         and #$0F
         tax
+        bra _wvdc_attr_write_color
+_wvdc_attr_rev:
+        ; Reverse: use R26 high nibble (foreground)
+        lda vdc_regs+26
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+_wvdc_attr_write_color:
         lda vdc_to_vic_color,x
         ldz #0
         sta [vdc_color_ptr],z
@@ -756,20 +771,18 @@ _vdc_skip_screen_dma:
 
         lda #0
         sta vdc_attr_dirty      ; Clear dirty flag
-        ; Read each attribute byte from VDC RAM, extract low nibble
-        ; (VDC RGBI color), convert via lookup table, write to color RAM.
 
         ; Source pointer: $50000 + VDC R20:R21
-        lda vdc_regs+21         ; R21 = attribute start low
+        lda vdc_regs+21
         sta C128_MEM_PTR+0
-        lda vdc_regs+20         ; R20 = attribute start high
-        and #$3F                ; mask to 16KB
+        lda vdc_regs+20
+        and #$3F
         clc
         adc #>VDC_RAM_BASE
         sta C128_MEM_PTR+1
-        lda #VDC_RAM_BANK       ; bank 5
+        lda #VDC_RAM_BANK
         sta C128_MEM_PTR+2
-        lda #VDC_RAM_MB         ; $00
+        lda #VDC_RAM_MB
         sta C128_MEM_PTR+3
 
         ; Dest pointer: color RAM at $0FF80000
@@ -780,10 +793,20 @@ _vdc_skip_screen_dma:
         lda #$F8
         sta vdc_color_ptr+2
         lda #$0F
-        sta vdc_color_ptr+3     ; -> $0FF80000
+        sta vdc_color_ptr+3
 
-        ; Process in pages of 256 bytes using Z as index
-        ; First: 7 full pages (7 x 256 = 1792)
+        ; Pre-translate R26 fg color for reverse video lookups
+        ; Reversed cells show R26 foreground as dominant color
+        lda vdc_regs+26
+        lsr
+        lsr
+        lsr
+        lsr                     ; high nibble = foreground
+        tax
+        lda vdc_to_vic_color,x
+        sta _vdc_rev_bg_color   ; cached VIC-II fg color for reversed cells
+
+        ; Process 7 full pages (1792 bytes) then 208 tail
         lda #7
         sta _vdc_page_count
 
@@ -791,14 +814,24 @@ _vdc_attr_page:
         ldz #0
 _vdc_attr_inner:
         lda [C128_MEM_PTR],z    ; Read VDC attribute byte
-        and #$0F                ; Extract foreground color
+        sta _vdc_attr_tmp       ; save full byte
+        and #$40                ; check bit 6 (reverse)
+        bne _vdc_attr_rev
+        ; Normal: use attribute low nibble (foreground)
+        lda _vdc_attr_tmp
+        and #$0F
         tax
-        lda vdc_to_vic_color,x  ; Convert to VIC-II color
+        lda vdc_to_vic_color,x
+        bra _vdc_attr_store
+_vdc_attr_rev:
+        ; Reverse: use R26 background color
+        lda _vdc_rev_bg_color
+_vdc_attr_store:
         sta [vdc_color_ptr],z   ; Write to color RAM
         inz
-        bne _vdc_attr_inner     ; Loop 256 times (Z wraps)
+        bne _vdc_attr_inner
 
-        ; Advance source and dest pointers by 256 (increment high byte)
+        ; Advance source and dest pointers by 256
         inc C128_MEM_PTR+1
         inc vdc_color_ptr+1
 
@@ -809,9 +842,17 @@ _vdc_attr_inner:
         ldz #0
 _vdc_attr_tail:
         lda [C128_MEM_PTR],z
+        sta _vdc_attr_tmp
+        and #$40
+        bne _vdc_attr_tail_rev
+        lda _vdc_attr_tmp
         and #$0F
         tax
         lda vdc_to_vic_color,x
+        bra _vdc_attr_tail_store
+_vdc_attr_tail_rev:
+        lda _vdc_rev_bg_color
+_vdc_attr_tail_store:
         sta [vdc_color_ptr],z
         inz
         cpz #208
@@ -820,7 +861,9 @@ _vdc_attr_tail:
 _vdc_skip_attr:
         rts
 
-_vdc_page_count: .byte 0
+_vdc_page_count:    .byte 0
+_vdc_attr_tmp:      .byte 0
+_vdc_rev_bg_color:  .byte 0
 vdc_bitmap_active: .byte 0     ; 1 = VIC-IV is in bitmap mode for VDC
 
 ; ============================================================
@@ -890,15 +933,7 @@ _vdc_bmp_update:
         bne _vdc_bmp_attr_mode
 
         ; --- Attributes disabled: uniform color from R26 ---
-        lda vdc_regs+26
-        and #$0F                ; foreground (ON bits)
-        tax
-        lda vdc_to_vic_color_bmp,x
-        asl
-        asl
-        asl
-        asl
-        sta _vdc_bmp_tmp        ; fg in high nibble
+        ; Output: bg<<4 | fg
         lda vdc_regs+26
         lsr
         lsr
@@ -906,7 +941,16 @@ _vdc_bmp_update:
         lsr                     ; background (OFF bits)
         tax
         lda vdc_to_vic_color_bmp,x
-        ora _vdc_bmp_tmp        ; combine fg<<4 | bg
+        asl
+        asl
+        asl
+        asl
+        sta _vdc_bmp_tmp        ; bg in high nibble
+        lda vdc_regs+26
+        and #$0F                ; foreground (ON bits)
+        tax
+        lda vdc_to_vic_color_bmp,x
+        ora _vdc_bmp_tmp        ; combine bg<<4 | fg
         sta _vdc_bmp_fill_val
 
         ; DMA fill screen RAM at $058000 with uniform color byte
@@ -962,25 +1006,25 @@ _vdc_bmp_attr_page:
         ldz #0
 _vdc_bmp_attr_inner:
         lda [C128_MEM_PTR],z
-        ; High nibble = bg color (RGBI)
+        ; High nibble = bg color (RGBI) -> VIC high nibble
         lsr
         lsr
         lsr
         lsr
         tax
-        lda vdc_to_vic_color_bmp,x  ; bg -> VIC-II
-        sta _vdc_bmp_tmp            ; save bg in low nibble
+        lda vdc_to_vic_color_bmp,x
+        asl
+        asl
+        asl
+        asl                         ; bg to high nibble
+        sta _vdc_bmp_tmp
 
         lda [C128_MEM_PTR],z
-        ; Low nibble = fg color (RGBI)
+        ; Low nibble = fg color (RGBI) -> VIC low nibble
         and #$0F
         tax
-        lda vdc_to_vic_color_bmp,x  ; fg -> VIC-II
-        asl
-        asl
-        asl
-        asl                         ; fg to high nibble
-        ora _vdc_bmp_tmp            ; combine fg<<4 | bg
+        lda vdc_to_vic_color_bmp,x  ; fg stays in low nibble
+        ora _vdc_bmp_tmp            ; combine bg<<4 | fg
         sta [vdc_color_ptr],z
         inz
         bne _vdc_bmp_attr_inner
@@ -1000,16 +1044,16 @@ _vdc_bmp_attr_tail:
         lsr
         tax
         lda vdc_to_vic_color_bmp,x
+        asl
+        asl
+        asl
+        asl
         sta _vdc_bmp_tmp
 
         lda [C128_MEM_PTR],z
         and #$0F
         tax
         lda vdc_to_vic_color_bmp,x
-        asl
-        asl
-        asl
-        asl
         ora _vdc_bmp_tmp
         sta [vdc_color_ptr],z
         inz
