@@ -689,6 +689,7 @@ _vpc_off_hi:  .byte 0
 ; via lookup table.
 ; ============================================================
 VDC_RenderFrame:
+        jsr ensure_viciv_regs
         ; Check if VDC is in bitmap mode (R25 bit 7)
         lda vdc_regs+25
         bmi _vdc_render_bitmap

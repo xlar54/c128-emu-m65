@@ -280,18 +280,9 @@ C128_VideoInit:
         lda #$53
         sta $D02F
 
-        ; Make sure HOTREG is OFF so VIC-II changes dont effect VIC-IV registers
-        lda $D05D
-        and #$7F                ; Clear bit 7 (HOTREG disable)
-        sta $D05D
-
-        ; --- Common setup for both modes ---
-
-        ; Disable VIC-IV hot registers so C128 KERNAL writes to
-        ; $D018/$D011/$D016/$D031 don't reset our VIC-IV register settings
-        ; (SCRNPTR, CHARPTR, COLPTR, display geometry, etc.)
+        ; Disable HOTREG so VIC-II register writes don't auto-update VIC-IV
         lda #$80
-        trb $D05D               ; Clear bit 7 of $D05D = disable HOTREG
+        trb $D05D               ; Clear bit 7 = disable HOTREG
 
         ; Point screen at bank 5 + $4000 = $054000
         lda #$00
@@ -464,7 +455,22 @@ init_color_buffers:
 ; display_show_40col - Display-only: show 40-col VIC screen
 ; Does NOT change vdc_mode_active (emulation state unchanged)
 ; ============================================================
+; ============================================================
+; ensure_viciv_regs - Ensure VIC-IV registers are accessible
+; Unlocks VIC-IV mode and disables HOTREG.
+; Must be called before any write to $D060+ registers.
+; ============================================================
+ensure_viciv_regs:
+        lda #$47
+        sta $D02F
+        lda #$53
+        sta $D02F
+        lda #$80
+        trb $D05D               ; Clear bit 7 = disable HOTREG
+        rts
+
 display_show_40col:
+        jsr ensure_viciv_regs
         ; Save 80-col colors: $0FF80000 -> $05A800 (bank 5, 2000 bytes)
         lda #$00
         sta $D707
@@ -518,15 +524,15 @@ _ds40_no_bmp:
         sta $D058
         lda #0
         sta $D059
-        ; Point SCRNPTR at C128 VIC screen in bank 4: $040400
-        lda #$00
-        sta $D060               ; SCRNPTR[7:0]
-        lda #$04
-        sta $D061               ; SCRNPTR[15:8]
-        lda #$04
-        sta $D062               ; SCRNPTR[23:16] = $04
-        lda #$00
-        sta $D063               ; -> $040400
+        ; Restore D011 from shadow
+        lda vic_regs+$11
+        sta $D011
+        ; Reconfigure SCRNPTR and CHARPTR from current $D018 and VIC bank
+        lda vic_regs+$18
+        sta c128_saved_data
+        lda #$18
+        sta c128_addr_lo
+        jsr write_vic_register
 
         ; Enable SPRPTR16 mode and point SPRPTRADR at our 16-byte
         ; pointer table in host RAM. In SPRPTR16 mode, sprite data
@@ -557,6 +563,7 @@ saved_sprite_enable: .byte 0
 ; Does NOT change vdc_mode_active (emulation state unchanged)
 ; ============================================================
 display_show_80col:
+        jsr ensure_viciv_regs
         ; Save 40-col colors: $0FF80000 -> $05A000 (bank 5, 1000 bytes)
         lda #$00
         sta $D707
@@ -588,6 +595,8 @@ display_show_80col:
 
         lda #$80
         sta $D031               ; H640 on
+        lda #$1B
+        sta $D011               ; Restore standard display: DEN on, 25 rows, no bitmap
         lda #80
         sta $D058
         lda #0
@@ -1737,6 +1746,10 @@ write_vic_register:
         beq _wv_ignore
         cpx #$30
         beq _wv_ignore
+        ; Only write to real hardware for $D000-$D02E (standard VIC-II range)
+        ; Writes above $D030 would hit VIC-IV extended registers (SCRNPTR etc.)
+        cpx #$31
+        bcs _wv_ignore          ; skip any register >= $31
         lda c128_saved_data
         sta $D000,x
         rts
@@ -1811,12 +1824,13 @@ _wv_d018:
         ; Bits 1-3: Charset base offset (x $0800)
         ;           In bitmap mode, bit 3 selects bitmap base ($0000 or $2000)
         ;
-        ; In 80-col mode, save to shadow only - don't update SCRNPTR/CHARPTR
+        ; In 80-col display mode, save to shadow only - don't update SCRNPTR/CHARPTR
         ; since VDC_RenderFrame handles the display
-        lda vdc_mode_active
+        lda display_showing_80
         bne _d018_shadow_only
 
 _wv_d018_update:
+        jsr ensure_viciv_regs
         ; Check if bitmap mode is active ($D011 bit 5)
         lda vic_regs+$11
         and #$20
@@ -1839,15 +1853,22 @@ _wv_d018_update:
         sta _d018_char_hi
 
         ; Check for character ROM shadow: offset $10 or $18
+        ; Only in VIC banks 0 and 2
+        lda vic_bank_has_charrom
+        beq _d018_char_ram      ; banks 1,3 have no char ROM shadow
+        lda _d018_char_hi
         cmp #$10
         beq _d018_charrom
         cmp #$18
         beq _d018_charrom
 
-        ; Not a char ROM shadow address - use RAM in bank 4
+_d018_char_ram:
+        ; Not a char ROM shadow address - use RAM in bank 4 + VIC bank
         lda #$00
         sta $D068
         lda _d018_char_hi
+        clc
+        adc vic_bank_base       ; add VIC bank offset
         sta $D069
         lda #BANK_RAM0
         sta $D06A
@@ -1868,32 +1889,37 @@ _d018_charrom:
 _d018_bitmap:
         ; --- Bitmap mode: CHARPTR = bitmap data base ---
         ; $D018 bit 3: 0 = bitmap at VIC bank+$0000, 1 = bitmap at VIC bank+$2000
-        ; VIC bank 0 (default), so bitmap at $40000 or $42000 in MEGA65
         lda c128_saved_data
         and #$08                ; isolate bit 3
         beq _d018_bmp_lo
-        ; Bit 3 set: bitmap at $2000 -> MEGA65 $42000
+        ; Bit 3 set: bitmap at VIC bank + $2000
         lda #$00
         sta $D068
         lda #$20
+        clc
+        adc vic_bank_base
         sta $D069
         lda #BANK_RAM0
         sta $D06A
         jmp _d018_screen
 _d018_bmp_lo:
-        ; Bit 3 clear: bitmap at $0000 -> MEGA65 $40000
+        ; Bit 3 clear: bitmap at VIC bank + $0000
         lda #$00
         sta $D068
+        lda vic_bank_base
         sta $D069
         lda #BANK_RAM0
         sta $D06A
 
 _d018_screen:
         ; --- Update SCRNPTR ---
+        ; Screen addr = VIC bank base + ($D018 bits 7-4) * $0400
         lda c128_saved_data
         lsr
         lsr
         and #$3C
+        clc
+        adc vic_bank_base       ; add VIC bank offset
         sta _d018_scrn_hi
 
         lda #$00
@@ -1902,6 +1928,8 @@ _d018_screen:
         sta $D061
         lda #BANK_RAM0
         sta $D062
+        lda #$00
+        sta $D063               ; megabyte = 0
 
         rts
 
@@ -1911,6 +1939,8 @@ _d018_shadow_only:
 
 _d018_char_hi: .byte 0
 _d018_scrn_hi: .byte 0
+vic_bank_base: .byte 0            ; VIC bank base high byte ($00/$40/$80/$C0)
+vic_bank_has_charrom: .byte 1     ; 1=char ROM shadow visible (C128: always, unless CHAREN set)
 
 _wv_d019:
         ; $D019: IRQ flag register - write 1 to acknowledge
@@ -2053,7 +2083,33 @@ write_cia2_register:
         ; $DD00: VIC bank select
         cpx #$00
         bne _wc2_not_00
-        ; TODO: Update VIC bank selection
+        ; Bits 0-1 select VIC bank (inverted):
+        ;   %11 = bank 0 ($0000), %10 = bank 1 ($4000)
+        ;   %01 = bank 2 ($8000), %00 = bank 3 ($C000)
+        ; Compute VIC bank base high byte for MEGA65 addressing
+        lda c128_saved_data
+        and #$03
+        eor #$03                ; invert: 3->0, 2->1, 1->2, 0->3
+        ; Multiply by $40 to get base high byte ($00/$40/$80/$C0)
+        asl
+        asl
+        asl
+        asl
+        asl
+        asl
+        sta vic_bank_base       ; high byte of VIC bank within C128 RAM
+        ; C128 VIC-IIe: character ROM shadow is visible in ALL four VIC banks
+        ; (unlike C64 VIC-II which only has it in banks 0 and 2).
+        ; The CHAREN bit ($01 bit 2) controls whether it's enabled.
+        ; Default is enabled (CHAREN=0), so always set has_charrom=1.
+        lda #1
+        sta vic_bank_has_charrom
+        ; Re-run $D018 update with new bank by simulating a write
+        lda vic_regs+$18
+        sta c128_saved_data
+        lda #$18
+        sta c128_addr_lo
+        jsr write_vic_register
         rts
 _wc2_not_00:
         rts
