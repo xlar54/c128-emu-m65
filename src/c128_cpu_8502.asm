@@ -240,8 +240,8 @@ hook_page_flags:
         .fill 60, 0
         ; $80-$9F: no hooks
         .fill 32, 0
-        ; $A0: DIRECTORY hook
-        .byte $80
+        ; $A0: no hooks
+        .byte 0
         ; $A1-$A7: no hooks
         .fill 7, 0
         ; $A8: KERNAL hooks (LOAD etc)
@@ -2813,8 +2813,6 @@ _hook_chain_kernal_check:
         cmp #$C8
         beq _hook_do_check
         cmp #$A8
-        beq _hook_do_check
-        cmp #$A0
         beq _hook_do_check
         cmp #$E2
         beq _hook_do_check

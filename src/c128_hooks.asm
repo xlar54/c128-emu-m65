@@ -212,7 +212,7 @@ _do_irq_hook:
 _check_f8:
         ; ----- Check for $F8xx (auto-boot) -----
         cmp #$F8
-        bne _check_f9
+        bne _check_a8
         lda c128_pc_lo
         cmp #$67                        ; $F867 = IOINIT entry
         bne _done_fast
@@ -237,23 +237,6 @@ _check_f8:
         lda #$FF
         sta $DC00
         jsr C128Hook_RTS_Guest
-        jmp _done
-
-_check_f9:
-        ; ----- Check for $A0xx (DIRECTORY at $A07E) -----
-        cmp #$A0
-        bne _check_a8
-        lda c128_pc_lo
-        cmp #$7E
-        bne _done_fast
-        ; Match - save regs and handle
-        pha
-        txa
-        pha
-        tya
-        pha
-        jsr C128Hook_SyncLowRAM
-        jsr C128Hook_OnDIRECTORY
         jmp _done
 
 _check_a8:
