@@ -335,6 +335,11 @@ C128Host_Msg_Loading:
         .text "loading"
         .byte 0
 
+C128Host_Msg_Verifying:
+        .byte $0d
+        .text "verifying"
+        .byte 0
+
 C128Host_Msg_Saving:
         .byte $0d
         .text "saving "

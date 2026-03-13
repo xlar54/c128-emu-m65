@@ -117,6 +117,7 @@ c128_fl_buf:      .fill 17, 0
 c128_fl_len:      .byte 0
 c128_fl_end_lo:   .byte 0
 c128_fl_end_hi:   .byte 0
+c128_load_verify_flag: .byte 0
 
 ; SAVE variables
 c128_save_start_lo: .byte 0
@@ -449,11 +450,10 @@ _load_has_name:
         rts
 
 _load_is_disk:
-        ; Check if this is a verify (A != 0)
+        ; Save the load/verify flag (A=0 for load, A!=0 for verify)
         lda c128_a
-        beq +
-        jmp _load_let_rom       ; We don't handle verify
-+
+        sta c128_load_verify_flag
+
         ; Clear the valid SETNAM flag (consumed)
         lda #0
         sta c128_setnam_valid
@@ -619,6 +619,12 @@ _load_dest_ok:
         lda #1
         sta c128_file_op_active
 
+        ; Check if this is a VERIFY instead of a LOAD
+        lda c128_load_verify_flag
+        beq _do_host_load_native
+        jmp _do_manual_verify
+
+_do_host_load_native:
         ; DEBUG: store filename length and first 4 chars at $A1F0
         lda c128_fl_len
         sta $A1F0
@@ -671,14 +677,16 @@ _load_dest_ok:
         lda #$AA
         sta $A1F9
 
-        ; LOAD: A=0 (load), X/Y = destination address
+        ; LOAD: A=0 (load) or A!=0 (verify), X/Y = destination address
         ; Data goes directly into MEGA65 bank 4 or 5 (guest RAM)
-        lda #$00
+        lda c128_load_verify_flag
         ldx c128_dir_dest_lo
         ldy c128_dir_dest_hi
         jsr LOAD
         bcc _load_host_ok
 
+        sta dos_err_code        ; Capture error code (e.g. 27/28 for verify error)
+        
         ; DEBUG: store error info
         sta $A1FA               ; A = error code from LOAD
         lda #$EE                ; marker = error path
@@ -703,10 +711,17 @@ _load_host_ok:
         ldx #$00
         jsr SETBNK
 
-
-        ; Print "LOADING"
+_load_host_ok_shared:
+        ; Print "LOADING" or "VERIFYING"
+        lda c128_load_verify_flag
+        bne _load_print_verify
         lda #<C128Host_Msg_Loading
         ldx #>C128Host_Msg_Loading
+        bra _load_print_msg
+_load_print_verify:
+        lda #<C128Host_Msg_Verifying
+        ldx #>C128Host_Msg_Verifying
+_load_print_msg:
         jsr emu_print_string
 
         ; If load destination was in $0000-$0FFF, sync LOW_RAM_BUFFER
@@ -779,6 +794,128 @@ _load_return:
         ; Return to guest via RTS - pops JSR $FFD5 return address
         jsr C128Hook_RTS_Guest
         rts
+
+
+_do_manual_verify:
+        ; Ensure B register = 0 for KERNAL calls
+        lda #$00
+        tab
+
+        ; Set up host KERNAL for reading the file
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
+        ldx #<c128_fl_buf
+        ldy #>c128_fl_buf
+        lda c128_fl_len
+        jsr SETNAM
+
+        ; SETLFS: lfn=1, device 8, sa=0 (sequential read)
+        lda #$01
+        ldx #$08
+        ldy #$00
+        jsr SETLFS
+
+        jsr OPEN
+        bcc _verify_open_ok
+        
+        lda #$04                ; FILE NOT FOUND
+        sta dos_err_code
+        jmp _verify_fail
+
+_verify_open_ok:
+        ldx #$01
+        jsr CHKIN
+        bcc _verify_chkin_ok
+
+        lda #$04
+        sta dos_err_code
+        jmp _verify_fail_close
+
+_verify_chkin_ok:
+        ; Read 2-byte PRG header and discard it
+        jsr CHRIN
+        jsr CHRIN
+
+        ; Setup pointer to guest RAM
+        lda c128_dir_dest_lo
+        sta C128_MEM_PTR+0
+        lda c128_dir_dest_hi
+        sta C128_MEM_PTR+1
+        lda load_mega65_bank
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Check if the file was empty (EOF hit during header)
+        jsr READST
+        and #$40
+        bne _verify_success
+
+_verify_byte_loop:
+        ; Read byte from file
+        jsr CHRIN
+        sta tmp_lo              ; save byte from file
+
+        ; Check host status for EOF or errors
+        jsr READST
+        sta tmp_hi
+
+        ; Read byte from guest RAM
+        ldz #0
+        lda [C128_MEM_PTR],z
+
+        ; Compare
+        cmp tmp_lo
+        bne _verify_mismatch
+
+        ; Increment pointer
+        inc C128_MEM_PTR+0
+        bne +
+        inc C128_MEM_PTR+1
++
+        ; Was this the last byte?
+        lda tmp_hi
+        and #$40                ; EOF?
+        bne _verify_success
+        
+        bra _verify_byte_loop
+
+_verify_mismatch:
+        ; Mismatch! Set error code 28 for VERIFY ERROR
+        lda #28
+        sta dos_err_code
+        bra _verify_fail_close
+
+_verify_success:
+        ; Success! Save end address in X/Y for return
+        ldx C128_MEM_PTR+0
+        ldy C128_MEM_PTR+1
+        stx c128_fl_end_lo
+        sty c128_fl_end_hi
+
+        jsr CLRCHN
+        lda #$01
+        jsr CLOSE
+
+        ; Reset SETBNK
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
+        jmp _load_host_ok_shared
+
+_verify_fail_close:
+        jsr CLRCHN
+        lda #$01
+        jsr CLOSE
+_verify_fail:
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+        jmp _load_error
+
 
 _load_let_rom:
         ; Can't handle - let ROM deal with it
