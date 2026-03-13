@@ -246,10 +246,10 @@ C128Hook_OnSETNAM:
         ; Length 0: clear our filename state so stale data isn't used
         sta c128_fl_len
         sta c128_setnam_valid
-        jmp _setnam_skip
+        rts
 _setnam_capture:
-
-        ; Capture parameters from emulated CPU registers
+        ; Save pointer and length only - defer actual byte copy
+        ; to OPEN/LOAD/SAVE handlers when c128_setbnk_fname is correct.
         sta c128_setnam_len
 
         lda c128_x
@@ -262,31 +262,37 @@ _setnam_capture:
         lda #1
         sta c128_setnam_valid
 
-        ; Copy actual filename bytes into our buffer.
-        ;
-        ; The filename bank is set by SETBNK (stored in c128_setbnk_fname
-        ; and guest ZP $C7). For normal LOAD/SAVE, SETBNK is called before
-        ; SETNAM so c128_setbnk_fname is correct. For D-commands (DLOAD etc),
-        ; SETBNK may not have been called yet, but D-command filenames are
-        ; always in bank 0 at $1100.
-        ;
-        ; Bank 0 filenames: read from MEGA65 bank 4 via C128_MEM_PTR
-        ; Bank 1 filenames: read from attic via DMA (attic_read_byte)
-        ;
-        ; We check c128_setbnk_fname first. If it says bank 1 but the
-        ; address is in the $1000-$1FFF range (DOS command area), override
-        ; to bank 0 since D-commands always use bank 0 for filenames.
+        ; Let the ROM SETNAM continue normally
+        rts
+
+
+; ============================================================
+; dos_copy_filename - Copy filename bytes from guest RAM
+;
+; Called from OPEN/LOAD/SAVE hooks AFTER SETBNK has been called.
+; Reads c128_setnam_len bytes from c128_setnam_ptr in the bank
+; specified by c128_setbnk_fname, stores into c128_fl_buf.
+;
+; Bank 0 filenames: read from MEGA65 bank 4 via C128_MEM_PTR
+; Bank 1 filenames: read from attic via DMA (attic_read_byte)
+;
+; D-command filenames (ptr in $1000-$1FFF range) are always
+; in bank 0 regardless of c128_setbnk_fname setting.
+; ============================================================
+dos_copy_filename:
+        lda c128_setnam_len
+        beq _dcf_done           ; Nothing to copy
 
         lda c128_setbnk_fname
-        beq _setnam_use_bank0
+        beq _dcf_use_bank0
         ; setbnk says bank 1 - but check if address suggests bank 0
         lda c128_setnam_ptr_hi
         cmp #$20                ; below $2000? DOS command area = bank 0
-        bcc _setnam_use_bank0
+        bcc _dcf_use_bank0
         ; Genuine bank 1 filename (e.g. LOAD from input buffer at $FEFD)
-        jmp _setnam_copy_attic
+        jmp _dcf_copy_attic
 
-_setnam_use_bank0:
+_dcf_use_bank0:
         lda #BANK_RAM0
         sta C128_MEM_PTR+2
         lda #BANK_RAM0_MB
@@ -297,27 +303,27 @@ _setnam_use_bank0:
         sta C128_MEM_PTR+1
 
         ldy #0
-_setnam_copy_loop:
+_dcf_copy_loop:
         cpy c128_setnam_len
-        beq _setnam_copy_done
+        beq _dcf_done
         tya
         taz
         lda [C128_MEM_PTR],z
         sta c128_fl_buf,y
         iny
         cpy #16
-        bcc _setnam_copy_loop
-        bra _setnam_copy_done
+        bcc _dcf_copy_loop
+        bra _dcf_done
 
-_setnam_copy_attic:
+_dcf_copy_attic:
         ; Read filename from attic RAM bank 1 via DMA
         lda c128_setnam_ptr_lo
         sta c128_addr_lo
         lda c128_setnam_ptr_hi
         ldy #0
-_setnam_attic_loop:
+_dcf_attic_loop:
         cpy c128_setnam_len
-        beq _setnam_copy_done
+        beq _dcf_done
         phy
         lda c128_setnam_ptr_hi
         jsr attic_read_byte
@@ -328,15 +334,12 @@ _setnam_attic_loop:
         inc c128_setnam_ptr_hi
 +       iny
         cpy #16
-        bcc _setnam_attic_loop
+        bcc _dcf_attic_loop
 
-_setnam_copy_done:
+_dcf_done:
         lda #0
         sta c128_fl_buf,y       ; Null terminate
         sty c128_fl_len
-
-_setnam_skip:
-        ; Let the ROM SETNAM continue normally
         rts
 
 
@@ -419,6 +422,9 @@ C128Hook_OnSETBNK:
 ;   - Return end address in guest X/Y, status in carry
 ; ============================================================
 C128Hook_OnLOAD:
+        ; Copy filename bytes now that SETBNK is correct
+        jsr dos_copy_filename
+
         ; Check for valid filename from our SETNAM capture
         lda c128_fl_len
         bne _load_has_name
@@ -943,6 +949,9 @@ _load_msg_fnf:
 ;       via RTS_Guest.
 ; ============================================================
 C128Hook_OnSAVE:
+        ; Copy filename bytes now that SETBNK is correct
+        jsr dos_copy_filename
+
         ; Only intercept device 8
         lda c128_setlfs_dev
         cmp #$08
@@ -1692,6 +1701,9 @@ _dir_leading_zero:  .byte 0
 ;       carry clear on success.
 ; ============================================================
 C128Hook_OnOPEN:
+        ; Copy filename bytes now that SETBNK is correct
+        jsr dos_copy_filename
+
         ; Check if this is device 8
         lda LOW_RAM_BUFFER + $BA        ; Device number
         cmp #$08
