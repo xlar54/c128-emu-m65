@@ -295,7 +295,7 @@ C128_VideoInit:
         sta $D063               ; SCRNPTR[31:24] = $00 -> $054000
 
         ; Point charset at C128 character ROM in bank 2
-        lda #<CHARGEN_OFF
+        lda #$00
         sta $D068               ; CHARPTR LSB
         lda #>CHARGEN_OFF
         sta $D069               ; CHARPTR byte 1
@@ -510,12 +510,8 @@ display_show_40col:
         beq _ds40_no_bmp
         lda #$1B
         sta $D011               ; bitmap off
-        lda #<CHARGEN_OFF
-        sta $D068
-        lda #>CHARGEN_OFF
-        sta $D069
-        lda #CHARGEN_BANK
-        sta $D06A
+        ; Restore CHARPTR via $D018 re-evaluation (uses bank 4 RAM)
+        ; Just fall through to _ds40_no_bmp which calls write_vic_register
         lda #0
         sta vdc_bitmap_active
 _ds40_no_bmp:
@@ -1846,42 +1842,21 @@ _wv_d018_update:
         ; chargen ROM shadow in MEGA65 bank 0 at $09000.
 
         ; --- Update CHARPTR ---
+        ; C128 VIC-IIe: character ROM shadow is always active.
+        ; $D018 bit 1 selects which 2KB half of the 4KB chargen ROM:
+        ;   bit 1 = 0 -> first 2KB at $02A000 (uppercase/graphics)
+        ;   bit 1 = 1 -> second 2KB at $02A800 (lowercase/uppercase)
         lda c128_saved_data
-        and #$0E                ; Isolate bits 3-1
-        asl
-        asl                     ; A = charset offset high byte
-        sta _d018_char_hi
-
-        ; Check for character ROM shadow: offset $10 or $18
-        ; Only in VIC banks 0 and 2
-        lda vic_bank_has_charrom
-        beq _d018_char_ram      ; banks 1,3 have no char ROM shadow
-        lda _d018_char_hi
-        cmp #$10
-        beq _d018_charrom
-        cmp #$18
-        beq _d018_charrom
-
-_d018_char_ram:
-        ; Not a char ROM shadow address - use RAM in bank 4 + VIC bank
+        and #$02                ; isolate bit 1
+        beq _d018_charset_lo
+        lda #$A8                ; second 2KB: $02A800
+        bra _d018_charset_set
+_d018_charset_lo:
+        lda #$A0                ; first 2KB: $02A000
+_d018_charset_set:
+        sta $D069
         lda #$00
         sta $D068
-        lda _d018_char_hi
-        clc
-        adc vic_bank_base       ; add VIC bank offset
-        sta $D069
-        lda #BANK_RAM0
-        sta $D06A
-        jmp _d018_screen
-
-_d018_charrom:
-        ; Point CHARPTR at chargen in bank 2 ($02A000)
-        lda #$00
-        sta $D068
-        lda _d018_char_hi
-        clc
-        adc #>CHARGEN_OFF       ; $10 -> $B0, $18 -> $B8
-        sta $D069
         lda #CHARGEN_BANK
         sta $D06A
         jmp _d018_screen
@@ -1937,9 +1912,10 @@ _d018_shadow_only:
         ; 80-col mode: just save to shadow, don't touch VIC-IV
         rts
 
-_d018_char_hi: .byte 0
+
 _d018_scrn_hi: .byte 0
 vic_bank_base: .byte 0            ; VIC bank base high byte ($00/$40/$80/$C0)
+vic_bank_spr:  .byte 0            ; VIC bank SPRPTR16 high byte offset ($00/$01/$02/$03)
 vic_bank_has_charrom: .byte 1     ; 1=char ROM shadow visible (C128: always, unless CHAREN set)
 
 _wv_d019:
@@ -2098,6 +2074,17 @@ write_cia2_register:
         asl
         asl
         sta vic_bank_base       ; high byte of VIC bank within C128 RAM
+        ; Compute sprite pointer offset for SPRPTR16 mode
+        ; SPRPTR16 address = pointer * 64, so bank offset = vic_bank_base * 256 / 64
+        ; = vic_bank_base / 64 * 256 = vic_bank_base >> 6
+        ; $00->$00, $40->$01, $80->$02, $C0->$03
+        lsr
+        lsr
+        lsr
+        lsr
+        lsr
+        lsr
+        sta vic_bank_spr        ; SPRPTR16 high byte offset for VIC bank
         ; C128 VIC-IIe: character ROM shadow is visible in ALL four VIC banks
         ; (unlike C64 VIC-II which only has it in banks 0 and 2).
         ; The CHAREN bit ($01 bit 2) controls whether it's enabled.
