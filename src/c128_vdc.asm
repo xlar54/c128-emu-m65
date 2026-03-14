@@ -136,7 +136,11 @@ write_vdc_register:
         bcs _wvdc_done
         lda c128_saved_data
         sta vdc_regs,x
-        ; Mark dirty if screen/attr pointer regs changed
+        ; Invalidate R31 write cache + mark dirty when pointer regs change
+        cpx #18
+        beq _wvdc_invalidate_cache  ; R18 = update address hi
+        cpx #19
+        beq _wvdc_invalidate_cache  ; R19 = update address lo
         cpx #12
         beq _wvdc_mark_scr_dirty
         cpx #13
@@ -147,19 +151,29 @@ write_vdc_register:
         beq _wvdc_mark_attr_dirty
         cpx #24
         beq _wvdc_mark_attr_dirty  ; R24 bit 6 = reverse mode, affects attr rendering
+        cpx #25
+        beq _wvdc_mark_attr_dirty  ; R25 bit 6 = attribute enable, affects attr rendering
         cpx #26
         beq _wvdc_update_colors
 _wvdc_done:
         rts
+_wvdc_invalidate_cache:
+        lda #0
+        sta _wvdc_cache_valid
+        rts
 _wvdc_mark_scr_dirty:
         lda #1
         sta vdc_screen_dirty
-        sta fco_offset_dirty    ; screen start changed, invalidate attr offset cache
+        sta fco_offset_dirty
+        lda #0
+        sta _wvdc_cache_valid   ; screen start changed, invalidate R31 cache
         rts
 _wvdc_mark_attr_dirty:
         lda #1
         sta vdc_attr_dirty
-        sta fco_offset_dirty    ; attr start changed, invalidate attr offset cache
+        sta fco_offset_dirty
+        lda #0
+        sta _wvdc_cache_valid   ; attr start changed, invalidate R31 cache
         rts
 _wvdc_update_colors:
         ; R26 written: high nibble = FG, low nibble = BG
@@ -188,7 +202,7 @@ _wvdc_data:
         sta vdc_regs+31         ; Always update shadow
 
 _wvdc_data_go:
-        ; VDC RAM at $50000: real_addr = $50000 + VDC_addr
+        ; --- Always write to VDC RAM at $50000 + R18:R19 ---
         lda vdc_regs+19         ; address lo
         sta C128_MEM_PTR+0
         lda vdc_regs+18         ; address hi
@@ -204,10 +218,7 @@ _wvdc_data_go:
         lda c128_saved_data
         sta [C128_MEM_PTR],z
 
-        ; Skip MEGA65 screen/color mirroring if in 40-col mode
-        ; (VDC RAM is always written above, but MEGA65 display only
-        ; needs updating when actively showing 80-col)
-        ; Mark dirty so VDC_RenderFrame re-copies when switching to 80-col
+        ; Skip MEGA65 mirroring if in 40-col mode
         ldx vdc_mode_active
         bne _wvdc_do_mirror
         lda #1
@@ -216,8 +227,55 @@ _wvdc_data_go:
         jmp _wvdc_data_skip
 _wvdc_do_mirror:
 
-        ; --- Inline attribute translation to MEGA65 color RAM ---
-        ; Check if this write is to attribute area (R18 >= R20)
+        ; --- Fast path: use cached MEGA65 destination pointer ---
+        ; On sequential R31 writes (the ROM's normal pattern), we skip
+        ; the screen/attr comparison and offset calculation entirely.
+        ; The cache is invalidated when R18/R19/R12/R13/R20/R21 change.
+        lda _wvdc_cache_valid
+        beq _wvdc_cache_miss
+
+        ; Cache hit: write to cached destination, then increment both
+        ldz #0
+        lda _wvdc_cache_is_attr
+        bne _wvdc_cached_attr
+
+        ; Cached screen write
+        lda c128_saved_data
+        sta [vdc_color_ptr],z
+        ; Increment cached ptr
+        inc vdc_color_ptr+0
+        bne _wvdc_data_skip
+        inc vdc_color_ptr+1
+        bra _wvdc_data_skip
+
+_wvdc_cached_attr:
+        ; Cached attribute write: translate color
+        lda c128_saved_data
+        and #$40
+        bne _wvdc_cached_attr_rev
+        lda c128_saved_data
+        and #$0F
+        tax
+        bra _wvdc_cached_attr_wc
+_wvdc_cached_attr_rev:
+        lda vdc_regs+26
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+_wvdc_cached_attr_wc:
+        lda vdc_to_vic_color,x
+        sta [vdc_color_ptr],z
+        ; Increment cached ptr
+        inc vdc_color_ptr+0
+        bne _wvdc_data_skip
+        inc vdc_color_ptr+1
+        bra _wvdc_data_skip
+
+_wvdc_cache_miss:
+        ; --- Full computation (first write or after invalidation) ---
+        ; Determine if this is screen or attribute area
         lda vdc_regs+18
         cmp vdc_regs+20
         bcc _wvdc_is_screen
@@ -227,8 +285,7 @@ _wvdc_do_mirror:
         bcc _wvdc_is_screen
 
 _wvdc_is_attr:
-        ; Attribute write: translate color and write to color RAM or buffer
-        ; Offset within attr area = (R18:R19) - (R20:R21)
+        ; Attribute write: compute offset and set up pointer
         lda vdc_regs+19
         sec
         sbc vdc_regs+21
@@ -236,38 +293,33 @@ _wvdc_is_attr:
         lda vdc_regs+18
         sbc vdc_regs+20
         sta vdc_color_ptr+1
-        ; If displaying 40-col, redirect to 80-col save buffer in bank 5
         lda display_showing_80
         bne _wvdc_attr_live
         ; 40-col display: write to save buffer at $05A800 + offset
         lda vdc_color_ptr+1
         clc
-        adc #>COLOR_80_ADDR     ; + $A8
+        adc #>COLOR_80_ADDR
         sta vdc_color_ptr+1
-        lda #COLOR_80_BANK      ; bank $05
+        lda #COLOR_80_BANK
         sta vdc_color_ptr+2
-        lda #COLOR_80_MB        ; MB $00
+        lda #COLOR_80_MB
         sta vdc_color_ptr+3
         bra _wvdc_attr_do_write
 _wvdc_attr_live:
-        ; 80-col display: write to live color RAM at $0FF80000
         lda #$F8
         sta vdc_color_ptr+2
         lda #$0F
         sta vdc_color_ptr+3
 _wvdc_attr_do_write:
-        ; Translate attribute to color RAM
-        ; If bit 6 (reverse) set, use R26 fg color (high nibble)
+        ; Translate and write color
         lda c128_saved_data
         and #$40
         bne _wvdc_attr_rev
-        ; Normal: use attribute low nibble (foreground)
         lda c128_saved_data
         and #$0F
         tax
         bra _wvdc_attr_write_color
 _wvdc_attr_rev:
-        ; Reverse: use R26 high nibble (foreground)
         lda vdc_regs+26
         lsr
         lsr
@@ -278,19 +330,26 @@ _wvdc_attr_write_color:
         lda vdc_to_vic_color,x
         ldz #0
         sta [vdc_color_ptr],z
-        jmp _wvdc_data_skip
+        ; Cache this pointer for next sequential write
+        lda #1
+        sta _wvdc_cache_valid
+        sta _wvdc_cache_is_attr
+        ; Advance cached ptr past this byte for next call
+        inc vdc_color_ptr+0
+        bne _wvdc_data_skip
+        inc vdc_color_ptr+1
+        bra _wvdc_data_skip
 
 _wvdc_is_screen:
-        ; Screen write: copy char directly to MEGA65 screen + offset
-        ; Offset = (R18:R19) - (R12:R13)
+        ; Screen write: compute offset and set up pointer
         lda vdc_regs+19
         sec
         sbc vdc_regs+13
-        sta vdc_color_ptr+0     ; Reuse ptr temporarily
+        sta vdc_color_ptr+0
         lda vdc_regs+18
         sbc vdc_regs+12
         clc
-        adc #>C128_SCREEN_OFF   ; +screen offset high byte
+        adc #>C128_SCREEN_OFF
         sta vdc_color_ptr+1
         lda #C128_SCREEN_BANK
         sta vdc_color_ptr+2
@@ -299,6 +358,15 @@ _wvdc_is_screen:
         ldz #0
         lda c128_saved_data
         sta [vdc_color_ptr],z
+        ; Cache this pointer for next sequential write
+        lda #1
+        sta _wvdc_cache_valid
+        lda #0
+        sta _wvdc_cache_is_attr
+        ; Advance cached ptr past this byte for next call
+        inc vdc_color_ptr+0
+        bne _wvdc_data_skip
+        inc vdc_color_ptr+1
 
         ; Auto-increment R18:R19
 _wvdc_data_skip:
@@ -307,6 +375,9 @@ _wvdc_data_skip:
         inc vdc_regs+18
 +       rts
 
+_wvdc_cache_valid:   .byte 0    ; 1 = cached ptr is valid for next sequential R31 write
+_wvdc_cache_is_attr: .byte 0    ; 0 = screen, 1 = attribute
+
 
 _wvdc_word_count:
         ; R30: Writing word count triggers block copy or fill
@@ -314,6 +385,8 @@ _wvdc_word_count:
         ; The R31 write already wrote the first byte and advanced R18:R19.
         ; R30 value = number of additional bytes to fill/copy (not +1).
         ; Bit 7 of R24 selects copy (1) vs fill (0).
+        lda #0
+        sta _wvdc_cache_valid   ; invalidate R31 cache (R18:R19 will change)
         lda c128_saved_data
         sta vdc_regs+30
 
@@ -800,6 +873,13 @@ _vdc_no_rev_change:
         lda #0
         sta vdc_attr_dirty      ; Clear dirty flag
 
+        ; Check R25 bit 6: are per-character attributes enabled?
+        ; When clear, all characters use R26 fg color (no attribute RAM).
+        ; DMA fill color RAM with the uniform color instead of per-byte loop.
+        lda vdc_regs+25
+        and #$40
+        beq _vdc_attr_uniform
+
         ; Source pointer: $50000 + VDC R20:R21
         lda vdc_regs+21
         sta C128_MEM_PTR+0
@@ -880,6 +960,34 @@ _vdc_attr_tail_store:
         inz
         cpz #208
         bne _vdc_attr_tail
+
+        bra _vdc_skip_attr
+
+_vdc_attr_uniform:
+        ; Attributes disabled (R25 bit 6 = 0): fill color RAM with R26 fg
+        lda vdc_regs+26
+        lsr
+        lsr
+        lsr
+        lsr                     ; high nibble = foreground
+        tax
+        lda vdc_to_vic_color,x
+        sta _vdc_uniform_fill_val
+
+        lda #$00
+        sta $D707
+        .byte $80, $00
+        .byte $81, $FF          ; dst MB = $FF (color RAM)
+        .byte $00
+        .byte $03               ; fill
+        .word 2000
+_vdc_uniform_fill_val:
+        .word $0000             ; fill value (patched above)
+        .byte $00
+        .word $0000             ; dst = $0FF80000
+        .byte $08               ; color RAM
+        .byte $00
+        .word $0000
 
 _vdc_skip_attr:
         rts
