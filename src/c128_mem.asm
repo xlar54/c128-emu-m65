@@ -1040,7 +1040,7 @@ _rd_check_hi_rom:
 read_from_kernal:
         lda c128_addr_hi
         cmp #$F8
-        bcc _rfk_normal
+        bcc read_from_rom_bank1
         ; $F800-$FFFF: read from relocated area at $12000
         ; Map $F8xx -> $20xx, $F9xx -> $21xx, etc.
         sec
@@ -1055,40 +1055,18 @@ read_from_kernal:
         ldz #$00
         lda [C128_MEM_PTR],z
         rts
-_rfk_normal:
+
+; Read from ROM bank 1: C128 address maps directly to MEGA65 bank 1
+; Used for BASIC LO ($4000-$7FFF), BASIC HI ($8000-$BFFF),
+; and KERNAL ($C000-$F7FF) — all at same offset in bank 1
+read_from_basic_lo:
+read_from_basic_hi:
+read_from_rom_bank1:
         lda c128_addr_lo
         sta C128_MEM_PTR
         lda c128_addr_hi
         sta C128_MEM_PTR+1
         lda #BANK_ROM           ; Bank 1
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #$00
-        lda [C128_MEM_PTR],z
-        rts
-
-; Read from BASIC LO: C128 $4000-$7FFF -> MEGA65 $14000-$17FFF
-read_from_basic_lo:
-        lda c128_addr_lo
-        sta C128_MEM_PTR
-        lda c128_addr_hi
-        sta C128_MEM_PTR+1
-        lda #BANK_ROM
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #$00
-        lda [C128_MEM_PTR],z
-        rts
-
-; Read from BASIC HI: C128 $8000-$BFFF -> MEGA65 $18000-$1BFFF
-read_from_basic_hi:
-        lda c128_addr_lo
-        sta C128_MEM_PTR
-        lda c128_addr_hi
-        sta C128_MEM_PTR+1
-        lda #BANK_ROM
         sta C128_MEM_PTR+2
         lda #$00
         sta C128_MEM_PTR+3

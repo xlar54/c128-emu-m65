@@ -635,8 +635,7 @@ lrb_dec_x:
         stx c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z
-        sec
-        sbc #1
+        dec a
         sta [c128_zp_ptr],z
         rts
 
@@ -645,8 +644,7 @@ lrb_inc_x:
         stx c128_zp_ptr+0
         ldz #0
         lda [c128_zp_ptr],z
-        clc
-        adc #1
+        inc a
         sta [c128_zp_ptr],z
         rts
 
@@ -678,28 +676,7 @@ _rzpx_tmp: .byte 0
 ; Read from ZP address in c128_addr_lo, result in A
 read_zp:
         ldx c128_addr_lo
-        cpx #$02
-        bcc _rzp_port
-        stx c128_zp_ptr+0
-        ldz #0
-        lda [c128_zp_ptr],z
-        rts
-_rzp_port:
-        cpx #$00
-        beq _rzp_ddr
-        ; Read port $01
-        lda cpu_port_ddr
-        and cpu_port_data
-        sta _rzp_tmp
-        lda cpu_port_ddr
-        eor #$FF
-        and cpu_port_ext
-        ora _rzp_tmp
-        rts
-_rzp_ddr:
-        lda cpu_port_ddr
-        rts
-_rzp_tmp: .byte 0
+        bra read_zp_x
 
 ; Write A to ZP address in X
 write_zp_x:
@@ -737,38 +714,8 @@ _wzpx_ddr:
 ; Write c128_data to ZP address in c128_addr_lo
 write_zp:
         ldx c128_addr_lo
-        cpx #$02
-        bcc _wzp_port
-        stx c128_zp_ptr+0
-        ldz #0
         lda c128_data
-        sta [c128_zp_ptr],z
-        rts
-_wzp_port:
-        lda c128_data
-        cpx #$00
-        beq _wzp_ddr
-        sta cpu_port_data
-        ; Also write to bank 4
-        pha
-        lda #$01
-        sta c128_zp_ptr+0
-        ldz #0
-        lda cpu_port_data
-        sta [c128_zp_ptr],z
-        pla
-        rts
-_wzp_ddr:
-        sta cpu_port_ddr
-        ; Also write to bank 4
-        pha
-        lda #$00
-        sta c128_zp_ptr+0
-        ldz #0
-        lda cpu_port_ddr
-        sta [c128_zp_ptr],z
-        pla
-        rts
+        bra write_zp_x
 
 ; Read 16-bit pointer from ZP address Y, result in c128_addr_lo/hi
 ; (Used for indirect addressing modes)
@@ -2645,21 +2592,8 @@ _hook_vdc_poll_skip:
         rts
 
 _hook_chain_kernal_only:
-        ; Inline CHROUT removed to reduce code size.
-        ; ROM handles all character output natively.
-        txa                     ; X has c128_pc_hi
-_hook_chain_kernal_not_chrout:
-        txa                     ; X still has c128_pc_hi = $FF
-        bra _hook_chain_kernal_check
-
-_hook_chain_kernal_not_ff:
-        txa                     ; Restore pc_hi into A
-        bra _hook_chain_kernal_check
-
-_hook_chain_kernal_reload:
-        lda c128_pc_hi
-_hook_chain_kernal:
-_hook_chain_kernal_check:
+        ; X = c128_pc_hi (set by table lookup dispatch above)
+        txa                     ; A = c128_pc_hi for comparisons below
         ; KERNAL call hooks (LOAD, SAVE, OPEN, etc.)
         ; A = c128_pc_hi. Only pages $A8, $C8, $F8, $FF have hooks.
         cmp #$FF
