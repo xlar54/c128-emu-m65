@@ -232,10 +232,8 @@ zn_table:
 ; 1-6 = inline hook (VDC poll, keyboard idle, raster wait, etc.)
 ; -----------------------------------------------------------------
 hook_page_flags:
-        ; $00-$42: no hooks (RAM and low BASIC ROM)
-        .fill 67, 0
-        ; $43: BASIC tokenizer hook (CRUNCH at $430A)
-        .byte 8
+        ; $00-$43: no hooks (RAM and low BASIC ROM, crunch disabled)
+        .fill 68, 0
         ; $44-$7F: no hooks (rest of BASIC ROM)
         .fill 60, 0
         ; $80-$9F: no hooks
@@ -623,13 +621,6 @@ lrb_write_x:
         sta [c128_zp_ptr],z
         rts
 
-; Helper: read ZP[Y] -> A  (preserves Y)
-lrb_read_y:
-        sty c128_zp_ptr+0
-        ldz #0
-        lda [c128_zp_ptr],z
-        rts
-
 ; Helper: ASL ZP[X]  (preserves X, sets flags from result)
 lrb_asl_x:
         stx c128_zp_ptr+0
@@ -658,16 +649,6 @@ lrb_inc_x:
         adc #1
         sta [c128_zp_ptr],z
         rts
-
-; Macro: inline setup of C128_MEM_PTR to bank 4 page 0 (for ZP access)
-setup_bank4_zp .macro
-        lda #$00
-        sta C128_MEM_PTR+0
-        sta C128_MEM_PTR+1
-        sta C128_MEM_PTR+3
-        lda #BANK_RAM0
-        sta C128_MEM_PTR+2
-        .endm
 
 ; Read from ZP address in X, result in A
 read_zp_x:
@@ -1653,22 +1634,6 @@ hook_keyboard_idle:
 
 _blink_set: .byte 0
 
-; write_milestone - Write progress byte A to $0FE0F
-; Uses 32-bit pointer to write to host RAM
-write_milestone:
-        pha
-        lda #$0F
-        sta C128_MEM_PTR+0
-        lda #$FE
-        sta C128_MEM_PTR+1
-        lda #$00
-        sta C128_MEM_PTR+2
-        sta C128_MEM_PTR+3
-        ldz #0
-        pla
-        sta [C128_MEM_PTR],z
-        rts
-
 
 ; ============================================================
 ; CIA1 Timer State
@@ -1690,12 +1655,7 @@ vic_raster_compare_hi: .byte $01     ; Raster compare high bit
 
 ; Cursor state
 
-tab_last:             .byte 0
 display_showing_80:   .byte 1           ; 1=showing 80-col, 0=showing 40-col
-pc_trace_idx:          .byte 0
-pc_trace_hi:           .fill 128, 0
-pc_trace_lo:           .fill 128, 0
-pc_trace_sp:           .fill 128, 0
 
 ; 16-bit sprite pointer table for SPRPTR16 mode
 ; Must be aligned to 16-byte boundary
@@ -1856,92 +1816,7 @@ C128_CPUReset:
         rts
 
 ; VDC test program data removed (test passed - VDC pipeline works)
-; To re-enable, uncomment and change C128_CPUReset to inject at $3000
-
-; ============================================================
-; fix_80col_zp_vars - Write correct 80-col screen editor ZP values
-; Called once when BASIC starts ($B000) in 80-col mode.
-; CINT's screen clear corrupts $E0-$FA with $20 (spaces).
-; We restore them to the correct values from VICE.
-; Also fix $D5 (LNMX) and $DA/$DB (screen line ptr).
-; ============================================================
-fix_80col_zp_vars:
-        ; Write $E0-$FA from table
-        ldx #0
-_fix_zp_loop:
-        lda vice_80col_zp,x
-        sta c128_data
-        txa
-        clc
-        adc #$E0
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        phx
-        #write_data_fast
-        plx
-        inx
-        cpx #27                 ; 27 bytes: $E0-$FA
-        bcc _fix_zp_loop
-
-        ; Fix $D5 (LNMX) = $4F (79 = 80 columns - 1)
-        lda #$4F
-        sta c128_data
-        lda #$D5
-        sta c128_addr_lo
-        lda #$00
-        sta c128_addr_hi
-        #write_data_fast
-
-        ; Fix $D7 (MODE) = $80 (80-col flag)
-        lda #$80
-        sta c128_data
-        lda #$D7
-        sta c128_addr_lo
-        #write_data_fast
-
-        ; Fix $DA (screen line ptr lo) = $00
-        lda #$00
-        sta c128_data
-        lda #$DA
-        sta c128_addr_lo
-        #write_data_fast
-
-        ; Fix $DB (screen line ptr hi) = $04
-        lda #$04
-        sta c128_data
-        lda #$DB
-        sta c128_addr_lo
-        #write_data_fast
-
-        ; Fix $0A03 = $50 (Z80 boot signature)
-        lda #$50
-        sta c128_data
-        lda #$03
-        sta c128_addr_lo
-        lda #$0A
-        sta c128_addr_hi
-        #write_data_fast
-
-        rts
-
-; 80-col screen editor ZP values ($E0-$FA) from VICE
-vice_80col_zp:
-        .byte $30, $02, $30, $0A, $18, $00, $00, $4F
-        .byte $07, $00, $05, $07, $00, $18, $4F, $0D
-        .byte $0D, $07, $07, $00, $00, $00, $00, $00
-        .byte $00, $00, $07
-        lda #$fc
-        sta c128_addr_lo
-        lda #$ff
-        sta c128_addr_hi
-        #read_data_fast
-        sta c128_pc_lo
-        lda #$fd
-        sta c128_addr_lo
-        #read_data_fast
-        sta c128_pc_hi
-        rts
+; fix_80col_zp_vars removed (was never called, contained orphaned code after data table)
 
 ; ============================================================
 ; z80_pre_init - Simulate what the Z80 boot ROM writes to RAM
@@ -2085,15 +1960,6 @@ z80_1100_data:
         .byte $6C, $FC, $FF     ; 1105: JMP ($FFFC)
 
 ; ============================================================
-; Trace/breakpoint for debugging
-; ============================================================
-TRACE_ENABLED = 0       ; Disabled - no breakpoint checking
-
-; Breakpoint address - halt when PC hits this
-BREAK_ADDR_LO = $00
-BREAK_ADDR_HI = $FD     ; Break at $FD00
-
-; ============================================================
 ; C128CPU_StepMultiple - Execute multiple instructions
 ; Interrupt checks inlined into batch loop to reduce overhead
 ; ============================================================
@@ -2224,8 +2090,6 @@ C128CPU_StepDecode_hooks:
         beq _hook_page_e0
         cmp #7
         beq _hook_page_c3
-        cmp #8
-        beq _hook_page_43
         cmp #9
         beq _hook_page_c8
         jmp step_fetch
@@ -2308,11 +2172,6 @@ _hook_page_ce:
         #finish_cycles_inline
         rts
 +       jmp step_fetch
-
-_hook_page_43:
-        ; Crunch disabled - skip
-_h43_skip:
-        jmp step_fetch
 
 _hook_page_c8:
         lda c128_pc_lo
@@ -2683,7 +2542,6 @@ _del_scr_lo:      .byte 0
 _del_scr_hi:      .byte 0
 _del_col_lo:      .byte 0
 _del_col_hi:      .byte 0
-_del_80_tmp:      .word 0
 
 _hook_page_c3:
         ; Check for SCRLUP entry at $C3DC (the actual line-copy routine)
@@ -5909,31 +5767,8 @@ op_e2:
 ; PC has already been incremented past the opcode when we get here
 
 op_02:
-        ; Trap opcode $02 - used for GONE hook at $4B3F
-        ; PC is now $4B40 (one past trap). Check it.
-        lda c128_pc_hi
-        cmp #$4B
-        bne _op02_illegal
-        lda c128_pc_lo
-        cmp #$40                ; $4B3F + 1 = $4B40
-        bne _op02_illegal
-        ; GONE trap disabled - treat as illegal opcode
-        jmp op_illegal
-_op02_illegal:
-        jmp op_illegal
-
 op_12:
-        ; Trap opcode $12 - used for Crunch hook at $430D
-        ; PC is now $430E (one past trap). Check it.
-        lda c128_pc_hi
-        cmp #$43
-        bne _op12_illegal
-        lda c128_pc_lo
-        cmp #$0E                ; $430D + 1 = $430E
-        bne _op12_illegal
-        ; Crunch trap disabled - treat as illegal opcode
-        jmp op_illegal
-_op12_illegal:
+        ; Trap opcodes (GONE/Crunch hooks disabled) - treat as illegal
         jmp op_illegal
 
 op_22:

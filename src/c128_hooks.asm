@@ -160,11 +160,6 @@ _do_getin:
         jmp _done
 
 
-_do_chrget:
-        jsr C128Hook_CHRGET
-        jmp _done
-
-
 _do_load_direct:
         ; Guard: if already inside a file operation, skip
         lda c128_file_op_active
@@ -311,53 +306,8 @@ C128Hook_RTS_Guest:
 
 ; PRIMM removed to reduce code size
 ; (ROM handles PRIMM natively, vdc_screen_dirty set by RenderFrame)
+; CHRGET hook removed (was disabled, unreachable from dispatcher)
 
-
-
-
-; ============================================================
-; C128Hook_CHRGET - Fast CHRGET replacement
-;
-; Hooked via JMP $FF42 patched into CHRGET at $0380.
-; Called via JSR $0380 from BASIC interpreter (very frequently).
-;
-; CHRGET: increment text pointer, read byte from bank 0 RAM,
-; skip spaces, set flags for token/digit/colon detection.
-;
-; On exit: A = byte read, Y = 0
-;   Flags: Z=1 if byte is $00 or $3A (colon)
-;          C=1 if byte >= $3A (not a digit)
-;          C=0 if byte is $30-$39 (digit)
-; ============================================================
-C128Hook_CHRGET:
-        ; DISABLED - redirect to original CHRGET code at $0383
-        ; $0380 = JMP $FF42 (our hook)
-        ; $0383 = original $02 (was BNE offset)
-        ; We need to do what CHRGET does: INC $3D, BNE +2, INC $3E
-        ; then fall into CHRGOT at $0386
-        ; Simplest: do the INC ourselves and set PC to $0386 (CHRGOT)
-        lda #$3D
-        sta c128_zp_ptr
-        ldz #0
-        lda [c128_zp_ptr],z     ; read $3D
-        clc
-        adc #1
-        sta [c128_zp_ptr],z     ; write $3D
-        bne _chrget_disabled_no_carry
-        ldz #1
-        lda [c128_zp_ptr],z     ; read $3E
-        clc
-        adc #1
-        sta [c128_zp_ptr],z     ; write $3E
-_chrget_disabled_no_carry:
-        ; Set PC to CHRGOT ($0386) and let ROM handle the rest
-        lda #$86
-        sta c128_pc_lo
-        lda #$03
-        sta c128_pc_hi
-        lda #1
-        sta c128_hook_pc_changed
-        rts
 
 ; ============================================================
 ; C128Hook_IRQ - Fast IRQ handler

@@ -75,6 +75,10 @@ DEBUG_BASE = $A200
 ; Zero page pointer for directory parsing
 DIR_PTR         = $F5
 
+; Zero page pointer for string printing
+C128H_STR_PTR     = $F5           ; 2 bytes (shared with DIR_PTR, never used simultaneously)
+
+
 
 ; ============================================================
 ; DOS Hook Variables
@@ -2156,3 +2160,31 @@ C128Hook_PostFileOpVideoFix:
 
 _pfov_done:
         rts
+
+; ============================================================
+; Convenience messages (lowercase for C128 default mode)
+; ============================================================
+C128Host_Msg_Searching:
+        .byte $0d                       ; Newline first
+        .text "searching for "
+        .byte 0
+
+C128Host_Msg_Loading:
+        .byte $0d
+        .text "loading"
+        .byte 0
+
+C128Host_Msg_Verifying:
+        .byte $0d
+        .text "verifying"
+        .byte 0
+
+C128Host_Msg_Saving:
+        .byte $0d
+        .text "saving "
+        .byte 0
+
+C128Host_Msg_Ready:
+        .byte $0d
+        .text "ready."
+        .byte $0d, 0
