@@ -59,19 +59,6 @@ MAX_SEQ_FILES           = 10
 SEQ_LFN_BASE            = 10
 
 ; ------------------------------------------------------------
-; C128 BASIC low-RAM pointers
-; ------------------------------------------------------------
-ZP_TXTTAB_LO = $2D
-ZP_TXTTAB_HI = $2E
-ZP_VARTAB_LO = $2F
-ZP_VARTAB_HI = $30
-ZP_TOPMEM_LO = $39
-ZP_TOPMEM_HI = $3A
-
-ZP_PTRS_BASE  = $2B
-ZP_PTRS_COUNT = 10
-
-; ------------------------------------------------------------
 ; Directory / staging buffer configuration
 ; ------------------------------------------------------------
 C128_BANK_RAM     = $04
@@ -138,19 +125,8 @@ c128_dir_len_hi:  .byte 0
 c128_dir_dest_lo: .byte 0
 c128_dir_dest_hi: .byte 0
 
-c128_saved_basic_ptrs:
-        .fill ZP_PTRS_COUNT, 0
-
-c128_dir_temp_lo: .byte 0
-c128_dir_temp_hi: .byte 0
-
 tmp_lo: .byte 0
 tmp_hi: .byte 0
-
-; Filename "$" for CBM directory listing
-c128_dir_name:
-        .byte '$'
-c128_dir_name_end:
 
 ; Sequential File I/O tables
 seq_slot_lfn:     .fill MAX_SEQ_FILES, $FF
@@ -457,15 +433,6 @@ _load_is_disk:
         ; Clear the valid SETNAM flag (consumed)
         lda #0
         sta c128_setnam_valid
-
-        ; Check if it's "$" for directory listing
-        lda c128_fl_len
-        cmp #1
-        bne _load_file
-        lda c128_fl_buf
-        cmp #'$'
-        bne _load_file
-        jmp C128Hook_LoadDirectory
 
 _load_file:
         ; All callers (BASIC, Monitor, etc.) return via RTS_Guest
@@ -919,147 +886,6 @@ _verify_fail:
 
 _load_let_rom:
         ; Can't handle - let ROM deal with it
-        rts
-
-C128Hook_LoadDirectory:
-        ; Load "$" directory listing from host SD card
-        ; Uses staging buffer at C128_DIR_BUF, then DMA to guest RAM
-
-        ; Print "SEARCHING FOR " + "$" and "LOADING"
-        jsr dos_print_filename
-
-        ; Print "LOADING"
-        lda #<C128Host_Msg_Loading
-        ldx #>C128Host_Msg_Loading
-        jsr emu_print_string
-
-        ; Reset DMA controller state that may have been
-        ; altered by attic RAM DMA operations
-        lda #$00
-        sta $D702               ; DMA list addr bank
-        sta $D704               ; DMA list addr MB
-
-        ; SETBNK: data and filename in bank 0
-        lda #$00
-        ldx #$00
-        jsr SETBNK
-
-        ; SETNAM("$", len=1)
-        ldx #<c128_dir_name
-        ldy #>c128_dir_name
-        lda #c128_dir_name_end - c128_dir_name
-        jsr SETNAM
-
-        ; SETLFS(lfn=1, device=8, sa=0)
-        lda #$01
-        ldx #$08
-        ldy #$00
-        jsr SETLFS
-
-        ; LOAD to staging buffer in bank 0
-        lda #$00
-        ldx #<C128_DIR_BUF
-        ldy #>C128_DIR_BUF
-        jsr LOAD
-        bcc ld_dir_ok
-
-        ; Load failed - set carry and return
-        sta dos_err_code
-        lda c128_p
-        ora #P_C
-        sta c128_p
-        lda dos_err_code
-        sta c128_a
-        lda #0
-        sta c128_fl_len
-        jsr C128Hook_RTS_Guest
-        rts
-
-ld_dir_ok:
-        ; X/Y = end address of loaded data
-        stx c128_dir_temp_lo
-        sty c128_dir_temp_hi
-
-        ; Calculate length
-        lda c128_dir_temp_lo
-        sec
-        sbc #<C128_DIR_BUF
-        sta c128_dir_len_lo
-        lda c128_dir_temp_hi
-        sbc #>C128_DIR_BUF
-        sta c128_dir_len_hi
-
-        ; Check for zero length
-        lda c128_dir_len_lo
-        ora c128_dir_len_hi
-        beq ld_dir_bypass
-
-        ; Destination = TXTTAB from guest ZP
-        ; Read $2B/$2C (TXTTAB) from LOW_RAM_BUFFER
-        lda LOW_RAM_BUFFER+ZP_TXTTAB_LO
-        sta c128_dir_dest_lo
-        lda LOW_RAM_BUFFER+ZP_TXTTAB_HI
-        sta c128_dir_dest_hi
-
-        ; DMA copy from staging buffer to guest RAM bank 4
-        ; Patch the inline DMA list
-        lda c128_dir_len_lo
-        sta c128_dir_dma_len
-        lda c128_dir_len_hi
-        sta c128_dir_dma_len+1
-        lda c128_dir_dest_lo
-        sta c128_dir_dma_dst
-        lda c128_dir_dest_hi
-        sta c128_dir_dma_dst+1
-        lda #$00
-        sta $D707
-        .byte $80, $00          ; src MB = $00
-        .byte $81, $00          ; dst MB = $00
-        .byte $00               ; end options
-        .byte $00               ; copy
-c128_dir_dma_len:
-        .word $0000             ; count (patched)
-        .word C128_DIR_BUF      ; src = staging buffer
-        .byte $00               ; src bank 0
-c128_dir_dma_dst:
-        .word $0000             ; dst addr (patched)
-        .byte BANK_RAM0         ; dst bank 4 (guest RAM)
-        .byte $00
-        .word $0000
-
-ld_dir_bypass:
-        ; Clean up host KERNAL state
-        lda #$01
-        jsr CLOSE
-        jsr CLRCHN
-        lda #$00
-        ldx #$00
-        jsr SETBNK
-
-        ; Clear KERNAL status in guest (ZP $90 in bank 4)
-        lda #$00
-        jsr c128_write_status
-
-        ; Set guest X/Y = end address (dest + length)
-        clc
-        lda c128_dir_dest_lo
-        adc c128_dir_len_lo
-        sta c128_x
-        lda c128_dir_dest_hi
-        adc c128_dir_len_hi
-        sta c128_y
-
-        ; Clear carry = success
-        lda c128_p
-        and #((~P_C) & $FF)
-        sta c128_p
-
-        lda #0
-        sta c128_fl_len
-
-        ; Sync cursor and return
-        jsr VDC_SyncCursor
-        jsr C128Hook_RTS_Guest
         rts
 
 load_mega65_bank: .byte $04    ; MEGA65 bank for load destination
