@@ -815,17 +815,15 @@ _vdc_attr_page:
         ldz #0
 _vdc_attr_inner:
         lda [C128_MEM_PTR],z    ; Read VDC attribute byte
-        sta _vdc_attr_tmp       ; save full byte
-        and #$40                ; check bit 6 (reverse)
+        bit #$40                ; test bit 6 (reverse) without destroying A
         bne _vdc_attr_rev
         ; Normal: use attribute low nibble (foreground)
-        lda _vdc_attr_tmp
         and #$0F
         tax
         lda vdc_to_vic_color,x
         bra _vdc_attr_store
 _vdc_attr_rev:
-        ; Reverse: use R26 background color
+        ; Reverse: use R26 foreground color (cached)
         lda _vdc_rev_bg_color
 _vdc_attr_store:
         sta [vdc_color_ptr],z   ; Write to color RAM
@@ -843,10 +841,8 @@ _vdc_attr_store:
         ldz #0
 _vdc_attr_tail:
         lda [C128_MEM_PTR],z
-        sta _vdc_attr_tmp
-        and #$40
+        bit #$40
         bne _vdc_attr_tail_rev
-        lda _vdc_attr_tmp
         and #$0F
         tax
         lda vdc_to_vic_color,x
@@ -863,7 +859,6 @@ _vdc_skip_attr:
         rts
 
 _vdc_page_count:    .byte 0
-_vdc_attr_tmp:      .byte 0
 _vdc_rev_bg_color:  .byte 0
 vdc_bitmap_active: .byte 0     ; 1 = VIC-IV is in bitmap mode for VDC
 
@@ -1006,7 +1001,8 @@ _vdc_bmp_attr_mode:
 _vdc_bmp_attr_page:
         ldz #0
 _vdc_bmp_attr_inner:
-        lda [C128_MEM_PTR],z
+        lda [C128_MEM_PTR],z    ; read once
+        pha                     ; save for low nibble
         ; High nibble = bg color (RGBI) -> VIC high nibble
         lsr
         lsr
@@ -1019,9 +1015,8 @@ _vdc_bmp_attr_inner:
         asl
         asl                         ; bg to high nibble
         sta _vdc_bmp_tmp
-
-        lda [C128_MEM_PTR],z
         ; Low nibble = fg color (RGBI) -> VIC low nibble
+        pla                     ; restore original byte
         and #$0F
         tax
         lda vdc_to_vic_color_bmp,x  ; fg stays in low nibble
@@ -1039,6 +1034,7 @@ _vdc_bmp_attr_inner:
         ldz #0
 _vdc_bmp_attr_tail:
         lda [C128_MEM_PTR],z
+        pha
         lsr
         lsr
         lsr
@@ -1050,8 +1046,7 @@ _vdc_bmp_attr_tail:
         asl
         asl
         sta _vdc_bmp_tmp
-
-        lda [C128_MEM_PTR],z
+        pla
         and #$0F
         tax
         lda vdc_to_vic_color_bmp,x
@@ -1122,19 +1117,20 @@ _vbmp_row_loop:
         sta vdc_color_ptr+3
 
         ; Inner loop: 80 columns
-        ; Source: sequential via Z index on C128_MEM_PTR
-        ; Dest: stride 8 via pointer, always write at offset 0
-        ldz #0
-        ldy #80
+        ; Source: sequential via X index, read with [C128_MEM_PTR],z
+        ; Dest: stride 8 via vdc_color_ptr, write with [ptr],z where z=0
+        ldx #0
+        ldz #0                  ; Z stays 0 for all dest writes
 _vbmp_col_loop:
-        lda [C128_MEM_PTR],z    ; read src[Z]
-        phz                     ; save Z
-        ldz #0
-        sta [vdc_color_ptr],z   ; write to dest[0]
-        plz                     ; restore Z
+        ; Read source byte: set Z=X temporarily for indexed read
+        txa
+        taz
+        lda [C128_MEM_PTR],z    ; read src[X]
+        ldz #0                  ; restore Z=0 for dest write
+        sta [vdc_color_ptr],z   ; write to dest
 
         ; Source advances by 1
-        inz
+        inx
 
         ; Dest advances by 8
         lda vdc_color_ptr+0
@@ -1144,7 +1140,7 @@ _vbmp_col_loop:
         bcc +
         inc vdc_color_ptr+1
 +
-        dey
+        cpx #80
         bne _vbmp_col_loop
 
         ; Advance source by 80 for next pixel row
