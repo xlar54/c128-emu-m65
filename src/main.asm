@@ -7,7 +7,7 @@
 ;   Bank 0 ($00000-$0FFFF): Host code + staging areas
 ;     $02001-$02011: BASIC stub (SYS 8210)
 ;     $02012-$07FFF: Emulator code (must end before $8000 for KERNAL MAP)
-;     $09400-$09FFF: SAVE staging buffer (~3KB)
+;     $09400-$09FFF: Free
 ;     $0A000-$0AFFF: LOW_RAM_BUFFER (cache of C128 RAM $0000-$0FFF, DMA-synced before hooks)
 ;
 ;   Bank 1 ($10000-$1FFFF): C128 ROMs (48KB used)

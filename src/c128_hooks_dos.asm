@@ -65,8 +65,7 @@ C128_BANK_RAM     = $04
 
 ; MEGA65 80-col screen location (must match c128_mem.asm)
 C128_SCREEN_BANK = $05      ; Bank byte for 80-col screen
-C128_SCREEN_OFF  = $4000    ; Offset within bank for 80-col screen           ; C128 RAM bank 0 = MEGA65 bank 4
-C128_DIR_BUF      = $9400
+C128_SCREEN_OFF  = $4000    ; Offset within bank for 80-col screen
 
 ; MEGA65 KERNAL SAVE
 SAVE            = $FFD8
@@ -120,8 +119,6 @@ c128_prg_header_lo: .byte 0
 c128_prg_header_hi: .byte 0
 
 ; Directory length/destination
-c128_dir_len_lo:  .byte 0
-c128_dir_len_hi:  .byte 0
 c128_dir_dest_lo: .byte 0
 c128_dir_dest_hi: .byte 0
 
@@ -244,7 +241,38 @@ _setnam_capture:
 
 
 ; ============================================================
-; dos_copy_filename - Copy filename bytes from guest RAM
+; dos_sync_from_zp - Sync file I/O parameters from guest ZP
+;
+; Called before dos_copy_filename when c128_setnam_valid is 0
+; (i.e. the caller wrote directly to KERNAL ZP without going
+; through SETNAM/SETBNK/SETLFS hooks - e.g. the monitor's
+; L/S/V commands).
+;
+; Reads: $B7 (filename len), $BB/$BC (filename ptr),
+;        $B9 (SA), $BA (device), $C6 (data bank), $C7 (fname bank)
+; ============================================================
+dos_sync_from_zp:
+        lda LOW_RAM_BUFFER + $B7
+        sta c128_setnam_len
+        sta $A1E0                       ; DEBUG: filename len
+        lda LOW_RAM_BUFFER + $BB
+        sta c128_setnam_ptr_lo
+        sta $A1E1                       ; DEBUG: ptr lo
+        lda LOW_RAM_BUFFER + $BC
+        sta c128_setnam_ptr_hi
+        sta $A1E2                       ; DEBUG: ptr hi
+        lda LOW_RAM_BUFFER + $BA
+        sta c128_setlfs_dev
+        sta $A1E3                       ; DEBUG: device
+        lda LOW_RAM_BUFFER + $B9
+        sta c128_setlfs_sa
+        lda LOW_RAM_BUFFER + $C6
+        sta c128_setbnk_data
+        sta $A1E4                       ; DEBUG: data bank
+        lda LOW_RAM_BUFFER + $C7
+        sta c128_setbnk_fname
+        sta $A1E5                       ; DEBUG: fname bank
+        rts
 ;
 ; Called from OPEN/LOAD/SAVE hooks AFTER SETBNK has been called.
 ; Reads c128_setnam_len bytes from c128_setnam_ptr in the bank
@@ -257,6 +285,15 @@ _setnam_capture:
 ; in bank 0 regardless of c128_setbnk_fname setting.
 ; ============================================================
 dos_copy_filename:
+        ; If SETNAM hook wasn't called, read params from guest ZP
+        lda c128_setnam_valid
+        bne _dcf_have_params
+        jsr dos_sync_from_zp
+_dcf_have_params:
+        ; Clear the valid flag (consumed)
+        lda #0
+        sta c128_setnam_valid
+
         lda c128_setnam_len
         beq _dcf_done           ; Nothing to copy
 
@@ -429,10 +466,6 @@ _load_is_disk:
         ; Save the load/verify flag (A=0 for load, A!=0 for verify)
         lda c128_a
         sta c128_load_verify_flag
-
-        ; Clear the valid SETNAM flag (consumed)
-        lda #0
-        sta c128_setnam_valid
 
 _load_file:
         ; All callers (BASIC, Monitor, etc.) return via RTS_Guest
@@ -952,20 +985,16 @@ _save_have_name:
         lda LOW_RAM_BUFFER,x
         sta c128_save_start_hi
 
-        ; Calculate data length
-        lda c128_save_end_lo
-        sec
-        sbc c128_save_start_lo
-        sta c128_dir_len_lo
-        lda c128_save_end_hi
-        sbc c128_save_start_hi
-        sta c128_dir_len_hi
-
         ; Check for zero or negative length
-        bmi _save_error
-        lda c128_dir_len_lo
-        ora c128_dir_len_hi
+        lda c128_save_end_hi
+        cmp c128_save_start_hi
+        bcc _save_error
+        bne _save_len_ok
+        lda c128_save_end_lo
+        cmp c128_save_start_lo
         beq _save_error
+        bcc _save_error
+_save_len_ok:
 
         ; Mark file operation active
         lda #1
@@ -977,95 +1006,39 @@ _save_have_name:
         jsr emu_print_string
         jsr dos_print_filename_only
 
-        ; DMA copy from guest RAM (bank 4) to staging buffer+2
-        ; First 2 bytes = PRG load address header
-        lda c128_save_start_lo
-        sta C128_DIR_BUF
-        lda c128_save_start_hi
-        sta C128_DIR_BUF+1
-
-        lda c128_dir_len_lo
-        sta _save_dma_len
-        lda c128_dir_len_hi
-        sta _save_dma_len+1
-        lda c128_save_start_lo
-        sta _save_dma_src
-        lda c128_save_start_hi
-        sta _save_dma_src+1
+        ; Ensure B register = 0 for KERNAL calls
         lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00
-        .byte $00               ; copy
-_save_dma_len:
-        .word $0000
-_save_dma_src:
-        .word $0000
-        .byte BANK_RAM0         ; src bank 4
-        .word C128_DIR_BUF+2    ; dst
-        .byte $00               ; dst bank 0
-        .byte $00
-        .word $0000
+        tab
 
-        ; Set up host KERNAL
-        lda #$00
+        ; SETBNK: save from guest RAM bank (bank 4), filename in bank 0
+        lda #BANK_RAM0
         ldx #$00
         jsr SETBNK
 
+        ; SETNAM
         ldx #<c128_fl_buf
         ldy #>c128_fl_buf
         lda c128_fl_len
         jsr SETNAM
 
+        ; SETLFS: lfn=1, device 8, sa=1 (save with replace)
         lda #$01
         ldx #$08
         ldy #$01
         jsr SETLFS
 
-        jsr OPEN
-        bcs _save_open_error
-
-        ldx #$01
-        jsr CHKOUT
-        bcs _save_chkout_error
-
-        ; Total = data + 2 byte header
-        clc
-        lda c128_dir_len_lo
-        adc #2
-        sta _save_total_lo
-        lda c128_dir_len_hi
-        adc #0
-        sta _save_total_hi
-
-        ; Output all bytes
-        lda #<C128_DIR_BUF
+        ; Set up ZP pointer for SAVE: store start address at DIR_PTR
+        lda c128_save_start_lo
         sta DIR_PTR
-        lda #>C128_DIR_BUF
+        lda c128_save_start_hi
         sta DIR_PTR+1
 
-        ldy #0
-_save_loop:
-        lda _save_total_lo
-        ora _save_total_hi
-        beq _save_loop_done
-
-        lda (DIR_PTR),y
-        jsr CHROUT
-
-        iny
-        bne +
-        inc DIR_PTR+1
-+
-        lda _save_total_lo
-        bne +
-        dec _save_total_hi
-+       dec _save_total_lo
-        bra _save_loop
-
-_save_loop_done:
-        jsr CLRCHN
-        lda #$01
-        jsr CLOSE
+        ; SAVE: A = ZP pointer to start, X/Y = end address
+        lda #DIR_PTR
+        ldx c128_save_end_lo
+        ldy c128_save_end_hi
+        jsr SAVE
+        bcs _save_host_error
 
         ; Success
         lda #$00
@@ -1077,11 +1050,11 @@ _save_loop_done:
         sta c128_a
         jmp _save_return
 
-_save_open_error:
-_save_chkout_error:
-        jsr CLRCHN
+_save_host_error:
+        ; Clean up and fall through to error
         lda #$01
         jsr CLOSE
+        jsr CLRCHN
 
 _save_error:
         lda c128_p
@@ -1092,6 +1065,11 @@ _save_error:
         jsr c128_write_status
 
 _save_return:
+        ; Reset SETBNK
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
         ; Sync C128 cursor ZP from VDC cursor position (80-col only)
         jsr VDC_SyncCursor
 
@@ -1100,9 +1078,6 @@ _save_return:
         sta c128_fl_len
         jsr C128Hook_RTS_Guest
         rts
-
-_save_total_lo: .byte 0
-_save_total_hi: .byte 0
 
 ; ============================================================
 ; emu_chrout - Print a PETSCII character to the emulated screen
