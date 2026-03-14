@@ -145,6 +145,8 @@ write_vdc_register:
         beq _wvdc_mark_attr_dirty
         cpx #21
         beq _wvdc_mark_attr_dirty
+        cpx #24
+        beq _wvdc_mark_attr_dirty  ; R24 bit 6 = reverse mode, affects attr rendering
         cpx #26
         beq _wvdc_update_colors
 _wvdc_done:
@@ -695,7 +697,7 @@ VDC_RenderFrame:
         bmi _vdc_render_bitmap
 
         ; --- TEXT MODE ---
-        ; Border/background from R26 bits 4-7 using text color table
+        ; Border/background from R26 low nibble (bg color)
         lda vdc_regs+26
         and #$0F
         tax
@@ -763,6 +765,31 @@ _vdc_dma_scr_bank:
 
 _vdc_skip_screen_dma:
 
+        ; --- Step 1b: Screen-wide reverse mode via charset swap ---
+        ; Instead of modifying 2000 screen bytes per frame, swap the
+        ; charset between normal and pre-inverted versions.
+        ; Only triggers on R24 bit 6 transition (not every frame).
+        ;
+        ; Normal charset at attic $8030000 (8KB)
+        ; Reversed charset at attic $8040000 (8KB, EOR #$FF of normal)
+        ; Active charset at bank 2 $02A000 (where CHARPTR points)
+        lda vdc_regs+24
+        and #$40
+        cmp _vdc_prev_r24_rev   ; compare with previous state
+        beq _vdc_no_rev_change  ; no transition, skip
+
+        sta _vdc_prev_r24_rev   ; save new state (sta doesn't set flags)
+        cmp #$40                ; test: reverse or normal?
+        beq _vdc_swap_to_rev
+        ; Transition to normal: DMA copy normal charset from attic to bank 2
+        #dma_copy $80, $03, $0000, $00, $02, $A000, $2000
+        bra _vdc_no_rev_change
+_vdc_swap_to_rev:
+        ; Transition to reverse: DMA copy reversed charset from attic to bank 2
+        #dma_copy $80, $04, $0000, $00, $02, $A000, $2000
+
+_vdc_no_rev_change:
+
         ; --- Step 2: Translate VDC attribute RAM -> MEGA65 color RAM ---
         ; Individual R31 writes are translated inline during writes.
         ; This batch loop only runs after R30 block fill/copy operations
@@ -796,8 +823,7 @@ _vdc_skip_screen_dma:
         lda #$0F
         sta vdc_color_ptr+3
 
-        ; Pre-translate R26 fg color for reverse video lookups
-        ; Reversed cells show R26 foreground as dominant color
+        ; Pre-translate R26 fg color for per-character reverse video
         lda vdc_regs+26
         lsr
         lsr
@@ -815,7 +841,7 @@ _vdc_attr_page:
         ldz #0
 _vdc_attr_inner:
         lda [C128_MEM_PTR],z    ; Read VDC attribute byte
-        bit #$40                ; test bit 6 (reverse) without destroying A
+        bit #$40                ; test bit 6 (per-char reverse)
         bne _vdc_attr_rev
         ; Normal: use attribute low nibble (foreground)
         and #$0F
@@ -823,7 +849,7 @@ _vdc_attr_inner:
         lda vdc_to_vic_color,x
         bra _vdc_attr_store
 _vdc_attr_rev:
-        ; Reverse: use R26 foreground color (cached)
+        ; Reversed: use R26 foreground color (cached)
         lda _vdc_rev_bg_color
 _vdc_attr_store:
         sta [vdc_color_ptr],z   ; Write to color RAM
@@ -860,6 +886,7 @@ _vdc_skip_attr:
 
 _vdc_page_count:    .byte 0
 _vdc_rev_bg_color:  .byte 0
+_vdc_prev_r24_rev:  .byte 0         ; previous R24 bit 6 state for transition detection
 vdc_bitmap_active: .byte 0     ; 1 = VIC-IV is in bitmap mode for VDC
 
 ; ============================================================

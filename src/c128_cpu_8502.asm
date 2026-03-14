@@ -258,8 +258,12 @@ hook_page_flags:
         .byte 0, 0
         ; $C8: DELETE + DIRECTORY hooks
         .byte 9
-        ; $C9-$CC: no hooks
-        .fill 4, 0
+        ; $C9: no hooks
+        .byte 0
+        ; $CA: 80-col scroll hook
+        .byte 10
+        ; $CB-$CC: no hooks
+        .byte 0, 0
         ; $CD: VDC polling loops
         .byte 1
         ; $CE: VDC screen clear
@@ -1155,7 +1159,7 @@ _skip_sprite_sync:
         ; VDC_RENDER_EVERY = 1: every frame (50fps, slowest emulation)
         ;                  = 2: every other frame (25fps, good balance)
         ;                  = 3: every 3rd frame (17fps, fastest emulation)
-VDC_RENDER_EVERY = 2
+VDC_RENDER_EVERY = 1
 
         lda display_showing_80
         beq _skip_vdc_render
@@ -2058,6 +2062,8 @@ C128CPU_StepDecode_hooks:
         beq _hook_page_c3
         cmp #9
         beq _hook_page_c8
+        cmp #10
+        beq _hook_page_ca
         jmp step_fetch
 
 _hook_page_cd:
@@ -2558,6 +2564,52 @@ _hook_page_c2:
         rts
 +       jmp step_fetch
 
+_hook_page_ca:
+        ; Check for 80-col SCRLUP entry at $CABC
+        lda c128_pc_lo
+        cmp #$BC
+        bne _hca_skip
+
+        ; Only handle full-screen scroll (no custom window margins)
+        ; Read window margins from C128 ZP via C128_RAM_PTR (bank 4)
+        lda #$00
+        sta C128_RAM_PTR+1      ; page 0 for ZP reads
+        ldz #$E5                ; SCTOP (top margin)
+        lda [C128_RAM_PTR],z
+        bne _hca_skip           ; top != 0, let ROM handle
+        ldz #$E4                ; SCBOT (bottom margin)
+        lda [C128_RAM_PTR],z
+        cmp #24
+        bne _hca_skip           ; bottom != 24, let ROM handle
+        ldz #$E6                ; SCLF (left margin)
+        lda [C128_RAM_PTR],z
+        bne _hca_skip           ; left != 0, let ROM handle
+        ldz #$E7                ; SCRT (right margin)
+        lda [C128_RAM_PTR],z
+        cmp #79
+        bne _hca_skip           ; right != 79, let ROM handle
+
+        ; Full-screen 80-col scroll - do it via DMA
+        jsr scroll_screen_up
+
+        ; Simulate RTS (pop return address from C128 stack)
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr low
+        sta c128_pc_lo
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr high
+        sta c128_pc_hi
+        inw c128_pc_lo          ; RTS adds 1 to return address
+        lda #0
+        sta c128_code_valid
+        lda #40                 ; ~40 cycles for scroll operation
+        #finish_cycles_no_xtra
+        rts
+_hca_skip:
+        jmp step_fetch
+
 _hook_page_e1:
         lda c128_pc_lo
         cmp #$42
@@ -2655,6 +2707,27 @@ step_fetch:
         ldz c128_pc_lo
         lda [c128_code_ptr],z
         inw c128_pc_lo
+
+        ; --- Inline fast path for most common opcodes ---
+        ; Avoids the asl/tax/jmp(table) dispatch overhead (~12 cycles)
+        ; for opcodes that account for ~60% of executed instructions.
+        cmp #$D0
+        beq _fast_bne
+        cmp #$F0
+        beq _fast_beq
+        cmp #$A5
+        beq _fast_lda_zp
+        cmp #$85
+        beq _fast_sta_zp
+        cmp #$A9
+        beq _fast_lda_imm
+        cmp #$4C
+        beq _fast_jmp_abs
+        cmp #$E8
+        beq _fast_inx
+        cmp #$CA
+        beq _fast_dex
+
 _step_dispatch:
         asl                     ; opcode * 2, carry set if opcode >= $80
         tax
@@ -2666,6 +2739,92 @@ _step_dispatch_lo:
 _step_fetch_slow:
         jsr fetch8
         jmp _step_dispatch
+
+; --- Inlined opcode handlers ---
+; These duplicate the logic from the main handlers but skip
+; the table dispatch overhead. The main op_xx handlers still
+; exist for the slow-path (cache miss) and single-step cases.
+
+_fast_lda_zp:
+        ; LDA zp ($A5) - 3 cycles, no page cross
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z
+        sta c128_a
+        #set_zn_fast
+        lda #3
+        #finish_cycles_no_xtra
+
+_fast_sta_zp:
+        ; STA zp ($85) - 3 cycles, no page cross
+        #fetch8_operand
+        sta c128_zp_ptr+0
+        ldz #0
+        lda c128_a
+        sta [c128_zp_ptr],z
+        lda #3
+        #finish_cycles_no_xtra
+
+_fast_lda_imm:
+        ; LDA #imm ($A9) - 2 cycles, no page cross
+        #fetch8_operand
+        sta c128_a
+        #set_zn_fast
+        lda #2
+        #finish_cycles_no_xtra
+
+_fast_bne:
+        ; BNE ($D0) - 2 cycles base + extra for taken/page cross
+        #fetch8_operand
+        sta c128_tmp
+        bbs 1, c128_p, _fast_bne_nt    ; Z flag set = equal, don't branch
+        #branch_do_inline
+        lda #2
+        #finish_cycles_inline
+_fast_bne_nt:
+        lda #2
+        #finish_cycles_no_xtra
+
+_fast_beq:
+        ; BEQ ($F0) - 2 cycles base + extra for taken/page cross
+        #fetch8_operand
+        sta c128_tmp
+        bbr 1, c128_p, _fast_beq_nt    ; Z flag clear = not equal, don't branch
+        #branch_do_inline
+        lda #2
+        #finish_cycles_inline
+_fast_beq_nt:
+        lda #2
+        #finish_cycles_no_xtra
+
+_fast_jmp_abs:
+        ; JMP abs ($4C) - 3 cycles, no page cross
+        jsr fetch16_to_addr
+        lda c128_addr_lo
+        sta c128_pc_lo
+        lda c128_addr_hi
+        sta c128_pc_hi
+        lda #0
+        sta c128_code_valid
+        lda #3
+        #finish_cycles_no_xtra
+
+_fast_inx:
+        ; INX ($E8) - 2 cycles, no page cross
+        inc c128_x
+        lda c128_x
+        #set_zn_fast
+        lda #2
+        #finish_cycles_no_xtra
+
+_fast_dex:
+        ; DEX ($CA) - 2 cycles, no page cross
+        dec c128_x
+        lda c128_x
+        #set_zn_fast
+        lda #2
+        #finish_cycles_no_xtra
 
 ; ============================================================
 ; finish_cycles - Handles cycle accounting, returns with RTS

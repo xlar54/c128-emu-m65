@@ -555,12 +555,18 @@ _scr_clr_dst:
         adc #>VDC_RAM_BASE
         sta _attr_clr_dst+1
 
+        ; Use current VDC R26 foreground color (low nibble) as attribute
+        lda vdc_regs+26
+        and #$0F
+        sta _attr_clr_val
+
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00
         .byte $03               ; fill
         .word 80
-        .word $0007             ; default attr (light cyan)
+_attr_clr_val:
+        .word $0007             ; attr value (patched from R26)
         .byte $00
 _attr_clr_dst:
         .word $0000
@@ -582,12 +588,20 @@ _attr_clr_dst:
         .word $0000
 
         ; --- Clear bottom row in MEGA65 color RAM ---
+        ; Translate VDC R26 foreground to VIC-II color
+        lda vdc_regs+26
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta _colram_clr_val
+
         lda #$00
         sta $D707
         .byte $80, $FF, $81, $FF, $00
         .byte $03               ; fill
         .word 80
-        .word $0003             ; cyan (VIC color 3)
+_colram_clr_val:
+        .word $0003             ; color value (patched from R26 translation)
         .byte $00
         .word 1920              ; offset 1920
         .byte $08
