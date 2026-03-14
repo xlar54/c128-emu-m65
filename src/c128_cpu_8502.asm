@@ -1017,6 +1017,40 @@ _vic_no_collision:
         lda vic_cycle_accum
         cmp #VIC_CYCLES_PER_LINE
         bcs _vic_line_loop
+
+        ; --- Interrupt dispatch (moved here from finish_and_loop) ---
+        ; Interrupts are only generated above (CIA timer, raster, collision),
+        ; so checking here instead of per-instruction saves ~8 host cycles
+        ; per emulated instruction (~10% speedup) with at most 63 emulated
+        ; cycles of added latency (one scanline).
+        lda c128_nmi_pending
+        bne _sl_do_nmi
+        lda c128_irq_pending
+        beq _sl_no_irq
+        ; IRQ pending - check I flag
+        lda c128_p
+        and #P_I
+        bne _sl_no_irq          ; IRQ masked
+        lda #0
+        sta c128_irq_pending
+        jsr cpu_take_irq
+        ; Add 7 cycles for IRQ sequence
+        lda #7
+        clc
+        adc vic_cycle_accum
+        sta vic_cycle_accum
+_sl_no_irq:
+        rts
+
+_sl_do_nmi:
+        lda #0
+        sta c128_nmi_pending
+        jsr cpu_take_nmi
+        ; Add 7 cycles for NMI sequence
+        lda #7
+        clc
+        adc vic_cycle_accum
+        sta vic_cycle_accum
         rts
 
 _vic_prev_collision: .byte 0    ; previous collision state for edge detection
@@ -1923,52 +1957,19 @@ sm_counter: .byte 0
 
 ; ============================================================
 ; finish_and_loop - End of instruction trampoline
-; Optimized: fast path for the common case (no interrupts,
-; PC in low RAM) jumps directly to step_fetch.
+; Optimized: interrupt check moved to finish_do_scanline
+; (interrupts only generated at scanline boundaries).
 ; ============================================================
 finish_and_loop:
         dec sm_counter
         bne _fal_continue
         rts                     ; Batch complete - return to main loop
 _fal_continue:
-        ; Fast path: no interrupts pending?
-        lda c128_irq_pending
-        ora c128_nmi_pending
-        bne _fal_irq_check
-
-        ; No interrupts - check if hooks needed
+        ; Check if hooks needed
         lda c128_pc_hi
         cmp #$40
         bcc step_fetch          ; PC < $4000: skip hooks, go to fetch
         jmp C128CPU_StepDecode_hooks
-
-_fal_irq_check:
-        ; --- Interrupt check ---
-        lda c128_nmi_pending
-        bne _fal_do_nmi
-        ; IRQ pending - check I flag
-        lda c128_p
-        and #P_I
-        bne _fal_dispatch       ; IRQ masked, continue
-_fal_do_irq:
-        lda #0
-        sta c128_irq_pending
-        jsr cpu_take_irq
-        lda #7
-        #finish_cycles_inline
-
-_fal_dispatch:
-        lda c128_pc_hi
-        cmp #$40
-        bcc step_fetch
-        jmp C128CPU_StepDecode_hooks
-
-_fal_do_nmi:
-        lda #0
-        sta c128_nmi_pending
-        jsr cpu_take_nmi
-        lda #7
-        #finish_cycles_inline
 
 
 ; ============================================================
@@ -2637,15 +2638,12 @@ step_fetch:
         lda [c128_code_ptr],z
         inw c128_pc_lo
 _step_dispatch:
-        sta last_opcode        ; Save raw opcode for debug
         asl                     ; opcode * 2, carry set if opcode >= $80
         tax
         bcc _step_dispatch_lo
         jmp (op_table_hi,x)     ; opcodes $80-$FF
 _step_dispatch_lo:
         jmp (op_table_lo,x)     ; opcodes $00-$7F
-
-last_opcode: .byte 0
 
 _step_fetch_slow:
         jsr fetch8
@@ -2825,6 +2823,14 @@ op_illegal:
         dec c128_pc_hi
 +       dec c128_pc_lo
 
+        ; Re-read the opcode byte from PC (now pointing at the illegal opcode)
+        lda c128_pc_lo
+        sta c128_addr_lo
+        lda c128_pc_hi
+        sta c128_addr_hi
+        #read_data_fast
+        sta _ill_saved_opcode   ; Save for display below
+
         ; Use C128_MEM_PTR ($F0-$F3) as screen pointer at $040400
         ; (bank 4 = 40-col VIC screen, visible when display_showing_80=0)
         lda #$00
@@ -2865,7 +2871,7 @@ op_illegal:
         lda #$3D
         sta [C128_MEM_PTR],z
         inz
-        lda last_opcode
+        lda _ill_saved_opcode
         jsr ill_write_hex
 
         ; " A="
@@ -3070,6 +3076,7 @@ _ill_halt:
         jmp _ill_halt
 
 _ill_sp_save: .byte 0
+_ill_saved_opcode: .byte 0
 
 ; Helper: write byte in A as 2 hex chars at [C128_MEM_PTR],z; advances Z by 2
 ill_write_hex:
