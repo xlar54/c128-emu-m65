@@ -394,21 +394,40 @@ _irq_clock_done:
         lda #0
         sta cia1_icr_data       ; Clear pending interrupt flags
 
-        ; --- Call BASIC IRQ extension at $4006 ---
-        ; This handles PLAY (music), MOVSPR (sprite motion), COLLISION.
-        ; Push return address ($FF33-1 = $FF32) onto guest stack so
-        ; RTS from $4006 goes to $FF33 (KERNAL IRQ exit/RTI).
+        ; --- Chain screen editor IRQ + BASIC IRQ ---
+        ; The real KERNAL IRQ calls:
+        ;   JSR $C024 (screen editor - cursor, keyboard, user hooks at $1218)
+        ;   JSR $4006 (BASIC IRQ - PLAY, MOVSPR, COLLISION)
+        ;   JMP $FF33 (RTI)
+        ;
+        ; We build a return chain on the guest stack:
+        ;   $FF33 (RTI) <- $4006 returns here
+        ;   $4005 ($4006-1 for RTS) <- $C024 returns here
+        ; Then set PC to $C024 to start the chain.
+        ;
+        ; This allows user IRQ hooks (e.g., SID players patching $1218)
+        ; to be called from the screen editor IRQ dispatch.
+
+        ; Push $FF33 return address (for BASIC IRQ -> RTI)
         lda #$FF
         sta c128_data
-        jsr push_data           ; push high byte of $FF33
+        jsr push_data           ; push high byte
         lda #$32
         sta c128_data
-        jsr push_data           ; push low byte ($33-1=$32 for RTS convention)
+        jsr push_data           ; push low byte ($33-1=$32)
 
-        ; Set PC to $4006 - BASIC IRQ handler
-        lda #$06
-        sta c128_pc_lo
+        ; Push $4006 return address (for screen editor -> BASIC IRQ)
         lda #$40
+        sta c128_data
+        jsr push_data           ; push high byte
+        lda #$05
+        sta c128_data
+        jsr push_data           ; push low byte ($06-1=$05)
+
+        ; Set PC to $C024 - screen editor IRQ
+        lda #$24
+        sta c128_pc_lo
+        lda #$C0
         sta c128_pc_hi
 
         lda #1

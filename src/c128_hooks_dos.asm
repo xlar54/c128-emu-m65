@@ -468,8 +468,9 @@ _load_has_name:
 
 _load_is_disk:
         ; Save critical emulator ZP before any host KERNAL calls.
-        ; The MEGA65 KERNAL may use low ZP ($02-$0F) as temporaries,
-        ; corrupting c128_sp, c128_p, c128_pc etc.  Restored at _load_return.
+        ; The MEGA65 KERNAL LOAD uses ZP extensively and will corrupt
+        ; our 32-bit pointers at $E0-$EF, $F0-$F3, $F8-$FB, $14-$17.
+        ; Save all of them. Restored at _load_return.
         lda c128_sp
         sta _saved_c128_sp
         lda c128_p
@@ -478,6 +479,32 @@ _load_is_disk:
         sta _saved_c128_pc_lo
         lda c128_pc_hi
         sta _saved_c128_pc_hi
+
+        ; Save 32-bit ZP pointers (28 bytes: $E0-$EF, $F0-$F3, $F8-$FB)
+        ldx #0
+-       lda $E0,x
+        sta _saved_zp_ptrs,x
+        inx
+        cpx #16                 ; $E0-$EF (code_ptr, stack_ptr, color_ptr)
+        bne -
+        ldx #0
+-       lda $F0,x
+        sta _saved_zp_ptrs+16,x
+        inx
+        cpx #4                  ; $F0-$F3 (C128_MEM_PTR)
+        bne -
+        ldx #0
+-       lda $F8,x
+        sta _saved_zp_ptrs+20,x
+        inx
+        cpx #4                  ; $F8-$FB (C128_RAM_PTR)
+        bne -
+        ldx #0
+-       lda $14,x
+        sta _saved_zp_ptrs+24,x
+        inx
+        cpx #4                  ; $14-$17 (c128_zp_ptr)
+        bne -
 
         ; Save the load/verify flag (A=0 for load, A!=0 for verify)
         lda c128_a
@@ -492,15 +519,12 @@ _load_continue:
         jsr dos_print_filename
 
         ; Determine the MEGA65 bank for the load destination.
-        ; Use our captured c128_setbnk_data (set by OnSETBNK hook).
-        ; C128 bank 0 -> MEGA65 bank 4, C128 bank 1 -> MEGA65 bank 5.
+        ; C128 bank 0 -> MEGA65 bank 4 (direct KERNAL LOAD).
+        ; C128 bank 1 -> Read file byte-by-byte, DMA write to attic ($8000000+).
+        ;   Bank 5 is VDC display RAM - must NOT be used as load target!
         lda c128_setbnk_data
-        beq _load_dest_bank0
-        lda #$05
-        bra _load_dest_bank_set
-_load_dest_bank0:
+        bne _load_bank1_attic   ; Bank 1: use byte-by-byte attic path
         lda #$04
-_load_dest_bank_set:
         sta load_mega65_bank
 
         ; Determine the destination address based on secondary address.
@@ -727,6 +751,170 @@ _load_host_ok:
         ldx #$00
         jsr SETBNK
 
+        jmp _load_host_ok_shared
+
+; ============================================================
+; Bank 1 load: OPEN file, read byte-by-byte via BASIN,
+; DMA write each byte directly to attic ($8000000+).
+; No staging in bank 4 — avoids overwriting C128 bank 0 data.
+; ============================================================
+_load_bank1_attic:
+        lda #1
+        sta c128_file_op_active
+
+        ; Ensure B register = 0 for KERNAL calls
+        lda #$00
+        tab
+
+        ; SETBNK: filename in bank 0
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
+        ; Set filename
+        ldx #<c128_fl_buf
+        ldy #>c128_fl_buf
+        lda c128_fl_len
+        jsr SETNAM
+
+        ; SETLFS: lfn=1, device 8, sa=0 (read with address header)
+        lda #$01
+        ldx #$08
+        ldy c128_setlfs_sa
+        jsr SETLFS
+
+        ; OPEN the file
+        jsr OPEN
+        bcc _b1_open_ok
+        jmp _load_error
+_b1_open_ok:
+        ; CHKIN to read from file
+        ldx #$01
+        jsr CHKIN
+        bcc _b1_chkin_ok
+        lda #$01
+        jsr CLOSE
+        jmp _load_error
+_b1_chkin_ok:
+
+        ; Read 2-byte PRG header (load address)
+        jsr CHRIN
+        sta c128_dir_dest_lo
+        jsr CHRIN
+        sta c128_dir_dest_hi
+
+        ; If SA bit 0 = 0 (relocating), use guest X/Y instead
+        lda c128_setlfs_sa
+        and #$01
+        bne _b1_addr_ok
+        lda c128_x
+        sta c128_dir_dest_lo
+        lda c128_y
+        sta c128_dir_dest_hi
+_b1_addr_ok:
+
+        ; Set up DMA dest address for attic
+        lda c128_dir_dest_lo
+        sta _b1_dma_dst
+        lda c128_dir_dest_hi
+        sta _b1_dma_dst+1
+
+        ; Print messages
+        jsr dos_print_filename
+        lda #<C128Host_Msg_Loading
+        ldx #>C128Host_Msg_Loading
+        jsr emu_print_string
+
+        ; Read loop: BASIN -> DMA write to attic
+_b1_read_loop:
+        jsr CHRIN
+        sta _b1_staging         ; byte to write
+
+        ; Check status for EOF or error
+        lda $90                 ; MEGA65 KERNAL status
+        and #$43                ; EOF ($40) or error ($01,$02)
+        bne _b1_read_done_last  ; write this last byte then stop
+
+        ; DMA write 1 byte to attic
+        lda #$00
+        sta $D707
+        .byte $80, $00          ; src MB = $00
+        .byte $81, $80          ; dst MB = $80 (attic)
+        .byte $0b               ; F018B format
+        .byte $00               ; end options
+        .byte $00               ; copy
+        .word $0001             ; count = 1
+        .word _b1_staging       ; src addr
+        .byte $00               ; src bank 0
+_b1_dma_dst:
+        .word $0000             ; dst addr (patched)
+        .byte $00               ; dst bank 0 (attic MB $80)
+        .byte $00
+        .word $0000
+
+        ; Advance dest address
+        inc _b1_dma_dst
+        bne +
+        inc _b1_dma_dst+1
++
+        bra _b1_read_loop
+
+_b1_read_done_last:
+        ; Write the last byte - patch dst2 from current dst
+        lda _b1_dma_dst
+        sta _b1_dma_dst2
+        lda _b1_dma_dst+1
+        sta _b1_dma_dst2+1
+        lda #$00
+        sta $D707
+        .byte $80, $00
+        .byte $81, $80
+        .byte $0b
+        .byte $00
+        .byte $00               ; copy
+        .word $0001
+        .word _b1_staging
+        .byte $00
+_b1_dma_dst2:
+        .word $0000
+        .byte $00
+        .byte $00
+        .word $0000
+
+        inc _b1_dma_dst
+        bne +
+        inc _b1_dma_dst+1
++
+
+_b1_read_done:
+        ; Save end address
+        lda _b1_dma_dst
+        sta c128_fl_end_lo
+        lda _b1_dma_dst+1
+        sta c128_fl_end_hi
+
+        ; Close file
+        jsr CLRCHN
+        lda #$01
+        jsr CLOSE
+        lda #$00
+        ldx #$00
+        jsr SETBNK
+
+        ; Set end address in guest X/Y
+        lda c128_fl_end_lo
+        sta c128_x
+        lda c128_fl_end_hi
+        sta c128_y
+
+        ; Success
+        lda #$00
+        sta _load_error_flag
+        jsr c128_write_status
+        jmp _load_return
+
+_b1_staging: .byte 0
+
 _load_host_ok_shared:
         ; Print "LOADING" or "VERIFYING"
         lda c128_load_verify_flag
@@ -798,6 +986,36 @@ _load_return:
         sta c128_pc_lo
         lda _saved_c128_pc_hi
         sta c128_pc_hi
+
+        ; Restore 32-bit ZP pointers
+        ldx #0
+-       lda _saved_zp_ptrs,x
+        sta $E0,x
+        inx
+        cpx #16                 ; $E0-$EF
+        bne -
+        ldx #0
+-       lda _saved_zp_ptrs+16,x
+        sta $F0,x
+        inx
+        cpx #4                  ; $F0-$F3
+        bne -
+        ldx #0
+-       lda _saved_zp_ptrs+20,x
+        sta $F8,x
+        inx
+        cpx #4                  ; $F8-$FB
+        bne -
+        ldx #0
+-       lda _saved_zp_ptrs+24,x
+        sta $14,x
+        inx
+        cpx #4                  ; $14-$17
+        bne -
+
+        ; Invalidate code cache (pointers restored, page may differ)
+        lda #0
+        sta c128_code_valid
 
         ; Now apply carry flag AFTER c128_p is restored
         ; (must be after restore or it gets overwritten)
@@ -967,6 +1185,8 @@ _saved_c128_p:     .byte 0
 _saved_c128_pc_lo: .byte 0
 _saved_c128_pc_hi: .byte 0
 _load_error_flag:  .byte 0     ; 0=success, 1=error (applied after c128_p restore)
+_load_needs_attic_copy: .byte 0 ; 1=bank 1 load needs DMA to attic after LOAD
+_saved_zp_ptrs:    .fill 28, 0 ; saved $E0-$EF (16), $F0-$F3 (4), $F8-$FB (4), $14-$17 (4)
 
 _load_msg_fnf:
         .byte $0d
