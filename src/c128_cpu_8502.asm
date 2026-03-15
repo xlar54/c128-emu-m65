@@ -1151,17 +1151,35 @@ _spr_convert:
 _skip_sprite_sync:
 
         ; VDC 80-column rendering only when displaying 80-col screen
+        ; Render every Nth frame to free CPU cycles for emulation.
+        ; VDC_RENDER_EVERY = 1: every frame (50fps, slowest emulation)
+        ;                  = 2: every other frame (25fps, good balance)
+        ;                  = 3: every 3rd frame (17fps, fastest emulation)
+VDC_RENDER_EVERY = 2
+
         lda display_showing_80
         beq _skip_vdc_render
+    .if VDC_RENDER_EVERY > 1
+        inc _vdc_frame_skip
+        lda _vdc_frame_skip
+        cmp #VDC_RENDER_EVERY
+        bcc _skip_vdc_render
+        lda #0
+        sta _vdc_frame_skip
+    .endif
         jsr VDC_RenderFrame
 _skip_vdc_render:
-        ; Update VDC cursor (handles blink timing internally)
+        ; Update VDC cursor every frame (keeps blink smooth)
         lda display_showing_80
         beq _frame_done
         jsr VDC_UpdateCursor
 
 _frame_done:
         rts
+
+    .if VDC_RENDER_EVERY > 1
+_vdc_frame_skip: .byte 0
+    .endif
 
 ; ============================================================
 ; C128_KeyboardInject - Read MEGA65 keyboard and inject into
