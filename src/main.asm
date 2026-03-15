@@ -235,6 +235,40 @@ start:
         ; VIC-IV CHARPTR points directly to bank 2 chargen at $02A000.
         ; Emulated CPU reads use read_from_chargen which reads bank 2 directly.
 
+        ; Generate reversed charset (EOR #$FF each byte) for VDC R24 reverse mode.
+        ; Attic layout:
+        ;   $8020000 = saved C65 ROM (for GO64)
+        ;   $8030000 = normal chargen copy (8KB, for restore after reverse)
+        ;   $8040000 = reversed chargen (8KB, EOR #$FF of normal)
+        ;
+        ; Step 1: Save normal chargen to attic $8030000
+        #dma_copy $00, $02, $A000, $80, $03, $0000, $2000
+        ; Step 2: DMA copy normal chargen to bank 4 scratch for inversion
+        ; (Use bank 4 $C000-$DFFF as scratch — will be cleared by MemInit)
+        #dma_copy_chip $02, $A000, $04, $C000, $2000
+        ; Step 3: Invert all bytes in scratch area
+        lda #$00
+        sta C128_MEM_PTR+0
+        lda #$C0
+        sta C128_MEM_PTR+1
+        lda #$04
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldx #32                 ; 32 pages = 8KB
+_rev_charset_page:
+        ldz #0
+-       lda [C128_MEM_PTR],z
+        eor #$FF
+        sta [C128_MEM_PTR],z
+        inz
+        bne -
+        inc C128_MEM_PTR+1
+        dex
+        bne _rev_charset_page
+        ; Step 4: DMA copy inverted scratch to attic $8040000
+        #dma_copy $00, $04, $C000, $80, $04, $0000, $2000
+
         ; ============================================================
         ; Clear display area in bank 5 (VDC RAM + screen + color saves)
         ; ============================================================

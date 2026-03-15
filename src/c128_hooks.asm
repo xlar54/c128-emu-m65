@@ -544,6 +544,27 @@ _scr_clr_dst:
         .word $0000
 
         ; --- Clear bottom row in VDC attr RAM ---
+        ; Read the attribute from the last char of the line above (row 23)
+        ; to match whatever the current text color is.
+        lda vdc_regs+21
+        clc
+        adc #<1919              ; offset 1919 = last char of row 23
+        sta C128_MEM_PTR+0
+        lda vdc_regs+20
+        adc #>1919
+        and #$3F
+        clc
+        adc #>VDC_RAM_BASE
+        sta C128_MEM_PTR+1
+        lda #VDC_RAM_BANK
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+        ldz #0
+        lda [C128_MEM_PTR],z    ; read attr from line above
+        sta _scroll_cur_attr    ; save for both VDC and color RAM fills
+
+        ; Fill bottom row of VDC attr RAM with this attribute
         lda vdc_regs+21
         clc
         adc #<1920
@@ -555,12 +576,16 @@ _scr_clr_dst:
         adc #>VDC_RAM_BASE
         sta _attr_clr_dst+1
 
+        lda _scroll_cur_attr
+        sta _attr_clr_val
+
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00
         .byte $03               ; fill
         .word 80
-        .word $0007             ; default attr (light cyan)
+_attr_clr_val:
+        .word $0007             ; attr value (patched above)
         .byte $00
 _attr_clr_dst:
         .word $0000
@@ -582,17 +607,27 @@ _attr_clr_dst:
         .word $0000
 
         ; --- Clear bottom row in MEGA65 color RAM ---
+        ; Translate the current attribute's foreground to VIC-II color
+        lda _scroll_cur_attr
+        and #$0F
+        tax
+        lda vdc_to_vic_color,x
+        sta _colram_clr_val
+
         lda #$00
         sta $D707
         .byte $80, $FF, $81, $FF, $00
         .byte $03               ; fill
         .word 80
-        .word $0003             ; cyan (VIC color 3)
+_colram_clr_val:
+        .word $0003             ; color value (patched above)
         .byte $00
         .word 1920              ; offset 1920
         .byte $08
         .byte $00
         .word $0000
+
+_scroll_cur_attr: .byte 0
 
         ; Mark dirty
         lda #1

@@ -258,8 +258,12 @@ hook_page_flags:
         .byte 0, 0
         ; $C8: DELETE + DIRECTORY hooks
         .byte 9
-        ; $C9-$CC: no hooks
-        .fill 4, 0
+        ; $C9: no hooks
+        .byte 0
+        ; $CA: 80-col scroll hook
+        .byte 10
+        ; $CB-$CC: no hooks
+        .byte 0, 0
         ; $CD: VDC polling loops
         .byte 1
         ; $CE: VDC screen clear
@@ -2058,6 +2062,8 @@ C128CPU_StepDecode_hooks:
         beq _hook_page_c3
         cmp #9
         beq _hook_page_c8
+        cmp #10
+        beq _hook_page_ca
         jmp step_fetch
 
 _hook_page_cd:
@@ -2558,6 +2564,51 @@ _hook_page_c2:
         rts
 +       jmp step_fetch
 
+_hook_page_ca:
+        ; Check for 80-col SCRLUP entry at $CABC
+        lda c128_pc_lo
+        cmp #$BC
+        bne _hca_skip
+
+        ; Only handle full-screen scroll (no custom window margins)
+        lda #$00
+        sta C128_RAM_PTR+1      ; page 0 for ZP reads
+        ldz #$E5                ; SCTOP (top margin)
+        lda [C128_RAM_PTR],z
+        bne _hca_skip           ; top != 0, let ROM handle
+        ldz #$E4                ; SCBOT (bottom margin)
+        lda [C128_RAM_PTR],z
+        cmp #24
+        bne _hca_skip           ; bottom != 24, let ROM handle
+        ldz #$E6                ; SCLF (left margin)
+        lda [C128_RAM_PTR],z
+        bne _hca_skip           ; left != 0, let ROM handle
+        ldz #$E7                ; SCRT (right margin)
+        lda [C128_RAM_PTR],z
+        cmp #79
+        bne _hca_skip           ; right != 79, let ROM handle
+
+        ; Full-screen 80-col scroll - do it via DMA
+        jsr scroll_screen_up
+
+        ; Simulate RTS (pop return address from C128 stack)
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr low
+        sta c128_pc_lo
+        inc c128_sp
+        ldz c128_sp
+        lda [c128_stack_ptr],z  ; return addr high
+        sta c128_pc_hi
+        inw c128_pc_lo          ; RTS adds 1 to return address
+        lda #0
+        sta c128_code_valid
+        lda #40                 ; ~40 cycles for scroll operation
+        #finish_cycles_no_xtra
+        rts
+_hca_skip:
+        jmp step_fetch
+
 _hook_page_e1:
         lda c128_pc_lo
         cmp #$42
@@ -2694,13 +2745,14 @@ _fc_done:
 ; SCRLUP copies all lines in the window up one row and clears
 ; the bottom line. SCROLL ($C3A6) calls SCRLUP then handles
 ; cursor pointer updates — we only replace the copy/clear loop.
-; Only handles full-screen 40-col mode; returns Z=1 if not handled.
+; Handles full-screen scroll for both 40-col and 80-col modes.
+; Returns Z=1 if not handled (let ROM do it).
 ; Returns Z=0 (NE) if scroll was performed via DMA.
 ; ============================================================
 hook_40col_scroll:
         ; --- Guard: only handle 40-col mode ---
         lda vdc_mode_active
-        bne _h4s_skip           ; 80-col: let ROM handle
+        bne _h4s_skip           ; 80-col: let ROM handle (uses different scroll addr)
 
         ; --- Guard: only handle full-screen window ---
         ; Read window margins from C128 ZP via bank 4 (C128_RAM_PTR)
@@ -2721,6 +2773,7 @@ hook_40col_scroll:
         cmp #39
         bne _h4s_skip           ; right != 39
 
+        ; --- 40-col DMA scroll ---
         ; --- DMA scroll: C128 RAM bank 0 screen (bank 4, $0400) ---
         lda #$00
         sta $D707

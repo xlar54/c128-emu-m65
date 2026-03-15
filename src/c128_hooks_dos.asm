@@ -467,6 +467,18 @@ _load_has_name:
         rts
 
 _load_is_disk:
+        ; Save critical emulator ZP before any host KERNAL calls.
+        ; The MEGA65 KERNAL may use low ZP ($02-$0F) as temporaries,
+        ; corrupting c128_sp, c128_p, c128_pc etc.  Restored at _load_return.
+        lda c128_sp
+        sta _saved_c128_sp
+        lda c128_p
+        sta _saved_c128_p
+        lda c128_pc_lo
+        sta _saved_c128_pc_lo
+        lda c128_pc_hi
+        sta _saved_c128_pc_hi
+
         ; Save the load/verify flag (A=0 for load, A!=0 for verify)
         lda c128_a
         sta c128_load_verify_flag
@@ -739,17 +751,13 @@ _load_no_lrb_sync:
         ; Clear KERNAL status in guest
         lda #$00
         jsr c128_write_status
+        sta _load_error_flag    ; 0 = success
 
         ; Set end address in guest X/Y registers
         lda c128_fl_end_lo
         sta c128_x
         lda c128_fl_end_hi
         sta c128_y
-
-        ; Clear carry = success
-        lda c128_p
-        and #((~P_C) & $FF)
-        sta c128_p
 
         jmp _load_return
 
@@ -764,10 +772,9 @@ _load_host_failed:
         ; Fall through to error
 
 _load_error:
-        ; Set carry = error
-        lda c128_p
-        ora #P_C
-        sta c128_p
+        ; Set error flag
+        lda #$01
+        sta _load_error_flag
         ; Default to FILE NOT FOUND if no specific error
         lda dos_err_code
         bne +
@@ -781,6 +788,33 @@ _load_error:
         ;jsr C128Host_PrintString
 
 _load_return:
+        ; Restore critical emulator ZP that may have been corrupted
+        ; by host MEGA65 KERNAL calls (SETBNK, LOAD, CLOSE, etc.)
+        lda _saved_c128_sp
+        sta c128_sp
+        lda _saved_c128_p
+        sta c128_p
+        lda _saved_c128_pc_lo
+        sta c128_pc_lo
+        lda _saved_c128_pc_hi
+        sta c128_pc_hi
+
+        ; Now apply carry flag AFTER c128_p is restored
+        ; (must be after restore or it gets overwritten)
+        lda _load_error_flag
+        bne _load_set_carry
+        ; Success: clear carry
+        lda c128_p
+        and #((~P_C) & $FF)
+        sta c128_p
+        bra _load_carry_done
+_load_set_carry:
+        ; Error: set carry
+        lda c128_p
+        ora #P_C
+        sta c128_p
+_load_carry_done:
+
         ; Sync C128 cursor ZP from VDC cursor position (80-col only)
         jsr VDC_SyncCursor
 
@@ -926,6 +960,13 @@ _load_let_rom:
         rts
 
 load_mega65_bank: .byte $04    ; MEGA65 bank for load destination
+
+; Saved emulator ZP during host KERNAL calls
+_saved_c128_sp:    .byte 0
+_saved_c128_p:     .byte 0
+_saved_c128_pc_lo: .byte 0
+_saved_c128_pc_hi: .byte 0
+_load_error_flag:  .byte 0     ; 0=success, 1=error (applied after c128_p restore)
 
 _load_msg_fnf:
         .byte $0d
