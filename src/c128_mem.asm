@@ -94,6 +94,7 @@ BANK_RAM0_MB = $00                      ; Megabyte byte for RAM bank 0 (chip RAM
 CHARGEN_BASE = $2A000                   ; MEGA65 flat address of chargen ROM (bank 2)
 CHARGEN_BANK = $02                      ; Bank byte for chargen
 CHARGEN_OFF  = $A000                    ; Offset within bank for chargen
+SID_BASE     = $D400                    ; Base address for SID registers (passed through to real hardware)
 
 ; Low RAM buffer in bank 0 host RAM, DMA-synced from bank 4 before hooks
 LOW_RAM_BUFFER  = $A000                 ; 4KB - C128 low RAM $0000-$0FFF cache
@@ -174,7 +175,6 @@ cia2_regs:       .fill 16, 0      ; CIA2 $DD00-$DD0F
 ; ============================================================
 ; Video state
 ; ============================================================
-c128_charset_dirty: .byte 0
 c128_file_op_active: .byte 0
 
 ; ============================================================
@@ -250,7 +250,17 @@ _clear_cia:
         bpl _clear_cia
 
         ; Initialize SID for sound
-        jsr C128_SndInit
+        ; Silence all SID voices
+        ldx #$18
+        lda #$00
+_snd_clr:
+        sta SID_BASE,x
+        dex
+        bpl _snd_clr
+        
+        ; Set default volume to 0
+        lda #$00
+        sta SID_BASE+$18        ; Filter/volume register
 
         ; Clear C128 RAM bank 0 (already done in main.asm via DMA)
         ; Clear C128 RAM bank 1 (already done in main.asm via DMA)
@@ -362,26 +372,6 @@ _vi_40col:
 
         lda #0
         sta vdc_mode_active     ; Flag: VDC rendering inactive
-        rts
-
-; ============================================================
-; C128_MemClearRAM - Clear a RAM bank via DMA
-; X = MEGA65 bank number (4 or 5)
-; ============================================================
-C128_MemClearRAM:
-        stx _clr_bank+0
-        lda #$00
-        sta $D707
-        .byte $80, $00, $81, $00, $00   ; enhanced DMA options
-        .byte $03                       ; fill
-        .word $0000                     ; count (0 = 64K)
-        .word $0000                     ; fill with $00
-        .byte $00                       ; unused
-        .word $0000                     ; dest start
-_clr_bank:
-        .byte $04                       ; dest bank (modified)
-        .byte $00
-        .word $0000
         rts
 
 ; ============================================================

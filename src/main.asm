@@ -248,20 +248,7 @@ start:
         jsr C128_CPUReset
 
 main_loop:
-        ; --- Check if print requested ---
-        lda c128h_print_pending
-        beq _no_print_start
-        jsr C128Host_StartPrint
-
-_no_print_start:
         jsr C128_CPUStepMultiple  ; Execute batch of 8502 instructions
-
-        ; --- If printing, check if done ---
-        lda c128h_print_active
-        beq _no_print_check
-        jsr C128Host_CheckPrintDone
-
-_no_print_check:
         jmp main_loop
 
 ; ============================================================
@@ -291,5 +278,3 @@ kernal_name_end:
         .include "c128_hooks.asm"
         .include "c128_mem.asm"
         .include "c128_vdc.asm"
-        .include "c128_sound.asm"
-        .include "c128_host.asm"
