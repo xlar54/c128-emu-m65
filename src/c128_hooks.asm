@@ -245,6 +245,49 @@ _check_a8:
         lda c128_pc_lo
         cmp #$4B
         bne _done_fast
+
+        ; === DEBUG: Dump emulated state before GO64 ===
+        ; Store at $A100-$A11F for monitor inspection
+        lda c128_a
+        sta $A100               ; emulated A
+        lda c128_x
+        sta $A101               ; emulated X
+        lda c128_y
+        sta $A102               ; emulated Y
+        lda c128_sp
+        sta $A103               ; emulated SP
+        lda c128_p
+        sta $A104               ; emulated P (flags)
+        ; Dump top 8 bytes of emulated stack
+        ldz c128_sp
+        inz
+        lda [c128_stack_ptr],z  ; SP+1
+        sta $A108
+        inz
+        lda [c128_stack_ptr],z  ; SP+2
+        sta $A109
+        inz
+        lda [c128_stack_ptr],z  ; SP+3
+        sta $A10A
+        inz
+        lda [c128_stack_ptr],z  ; SP+4
+        sta $A10B
+        inz
+        lda [c128_stack_ptr],z  ; SP+5
+        sta $A10C
+        inz
+        lda [c128_stack_ptr],z  ; SP+6
+        sta $A10D
+        inz
+        lda [c128_stack_ptr],z  ; SP+7
+        sta $A10E
+        inz
+        lda [c128_stack_ptr],z  ; SP+8
+        sta $A10F
+        ; Store border color marker so we know debug fired
+        lda #2                  ; red
+        sta $D020
+
         ; GO64 detected - save regs and handle
         pha
         txa
@@ -395,34 +438,27 @@ _irq_clock_done:
         sta cia1_icr_data       ; Clear pending interrupt flags
 
         ; --- Chain screen editor IRQ + BASIC IRQ ---
-        ; The real KERNAL IRQ calls:
-        ;   JSR $C024 (screen editor - cursor, keyboard, user hooks at $1218)
-        ;   JSR $4006 (BASIC IRQ - PLAY, MOVSPR, COLLISION)
-        ;   JMP $FF33 (RTI)
-        ;
-        ; We build a return chain on the guest stack:
-        ;   $FF33 (RTI) <- $4006 returns here
-        ;   $4005 ($4006-1 for RTS) <- $C024 returns here
-        ; Then set PC to $C024 to start the chain.
-        ;
-        ; This allows user IRQ hooks (e.g., SID players patching $1218)
-        ; to be called from the screen editor IRQ dispatch.
+        ; During file operations, skip $C024 (screen editor) to avoid
+        ; interference with LOAD/SAVE. Just call $4006 (BASIC IRQ).
+        lda c128_file_op_active
+        bne _irq_basic_only
 
+        ; Normal: chain $C024 (screen editor) -> $4006 (BASIC IRQ) -> $FF33 (RTI)
         ; Push $FF33 return address (for BASIC IRQ -> RTI)
         lda #$FF
         sta c128_data
-        jsr push_data           ; push high byte
+        jsr push_data
         lda #$32
         sta c128_data
-        jsr push_data           ; push low byte ($33-1=$32)
+        jsr push_data
 
         ; Push $4006 return address (for screen editor -> BASIC IRQ)
         lda #$40
         sta c128_data
-        jsr push_data           ; push high byte
+        jsr push_data
         lda #$05
         sta c128_data
-        jsr push_data           ; push low byte ($06-1=$05)
+        jsr push_data
 
         ; Set PC to $C024 - screen editor IRQ
         lda #$24
@@ -432,7 +468,26 @@ _irq_clock_done:
 
         lda #1
         sta c128_hook_pc_changed
+        rts
 
+_irq_basic_only:
+        ; File op active: skip screen editor, just call BASIC IRQ
+        ; Push $FF33 return address (for BASIC IRQ -> RTI)
+        lda #$FF
+        sta c128_data
+        jsr push_data
+        lda #$32
+        sta c128_data
+        jsr push_data
+
+        ; Set PC to $4006 - BASIC IRQ handler
+        lda #$06
+        sta c128_pc_lo
+        lda #$40
+        sta c128_pc_hi
+
+        lda #1
+        sta c128_hook_pc_changed
         rts
 
 ; ============================================================
