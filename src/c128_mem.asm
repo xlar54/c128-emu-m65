@@ -2202,12 +2202,14 @@ vic_scroll_up:
         ; Clear bottom row of screen with spaces
         #dma_fill_chip $04, $07C0, 40, $20
 
-        ; Clear bottom row of color with current text color from ZP $86
-        lda #$86
+        ; Clear bottom row of color with current text color from ZP $F1
+        lda #$F1
         sta c128_zp_ptr+0
         ldz #0
-        lda [c128_zp_ptr],z
+        lda[c128_zp_ptr],z
+        and #$0F                ; Mask color bits (Color RAM is 4 bits)
         sta _vsc_color
+        
         lda #<960
         sta C128_MEM_PTR+0
         lda #>960

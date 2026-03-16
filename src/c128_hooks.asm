@@ -339,6 +339,7 @@ C128Hook_RTS_Guest:
         lda tmp_hi
         adc #$00
         sta c128_pc_hi
+
         lda #1
         sta c128_hook_pc_changed    ; Signal to threaded interpreter
         rts
@@ -431,6 +432,43 @@ _irq_no_carry1:
         sta [c128_zp_ptr],z     ; $A2 = 0
 
 _irq_clock_done:
+        ; --- Decrement SLEEP timer at $0A1D-$0A1F ---
+        ; This 3-byte countdown timer is used by BASIC's SLEEP command.
+        ; Normally decremented by the KERNAL's $F5F8 jiffy clock routine,
+        ; which we skip. Decrement it here instead.
+        ; Read from bank 4 via C128_MEM_PTR
+        lda #$1D
+        sta C128_MEM_PTR+0
+        lda #$0A
+        sta C128_MEM_PTR+1
+        lda #$04                ; bank 4
+        sta C128_MEM_PTR+2
+        lda #$00
+        sta C128_MEM_PTR+3
+
+        ; Decrement 3-byte counter: $0A1D (lo), $0A1E (mid), $0A1F (hi)
+        ldz #0
+        lda [C128_MEM_PTR],z    ; read $0A1D (low)
+        sec
+        sbc #1
+        sta [C128_MEM_PTR],z    ; write $0A1D
+        bcs _sleep_no_borrow1
+
+        ldz #1
+        lda [C128_MEM_PTR],z    ; read $0A1E (mid)
+        sec
+        sbc #1
+        sta [C128_MEM_PTR],z    ; write $0A1E
+        bcs _sleep_no_borrow1
+
+        ldz #2
+        lda [C128_MEM_PTR],z    ; read $0A1F (hi)
+        sec
+        sbc #1
+        sta [C128_MEM_PTR],z    ; write $0A1F
+
+_sleep_no_borrow1:
+
         ; --- Acknowledge CIA1 interrupt ---
         ; The ROM reads $DC0D to clear the interrupt flag
         lda cia1_icr_data
@@ -609,36 +647,25 @@ _attr_scroll_dst:
         .byte $80, $00, $81, $00, $00
         .byte $03               ; fill
         .word 80
-        .word $0020             ; space
-        .byte $00
+        .byte $20               ; space character
+        .byte $00               ; high byte
+        .byte $00               ; src bank (ignored)
 _scr_clr_dst:
         .word $0000
         .byte $05               ; bank 5 (VDC RAM)
         .byte $00
         .word $0000
 
-        ; --- Clear bottom row in VDC attr RAM ---
-        ; Read the attribute from the last char of the line above (row 23)
-        ; to match whatever the current text color is.
-        lda vdc_regs+21
-        clc
-        adc #<1919              ; offset 1919 = last char of row 23
-        sta C128_MEM_PTR+0
-        lda vdc_regs+20
-        adc #>1919
-        and #$3F
-        clc
-        adc #>VDC_RAM_BASE
-        sta C128_MEM_PTR+1
-        lda #VDC_RAM_BANK
-        sta C128_MEM_PTR+2
-        lda #$00
-        sta C128_MEM_PTR+3
-        ldz #0
-        lda [C128_MEM_PTR],z    ; read attr from line above
-        sta _scroll_cur_attr    ; save for both VDC and color RAM fills
+        ; --- FETCH CURRENT COLOR FROM C128 ZP ($F1) ---
+        ldx #$F1
+        jsr read_zp_x
+        sta _scroll_cur_attr
 
-        ; Fill bottom row of VDC attr RAM with this attribute
+        ; --- Clear bottom row in VDC attr RAM ---
+        lda _scroll_cur_attr
+        and #$8F                ; match ROM: only color + ALT bit
+        sta _attr_clr_val       ; Patch VDC Attr RAM DMA
+
         lda vdc_regs+21
         clc
         adc #<1920
@@ -650,17 +677,15 @@ _scr_clr_dst:
         adc #>VDC_RAM_BASE
         sta _attr_clr_dst+1
 
-        lda _scroll_cur_attr
-        sta _attr_clr_val
-
         lda #$00
         sta $D707
         .byte $80, $00, $81, $00, $00
         .byte $03               ; fill
         .word 80
 _attr_clr_val:
-        .word $0007             ; attr value (patched above)
-        .byte $00
+        .byte $07               ; low byte patched above
+        .byte $00               ; high byte (must be 0)
+        .byte $00               ; bank (must be 0)
 _attr_clr_dst:
         .word $0000
         .byte $05               ; bank 5 (VDC RAM)
@@ -673,7 +698,8 @@ _attr_clr_dst:
         .byte $80, $00, $81, $00, $00
         .byte $03               ; fill
         .word 80
-        .word $0020             ; space
+        .byte $20               ; space character
+        .byte $00
         .byte $00
         .word $4000+1920        ; $054780
         .byte $05
@@ -681,33 +707,33 @@ _attr_clr_dst:
         .word $0000
 
         ; --- Clear bottom row in MEGA65 color RAM ---
-        ; Translate the current attribute's foreground to VIC-II color
         lda _scroll_cur_attr
         and #$0F
         tax
         lda vdc_to_vic_color,x
-        sta _colram_clr_val
+        sta _colram_clr_val     ; Patch MEGA65 Color RAM DMA
 
         lda #$00
         sta $D707
-        .byte $80, $FF, $81, $FF, $00
+        .byte $80, $00, $81, $FF, $00
         .byte $03               ; fill
         .word 80
 _colram_clr_val:
-        .word $0003             ; color value (patched above)
-        .byte $00
-        .word 1920              ; offset 1920
-        .byte $08
-        .byte $00
-        .word $0000
-
-_scroll_cur_attr: .byte 0
+        .byte $03               ; low byte patched above
+        .byte $00               ; high byte (must be 0)
+        .byte $00               ; bank (must be 0)
+        .word 1920              ; dst addr = offset 1920
+        .byte $08               ; dst bank = color RAM flag
+        .byte $00               ; command high byte
+        .word $0000             ; modulo
 
         ; Mark dirty
         lda #1
         sta vdc_screen_dirty
         sta vdc_attr_dirty
         rts
+
+_scroll_cur_attr:  .byte 0
 
 ; Crunch tokenizer removed to reduce code size
 ; (BASIC tokenizer runs natively through ROM)

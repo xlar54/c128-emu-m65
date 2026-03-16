@@ -2572,7 +2572,11 @@ _hook_page_ca:
 
         ; Only handle full-screen scroll (no custom window margins)
         lda #$00
+        sta C128_RAM_PTR+0
         sta C128_RAM_PTR+1      ; page 0 for ZP reads
+        sta C128_RAM_PTR+3      ; megabyte 0
+        lda #$04
+        sta C128_RAM_PTR+2      ; bank 4
         ldz #$E5                ; SCTOP (top margin)
         lda [C128_RAM_PTR],z
         bne _hca_skip           ; top != 0, let ROM handle
@@ -2600,6 +2604,7 @@ _hook_page_ca:
         ldz c128_sp
         lda [c128_stack_ptr],z  ; return addr high
         sta c128_pc_hi
+
         inw c128_pc_lo          ; RTS adds 1 to return address
         lda #0
         sta c128_code_valid
@@ -2757,7 +2762,11 @@ hook_40col_scroll:
         ; --- Guard: only handle full-screen window ---
         ; Read window margins from C128 ZP via bank 4 (C128_RAM_PTR)
         lda #$00
+        sta C128_RAM_PTR+0
         sta C128_RAM_PTR+1      ; page 0 for ZP reads
+        sta C128_RAM_PTR+3      ; megabyte 0
+        lda #$04
+        sta C128_RAM_PTR+2      ; bank 4
         ldz #$E5                ; SCTOP
         lda [C128_RAM_PTR],z
         bne _h4s_skip           ; top != 0
@@ -2819,7 +2828,11 @@ hook_40col_scroll:
         ; --- DMA fill: clear bottom line color RAM ---
         ; Use current color attribute from C128 ZP $F1 (bank 4)
         lda #$00
+        sta C128_RAM_PTR+0
         sta C128_RAM_PTR+1      ; page 0
+        sta C128_RAM_PTR+3      ; megabyte 0
+        lda #$04
+        sta C128_RAM_PTR+2      ; bank 4
         ldz #$F1
         lda [C128_RAM_PTR],z
         and #$0F                ; color RAM is 4 bits

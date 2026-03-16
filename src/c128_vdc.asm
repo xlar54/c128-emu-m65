@@ -50,7 +50,7 @@ vdc_regs:        .fill 10, 0     ; R0-R9
                  .byte $08       ; R23 = char height (8 scan lines)
                  .byte $00       ; R24 = VSS (bit 7: 1=copy, 0=fill; bits 4-0: vert scroll)
                  .byte $07       ; R25 = attr mode flags
-                 .byte $F0       ; R26 = color: white fg ($F), black bg ($0)
+                 .byte $07       ; R26 = color: cyan fg ($7), black bg ($0)
                  .byte 0         ; R27 = row increment
                  .byte $00       ; R28 = charset addr / RAM type
                  .fill 9, 0     ; R29-R37
@@ -656,7 +656,12 @@ _vpc_do_mirror:
         sta vdc_color_ptr+2
         lda #$0F
         sta vdc_color_ptr+3
-        lda vdc_regs+26
+        ; Read current text color from C128 ZP $F1 (COLOR)
+        ; This is always kept up to date by the screen editor ROM.
+        lda #$F1
+        sta c128_zp_ptr+0
+        ldz #0
+        lda [c128_zp_ptr],z    ; read $F1 from bank 4
         and #$0F
         tax
         lda vdc_to_vic_color,x
