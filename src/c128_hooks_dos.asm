@@ -7,20 +7,12 @@
 ; SAVE, OPEN, CLOSE, CHKIN, CHKOUT, CLRCHN, BASIN (file),
 ; CHROUT (file), GETIN (file), and DIRECTORY.
 ;
-; STATUS: STUBBED OUT - all hooks return immediately, letting
-; the C128 ROM handle the call natively.
-; Each hook has a TODO marker for future C128-specific
-; implementation.
+; All hooks are fully implemented, intercepting guest calls
+; and forwarding file I/O to the host MEGA65 KERNAL.
 ; ============================================================
 
         .cpu "45gs02"
 
-
-; Switch to KERNAL ZP (page $00) - call before host KERNAL JSRs
-; Clobbers A.
-
-; Switch back to emulator ZP - call after host KERNAL returns
-; Preserves A and processor flags (carry etc).
 
 
 ; ------------------------------------------------------------
@@ -70,22 +62,13 @@ C128_SCREEN_OFF  = $4000    ; Offset within bank for 80-col screen
 ; MEGA65 KERNAL SAVE
 SAVE            = $FFD8
 
-DEBUG_BASE = $A200
-
 ; Zero page pointer for directory parsing
 DIR_PTR         = $F5
-
-; Zero page pointer for string printing
-C128H_STR_PTR     = $F5           ; 2 bytes (shared with DIR_PTR, never used simultaneously)
 
 
 
 ; ============================================================
 ; DOS Hook Variables
-;
-; These are kept so that other modules that reference them
-; continue to assemble. They will be populated once the hooks
-; are properly implemented.
 ; ============================================================
 
 ; SETNAM capture
@@ -208,9 +191,8 @@ _dpf_done:
 ;   X = filename pointer low byte
 ;   Y = filename pointer high byte
 ;
-; We capture the parameters AND copy the actual filename bytes
-; into c128_fl_buf, since the guest pointer may reference
-; banked RAM that becomes inaccessible later.
+; We capture the pointer and length; the actual filename bytes
+; are copied later by dos_copy_filename when the bank is known.
 ;
 ; The ROM SETNAM continues normally after we return (we don't
 ; redirect PC), so the C128 KERNAL ZP ($B7, $BB, $BC) also
@@ -258,26 +240,21 @@ _setnam_capture:
 dos_sync_from_zp:
         lda LOW_RAM_BUFFER + $B7
         sta c128_setnam_len
-        sta $A1E0                       ; DEBUG: filename len
         lda LOW_RAM_BUFFER + $BB
         sta c128_setnam_ptr_lo
-        sta $A1E1                       ; DEBUG: ptr lo
         lda LOW_RAM_BUFFER + $BC
         sta c128_setnam_ptr_hi
-        sta $A1E2                       ; DEBUG: ptr hi
         lda LOW_RAM_BUFFER + $BA
         sta c128_setlfs_dev
-        sta $A1E3                       ; DEBUG: device
         lda LOW_RAM_BUFFER + $B9
         sta c128_setlfs_sa
         lda LOW_RAM_BUFFER + $C6
         sta c128_setbnk_data
-        sta $A1E4                       ; DEBUG: data bank
         lda LOW_RAM_BUFFER + $C7
         sta c128_setbnk_fname
-        sta $A1E5                       ; DEBUG: fname bank
         rts
-;
+
+; ============================================================
 ; Called from OPEN/LOAD/SAVE hooks AFTER SETBNK has been called.
 ; Reads c128_setnam_len bytes from c128_setnam_ptr in the bank
 ; specified by c128_setbnk_fname, stores into c128_fl_buf.
@@ -433,7 +410,7 @@ C128Hook_OnSETBNK:
 ;   - Use our captured filename from c128_fl_buf (set by OnSETNAM)
 ;   - Determine destination: SA bit 0 clear -> guest X/Y,
 ;     SA bit 0 set -> read 2-byte PRG header from file
-;   - Map C128 bank ($C6) to MEGA65 bank (4 or 5)
+;   - Map C128 bank 0 to MEGA65 bank 4, bank 1 to attic DMA
 ;   - Use host MEGA65 KERNAL LOAD with SA=0 to load directly
 ;     into the correct MEGA65 bank at the destination address
 ;   - If load touched $0000-$0FFF, sync LOW_RAM_BUFFER
@@ -480,7 +457,7 @@ _load_is_disk:
         lda c128_pc_hi
         sta _saved_c128_pc_hi
 
-        ; Save 32-bit ZP pointers (28 bytes: $E0-$EF, $F0-$F3, $F8-$FB)
+        ; Save 32-bit ZP pointers (28 bytes: $E0-$EF, $F0-$F3, $F8-$FB, $14-$17)
         ldx #0
 -       lda $E0,x
         sta _saved_zp_ptrs,x
@@ -575,7 +552,7 @@ _load_absolute:
         jsr OPEN
         bcc _do_CHKIN
         
-        sta dos_err_code    ; Save return address for error path
+        sta dos_err_code    ; Save error code for error path
         jmp _load_abs_header_err
 
 _do_CHKIN:
@@ -583,9 +560,6 @@ _do_CHKIN:
         ldx #$0f
         jsr CHKIN
 
-;_loopy:
-;inc $d020
-;jmp _loopy
         bcc _do_BASIN
 
         sta dos_err_code
@@ -640,7 +614,7 @@ _load_abs_header_err:
         ;
         ; At this point:
         ;   c128_dir_dest = target address in guest RAM
-        ;   load_mega65_bank = MEGA65 bank (4 or 5)
+        ;   load_mega65_bank = MEGA65 bank 4 (bank 0 path only)
         ;   c128_fl_buf/c128_fl_len = filename
         ;
         ; We use host MEGA65 KERNAL LOAD with SA=0 so we control
@@ -665,39 +639,12 @@ _load_dest_ok:
         jmp _do_manual_verify
 
 _do_host_load_native:
-        ; DEBUG: store filename length and first 4 chars at $A1F0
-        lda c128_fl_len
-        sta $A1F0
-        lda c128_fl_buf+0
-        sta $A1F1
-        lda c128_fl_buf+1
-        sta $A1F2
-        lda c128_fl_buf+2
-        sta $A1F3
-        lda c128_fl_buf+3
-        sta $A1F4
-        ; DEBUG: store dest address and bank at $A1F5
-        lda c128_dir_dest_lo
-        sta $A1F5
-        lda c128_dir_dest_hi
-        sta $A1F6
-        lda load_mega65_bank
-        sta $A1F7
-        ; DEBUG: store SA and captured banks at $A1F8
-        lda c128_setlfs_sa
-        sta $A1F8
-        lda c128_setbnk_data
-        sta $A1FC
-        lda c128_setbnk_fname
-        sta $A1FD
-
-
         ; Ensure B register = 0 for KERNAL calls
         lda #$00
         tab
 
         ; SETBNK: data bank = guest's MEGA65 bank, filename bank = 0
-        lda load_mega65_bank   ; 4 or 5
+        lda load_mega65_bank   ; bank 4
         ldx #$00                ; Filename is in our c128_fl_buf in bank 0
         jsr SETBNK
 
@@ -713,12 +660,8 @@ _do_host_load_native:
         ldy #$00
         jsr SETLFS
 
-        ; DEBUG: mark before LOAD
-        lda #$AA
-        sta $A1F9
-
         ; LOAD: A=0 (load) or A!=0 (verify), X/Y = destination address
-        ; Data goes directly into MEGA65 bank 4 or 5 (guest RAM)
+        ; Data goes directly into MEGA65 bank 4 (guest RAM)
         lda c128_load_verify_flag
         ldx c128_dir_dest_lo
         ldy c128_dir_dest_hi
@@ -727,16 +670,8 @@ _do_host_load_native:
 
         sta dos_err_code        ; Capture error code (e.g. 27/28 for verify error)
         
-        ; DEBUG: store error info
-        sta $A1FA               ; A = error code from LOAD
-        lda #$EE                ; marker = error path
-        sta $A1FB
         jmp _load_host_failed
 _load_host_ok:
-        ; DEBUG: mark success
-        lda #$01
-        sta $A1FB
-
         ; Success! X/Y hold end address (first byte after loaded data)
         stx c128_fl_end_lo
         sty c128_fl_end_hi
@@ -970,11 +905,6 @@ _load_error:
 +       sta c128_a
         jsr c128_write_status
 
-        ; Print error message on 80-col screen
-        ;lda #<_load_msg_fnf
-        ;ldx #>_load_msg_fnf
-        ;jsr C128Host_PrintString
-
 _load_return:
         ; Restore critical emulator ZP that may have been corrupted
         ; by host MEGA65 KERNAL calls (SETBNK, LOAD, CLOSE, etc.)
@@ -1173,10 +1103,6 @@ _verify_fail:
         jmp _load_error
 
 
-_load_let_rom:
-        ; Can't handle - let ROM deal with it
-        rts
-
 load_mega65_bank: .byte $04    ; MEGA65 bank for load destination
 
 ; Saved emulator ZP during host KERNAL calls
@@ -1185,29 +1111,17 @@ _saved_c128_p:     .byte 0
 _saved_c128_pc_lo: .byte 0
 _saved_c128_pc_hi: .byte 0
 _load_error_flag:  .byte 0     ; 0=success, 1=error (applied after c128_p restore)
-_load_needs_attic_copy: .byte 0 ; 1=bank 1 load needs DMA to attic after LOAD
 _saved_zp_ptrs:    .fill 28, 0 ; saved $E0-$EF (16), $F0-$F3 (4), $F8-$FB (4), $14-$17 (4)
-
-_load_msg_fnf:
-        .byte $0d
-        .text "?file not found  error"
-        .byte $0d, $00
 
 
 ; ============================================================
-; STUB: C128Hook_OnSAVE
+; C128Hook_OnSAVE
 ; Intercept at $FFD8 - handle file saving
 ;
 ; Guest registers on entry:
 ;   A = zero page address containing start address pointer
 ;   X = end address low byte
 ;   Y = end address high byte
-;
-; TODO: Copy filename from guest input buffer, read start
-;       address from the ZP pointer in A, DMA guest RAM to
-;       staging buffer (with 2-byte PRG header), call host
-;       KERNAL SAVE with bank swap, handle errors, return
-;       via RTS_Guest.
 ; ============================================================
 C128Hook_OnSAVE:
         ; Copy filename bytes now that SETBNK is correct
@@ -1661,17 +1575,11 @@ _epi_done:
 
 
 ; ============================================================
-; STUB: C128Hook_OnOPEN
+; C128Hook_OnOPEN
 ; Intercept at $FFC0 - sequential file OPEN
 ;
-; Guest state: $AC=LFN, $AD=SA, $AE=device (set by SETLFS)
-;              $AB=namelen, $AF/$B0=nameptr (set by SETNAM)
-;
-; TODO: Only intercept device 8. Find free slot, copy filename
-;       from guest RAM (may be in low RAM or bank 5), call
-;       host OPEN, update C128 KERNAL file tables (LAT/FAT/SAT
-;       at $0509+, LDTND at $97), return via RTS_Guest with
-;       carry clear on success.
+; Guest state: $B8=LFN, $B9=SA, $BA=device (set by SETLFS)
+;              $B7=namelen, $BB/$BC=nameptr (set by SETNAM)
 ; ============================================================
 C128Hook_OnOPEN:
         ; Copy filename bytes now that SETBNK is correct
@@ -1833,14 +1741,10 @@ _open_slot:      .byte 0
 
 
 ; ============================================================
-; STUB: C128Hook_OnCLOSE
+; C128Hook_OnCLOSE
 ; Intercept at $FFC3 - close a logical file
 ;
 ; Guest A register = LFN to close
-;
-; TODO: Find slot by LFN, close on host, clear slot, remove
-;       entry from C128 KERNAL file tables (shift subsequent
-;       entries down, decrement LDTND), return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCLOSE:
         ; Get LFN from guest A
@@ -1953,14 +1857,10 @@ _close_slot: .byte 0
 
 
 ; ============================================================
-; STUB: C128Hook_OnCHKIN
+; C128Hook_OnCHKIN
 ; Intercept at $FFC6 - set input channel
 ;
 ; Guest X register = LFN
-;
-; TODO: Find slot by LFN, verify it's open, set as current
-;       input (seq_input_slot) on both our side and host side,
-;       return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCHKIN:
         ; Get LFN from guest X
@@ -2017,14 +1917,10 @@ _chkin_lfn: .byte 0
 
 
 ; ============================================================
-; STUB: C128Hook_OnCHKOUT
+; C128Hook_OnCHKOUT
 ; Intercept at $FFC9 - set output channel
 ;
 ; Guest X register = LFN
-;
-; TODO: Find slot by LFN, verify it's open, set as current
-;       output (seq_output_slot) on both our side and host side,
-;       return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCHKOUT:
         ; Get LFN from guest X
@@ -2084,12 +1980,8 @@ _chkout_lfn: .byte 0
 
 
 ; ============================================================
-; STUB: C128Hook_OnCLRCHN
+; C128Hook_OnCLRCHN
 ; Intercept at $FFCC - clear I/O channels
-;
-; TODO: If we had an active input/output channel, clear it on
-;       host side too. Reset seq_input_slot / seq_output_slot
-;       to $FF. Let ROM also run to reset its state.
 ; ============================================================
 C128Hook_OnCLRCHN:
         ; Check if we have any active channels
@@ -2111,14 +2003,10 @@ _clrchn_check_out:
 
 
 ; ============================================================
-; STUB: C128Hook_OnBASIN
+; C128Hook_OnBASIN
 ; Intercept at $FFCF - character input (file path)
 ;
 ; Only called when seq_input_slot != $FF (dispatcher checks).
-;
-; TODO: Check EOF status, read byte from host via BASIN,
-;       update slot status, update guest status byte,
-;       return byte in guest A, return via RTS_Guest.
 ; ============================================================
 C128Hook_OnBASIN:
         ; Check if we have an active input channel
@@ -2182,14 +2070,10 @@ _basin_status: .byte 0
 
 
 ; ============================================================
-; STUB: C128Hook_OnCHROUT
+; C128Hook_OnCHROUT
 ; Character output to file (not screen)
 ;
 ; Only called when seq_output_slot != $FF (dispatcher checks).
-;
-; TODO: Get byte from guest A, write to host via CHROUT,
-;       update slot status, update guest status byte,
-;       return via RTS_Guest.
 ; ============================================================
 C128Hook_OnCHROUT:
         ; Check if we have an active output channel to a file
@@ -2222,13 +2106,10 @@ _fchrout_rom:
 
 
 ; ============================================================
-; STUB: C128Hook_OnGETIN
+; C128Hook_OnGETIN
 ; Intercept at $FFE4 - get character (file path)
 ;
 ; Only called when seq_input_slot != $FF (dispatcher checks).
-;
-; TODO: Same as BASIN for file input. Check EOF, read byte,
-;       update status, return in guest A via RTS_Guest.
 ; ============================================================
 C128Hook_OnGETIN:
         ; Check if we have an active input channel
@@ -2288,23 +2169,6 @@ _getin_rom:
 
 _getin_byte:   .byte 0
 _getin_status: .byte 0
-
-
-
-; ============================================================
-; Host KERNAL bank swap helpers
-;
-; The MEGA65 host KERNAL needs its original ROM in banks 2-3.
-; The emulator overwrites these banks with VDC RAM etc.
-; Before any host KERNAL file I/O, swap in the originals;
-; after, swap back.
-;
-; Attic RAM layout:
-;   $80020000 = saved original bank 2 (at init)
-;   $80030000 = saved original bank 3 (at init)
-;   $80060000 = saved emulator bank 2 (during swap)
-;   $80070000 = saved emulator bank 3 (during swap)
-; ============================================================
 
 
 

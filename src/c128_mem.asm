@@ -1649,7 +1649,6 @@ wmmu_d505:
         ; Check for C64 mode switch
         and #$40
         bne wmmu_d505_done
-        ; TODO: Switch to C64 mode
 wmmu_d505_done:
         rts
 wmmu_d506:
@@ -2125,8 +2124,6 @@ vic_print_char:
         ldz #0
         lda _vipc_char
         sta [C128_MEM_PTR],z
-
-        ; Color write removed - ROM handles color
 
         ; Advance column $EC
         inc _vipc_col

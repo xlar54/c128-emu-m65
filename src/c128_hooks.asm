@@ -25,7 +25,7 @@
 
 
 ; ============================================================
-; Include DOS hooks (stubbed out, ready for reimplementation)
+; Include DOS hooks
 ; ============================================================
         .include "c128_hooks_dos.asm"
 
@@ -246,48 +246,6 @@ _check_a8:
         cmp #$4B
         bne _done_fast
 
-        ; === DEBUG: Dump emulated state before GO64 ===
-        ; Store at $A100-$A11F for monitor inspection
-        lda c128_a
-        sta $A100               ; emulated A
-        lda c128_x
-        sta $A101               ; emulated X
-        lda c128_y
-        sta $A102               ; emulated Y
-        lda c128_sp
-        sta $A103               ; emulated SP
-        lda c128_p
-        sta $A104               ; emulated P (flags)
-        ; Dump top 8 bytes of emulated stack
-        ldz c128_sp
-        inz
-        lda [c128_stack_ptr],z  ; SP+1
-        sta $A108
-        inz
-        lda [c128_stack_ptr],z  ; SP+2
-        sta $A109
-        inz
-        lda [c128_stack_ptr],z  ; SP+3
-        sta $A10A
-        inz
-        lda [c128_stack_ptr],z  ; SP+4
-        sta $A10B
-        inz
-        lda [c128_stack_ptr],z  ; SP+5
-        sta $A10C
-        inz
-        lda [c128_stack_ptr],z  ; SP+6
-        sta $A10D
-        inz
-        lda [c128_stack_ptr],z  ; SP+7
-        sta $A10E
-        inz
-        lda [c128_stack_ptr],z  ; SP+8
-        sta $A10F
-        ; Store border color marker so we know debug fired
-        lda #2                  ; red
-        sta $D020
-
         ; GO64 detected - save regs and handle
         pha
         txa
@@ -343,15 +301,6 @@ C128Hook_RTS_Guest:
         lda #1
         sta c128_hook_pc_changed    ; Signal to threaded interpreter
         rts
-
-
-; FastCHROUT removed to reduce code size
-; (ROM handles 80-col output natively via VDC writes + RenderFrame)
-
-; PRIMM removed to reduce code size
-; (ROM handles PRIMM natively, vdc_screen_dirty set by RenderFrame)
-; CHRGET hook removed (was disabled, unreachable from dispatcher)
-
 
 ; ============================================================
 ; C128Hook_IRQ - Fast IRQ handler
@@ -734,10 +683,6 @@ _colram_clr_val:
         rts
 
 _scroll_cur_attr:  .byte 0
-
-; Crunch tokenizer removed to reduce code size
-; (BASIC tokenizer runs natively through ROM)
-
 
 ; ============================================================
 ; C128Hook_GO64 - Handle GO64 command

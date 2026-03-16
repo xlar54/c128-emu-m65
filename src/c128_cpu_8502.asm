@@ -835,13 +835,11 @@ _indy_no_carry:
 addr_ind_jmp:
         jsr fetch16_to_addr
 
-;debug
         ;  save the pointer address (e.g. $0318)
         lda c128_addr_lo
         sta c128_vec_lo
         lda c128_addr_hi
         sta c128_vec_hi
-;
 
         #read_data_fast
         sta c128_tmp
@@ -1817,9 +1815,6 @@ C128_CPUReset:
         lda #0
         sta c128_code_valid
         rts
-
-; VDC test program data removed (test passed - VDC pipeline works)
-; fix_80col_zp_vars removed (was never called, contained orphaned code after data table)
 
 ; ============================================================
 ; z80_pre_init - Simulate what the Z80 boot ROM writes to RAM
@@ -2891,10 +2886,6 @@ _h4s_skip:
         lda #$00
         rts
 
-; Crunch tokenizer and keyword tables removed to reduce code size
-; (BASIC tokenizer runs natively through ROM)
-
-
 op_illegal:
         ; ILLEGAL OPCODE - show diagnostic info
         ; NOTE: PC has already been incremented past the opcode by fetch8
@@ -3557,7 +3548,7 @@ do_cpy:
 op_00:
         ; ============================================================
         ; BRK - Dump state for debugging, then execute normally
-        ; Border = YELLOW, info at $7050+
+        ; Border = YELLOW, info at $A110-$A117
         ; ============================================================
         lda #$07                ; yellow border
         sta $D020
